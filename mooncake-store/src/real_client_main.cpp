@@ -100,10 +100,11 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, FLAGS_host);
+    std::string bind_host = FLAGS_host.substr(0, FLAGS_host.find(':'));
+    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, bind_host);
     RegisterClientRpcService(server, *client_inst);
 
-    LOG(INFO) << "Starting real client service on " << FLAGS_host << ":" << FLAGS_port;
+    LOG(INFO) << "Starting real client service on " << bind_host << ":" << FLAGS_port;
 
     return server.start();
 }
