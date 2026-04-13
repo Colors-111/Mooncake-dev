@@ -3,6 +3,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "client_service.h"
+#include "common.h"
 #include "config.h"
 #include "real_client.h"
 
@@ -100,7 +101,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    std::string bind_host = FLAGS_host.substr(0, FLAGS_host.find(':'));
+    auto [bind_host, _] = parseHostNameWithPort(FLAGS_host);
     coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, bind_host);
     RegisterClientRpcService(server, *client_inst);
 
