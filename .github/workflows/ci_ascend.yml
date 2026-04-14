@@ -1,11 +1,7 @@
 name: 'CI Test on ASCEND Platform'
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-    types: [opened, synchronize, reopened, labeled]
+  workflow_call: {}
 
 jobs:
   build-and-test:

@@ -1,23 +1,7 @@
 name: 'Integration test (Linux)'
 
 on:
-  push:
-    branches: [ "main" ]
-    paths:
-      - 'mooncake-*/**'
-      - 'extern/**'
-      - 'CMakeLists.txt'
-      - 'scripts/**'
-      - '.github/workflows/**'
-  pull_request_target:
-    branches: [ "main" ]
-    types: [opened, synchronize, reopened, labeled]
-    paths:
-      - 'mooncake-*/**'
-      - 'extern/**'
-      - 'CMakeLists.txt'
-      - 'scripts/**'
-      - '.github/workflows/**'
+  workflow_call: {}
 
 jobs:
   test-sglang-integration:
