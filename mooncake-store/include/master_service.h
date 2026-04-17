@@ -562,7 +562,8 @@ class MasterService {
     // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
-    // Helper to get a snapshot of alive clients (under client_mutex_ shared lock)
+    // Helper to get a snapshot of alive clients (under client_mutex_ shared
+    // lock)
     std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
 
     // Clear invalid handles in all shards
@@ -977,12 +978,13 @@ class MasterService {
             // ClientMonitorFunc.
             if (it_ != shard_guard_->metadata.end()) {
                 bool all_invalid = true;
-                it_->second.VisitReplicas([&all_invalid](const Replica& replica) {
-                    if (!replica.is_memory_replica() ||
-                        !replica.has_invalid_mem_handle()) {
-                        all_invalid = false;
-                    }
-                });
+                it_->second.VisitReplicas(
+                    [&all_invalid](const Replica& replica) {
+                        if (!replica.is_memory_replica() ||
+                            !replica.has_invalid_mem_handle()) {
+                            all_invalid = false;
+                        }
+                    });
                 if (all_invalid && it_->second.HasReplica()) {
                     this->Erase();
                     if (processing_it_ != shard_guard_->processing_keys.end()) {
