@@ -214,6 +214,11 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         return init_storage_backend_result;
     }
     auto enable_offloading_result = IsEnableOffloading();
+    if (enable_offloading_result.has_value()) {
+        LOG(INFO) << "IsEnableOffloading result: " << (enable_offloading_result.value() ? "true" : "false");
+    } else {
+        LOG(INFO) << "IsEnableOffloading result: error: " << enable_offloading_result.error();
+    }
     if (!enable_offloading_result) {
         LOG(ERROR) << "Failed to get enable persist result, error : "
                    << enable_offloading_result.error();
@@ -434,6 +439,17 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         LOG(ERROR) << "client is nullptr";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+
+    // Re-evaluate enable_offloading_ in case the storage backend now has room
+    // (e.g., eviction freed up space after a previous KEYS_ULTRA_LIMIT error).
+    {
+        auto reeval_result = IsEnableOffloading();
+        if (reeval_result && reeval_result.value()) {
+            MutexLocker locker(&offloading_mutex_);
+            enable_offloading_ = true;
+        }
+    }
+
     std::unordered_map<std::string, int64_t>
         offloading_objects;  // Objects selected for offloading
 
@@ -456,6 +472,8 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                    << offload_result.error();
         return offload_result;
     }
+    LOG(INFO) << "Successfully completed heartbeat with offloaded objects count: "
+              << offloading_objects.size();
 
     // TODO(eviction): Implement an LRU eviction mechanism to manage local
     // storage capacity.

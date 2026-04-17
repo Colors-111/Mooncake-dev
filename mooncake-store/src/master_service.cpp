@@ -2098,6 +2098,10 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     if (enable_offloading) {
         return std::move(local_disk_segment_it->second->offloading_objects);
     }
+    // Even when offloading is disabled, clear the pending queue to prevent
+    // unbounded growth that would trigger KEYS_ULTRA_LIMIT in
+    // PushOffloadingQueue.
+    local_disk_segment_it->second->offloading_objects.clear();
     return {};
 }
 
