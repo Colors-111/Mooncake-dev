@@ -977,15 +977,14 @@ class MasterService {
             // local_disk replicas are cleaned up by ClearInvalidHandles() in
             // ClientMonitorFunc.
             if (it_ != shard_guard_->metadata.end()) {
-                bool all_invalid = true;
-                it_->second.VisitReplicas(
-                    [&all_invalid](const Replica& replica) {
-                        if (!replica.is_memory_replica() ||
-                            !replica.has_invalid_mem_handle()) {
-                            all_invalid = false;
-                        }
-                    });
-                if (all_invalid && it_->second.HasReplica()) {
+                // Erase invalid memory replicas (those with unmounted
+                // segments). No client_mutex_ needed since we only check memory
+                // replicas.
+                it_->second.EraseReplicas([](const Replica& replica) {
+                    return replica.has_invalid_mem_handle();
+                });
+                // If no valid replicas remain, delete the whole object.
+                if (!it_->second.IsValid()) {
                     this->Erase();
                     if (processing_it_ != shard_guard_->processing_keys.end()) {
                         this->EraseFromProcessing();
