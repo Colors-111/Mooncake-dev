@@ -562,8 +562,13 @@ class MasterService {
     // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
+    // Helper to get a snapshot of alive clients (under client_mutex_ shared lock)
+    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
+
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
+    void ClearInvalidHandles(
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -891,7 +896,10 @@ class MasterService {
     }
 
     // Helper to clean up stale handles pointing to unmounted segments
-    bool CleanupStaleHandles(ObjectMetadata& metadata);
+    // or local_disk replicas whose owner client is no longer alive.
+    bool CleanupStaleHandles(
+        ObjectMetadata& metadata,
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
@@ -964,7 +972,8 @@ class MasterService {
               replication_task_it_(shard_guard_->replication_tasks.find(key)) {
             // Automatically clean up invalid handles
             if (it_ != shard_guard_->metadata.end()) {
-                if (service_->CleanupStaleHandles(it_->second)) {
+                if (service_->CleanupStaleHandles(
+                        it_->second, service_->getAliveClientsSnapshot())) {
                     this->Erase();
 
                     if (processing_it_ != shard_guard_->processing_keys.end()) {
