@@ -970,12 +970,21 @@ class MasterService {
               it_(shard_guard_->metadata.find(key)),
               processing_it_(shard_guard_->processing_keys.find(key)),
               replication_task_it_(shard_guard_->replication_tasks.find(key)) {
-            // Automatically clean up invalid handles
+            // Automatically clean up invalid handles (memory replicas only).
+            // Note: We only check memory replicas here to avoid lock order
+            // violation (client_mutex_ must be acquired before metadata shard).
+            // local_disk replicas are cleaned up by ClearInvalidHandles() in
+            // ClientMonitorFunc.
             if (it_ != shard_guard_->metadata.end()) {
-                if (service_->CleanupStaleHandles(
-                        it_->second, service_->getAliveClientsSnapshot())) {
+                bool all_invalid = true;
+                it_->second.VisitReplicas([&all_invalid](const Replica& replica) {
+                    if (!replica.is_memory_replica() ||
+                        !replica.has_invalid_mem_handle()) {
+                        all_invalid = false;
+                    }
+                });
+                if (all_invalid && it_->second.HasReplica()) {
                     this->Erase();
-
                     if (processing_it_ != shard_guard_->processing_keys.end()) {
                         this->EraseFromProcessing();
                     }
