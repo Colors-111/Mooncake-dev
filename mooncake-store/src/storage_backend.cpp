@@ -1753,7 +1753,8 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
     if (bucket_backend_config_.eviction_policy != BucketEvictionPolicy::NONE &&
         bucket_backend_config_.max_total_size > 0) {
         return true;
-        
+    }
+
     auto store_metadata_result = GetStoreMetadata();
     if (!store_metadata_result) {
         LOG(ERROR) << "Failed to get store metadata: "

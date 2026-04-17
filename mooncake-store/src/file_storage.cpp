@@ -215,9 +215,11 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     }
     auto enable_offloading_result = IsEnableOffloading();
     if (enable_offloading_result.has_value()) {
-        LOG(INFO) << "IsEnableOffloading result: " << (enable_offloading_result.value() ? "true" : "false");
+        LOG(INFO) << "IsEnableOffloading result: "
+                  << (enable_offloading_result.value() ? "true" : "false");
     } else {
-        LOG(INFO) << "IsEnableOffloading result: error: " << enable_offloading_result.error();
+        LOG(INFO) << "IsEnableOffloading result: error: "
+                  << enable_offloading_result.error();
     }
     if (!enable_offloading_result) {
         LOG(ERROR) << "Failed to get enable persist result, error : "
@@ -472,8 +474,9 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                    << offload_result.error();
         return offload_result;
     }
-    LOG(INFO) << "Successfully completed heartbeat with offloaded objects count: "
-              << offloading_objects.size();
+    LOG(INFO)
+        << "Successfully completed heartbeat with offloaded objects count: "
+        << offloading_objects.size();
 
     // TODO(eviction): Implement an LRU eviction mechanism to manage local
     // storage capacity.
