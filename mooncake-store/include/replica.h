@@ -295,10 +295,9 @@ class Replica {
     [[nodiscard]] bool has_stale_local_disk_client(
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients)
         const {
-        if (is_local_disk_replica()) {
-            const auto& disk_data = std::get<LocalDiskReplicaData>(data_);
-            return alive_clients.find(disk_data.client_id) ==
-                   alive_clients.end();
+        auto client_id = get_local_disk_client_id();
+        if (client_id.has_value()) {
+            return alive_clients.find(client_id.value()) == alive_clients.end();
         }
         return false;
     }
