@@ -570,7 +570,7 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
 tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
     auto error_code = client_->RegisterLocalMemory(
         client_buffer_allocator_->getBase(), config_.local_buffer_size,
-        kWildcardLocation, false, false);
+        kWildcardLocation, false, true);
     if (!error_code) {
         LOG(ERROR) << "Failed to register local memory: " << error_code.error();
         return error_code;

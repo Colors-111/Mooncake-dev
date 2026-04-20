@@ -3940,7 +3940,7 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     }
     return BatchGetOffloadObjectResponse(
         result.value().batch_id, std::move(result.value().pointers),
-        client_->GetTransportEndpoint(),
+        client_->GetSegmentEndpoint(),
         file_storage_->config_.client_buffer_gc_ttl_ms);
 }
 
