@@ -486,11 +486,13 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
 
     // Re-evaluate enable_offloading_ in case the storage backend now has room
     // (e.g., eviction freed up space after a previous KEYS_ULTRA_LIMIT error).
+    // Synchronize the state directly with IsEnableOffloading() result to be
+    // proactive and consistent.
     {
         auto reeval_result = IsEnableOffloading();
-        if (reeval_result && reeval_result.value()) {
+        if (reeval_result) {
             MutexLocker locker(&offloading_mutex_);
-            enable_offloading_ = true;
+            enable_offloading_ = reeval_result.value();
         }
     }
 
