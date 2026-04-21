@@ -516,9 +516,6 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                    << offload_result.error();
         return offload_result;
     }
-    LOG(INFO)
-        << "Successfully completed heartbeat with offloaded objects count: "
-        << offloading_objects.size();
 
     // TODO(eviction): Implement an LRU eviction mechanism to manage local
     // storage capacity.
