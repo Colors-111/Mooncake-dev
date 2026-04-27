@@ -484,18 +484,6 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Re-evaluate enable_offloading_ in case the storage backend now has room
-    // (e.g., eviction freed up space after a previous KEYS_ULTRA_LIMIT error).
-    // Synchronize the state directly with IsEnableOffloading() result to be
-    // proactive and consistent.
-    {
-        auto reeval_result = IsEnableOffloading();
-        if (reeval_result) {
-            MutexLocker locker(&offloading_mutex_);
-            enable_offloading_ = reeval_result.value();
-        }
-    }
-
     std::unordered_map<std::string, int64_t>
         offloading_objects;  // Objects selected for offloading
 
