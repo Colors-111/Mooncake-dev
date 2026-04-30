@@ -51,8 +51,13 @@ class SnapshotChildProcessTest;
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
  * 1. client_mutex_
- * 2. metadata_shards_[shard_idx_].mutex
- * 3. segment_mutex_
+ * 2. radix_tree_shards_[shard_idx].mutex
+ * 3. metadata_shards_[shard_idx_].mutex
+ * 4. segment_mutex_
+ *
+ * When locking multiple radix tree shards (e.g., for cross-shard
+ * parent/child operations), always acquire in ascending shard index
+ * order to prevent deadlocks.
  */
 class MasterService {
     // Test friend class for snapshot/restore testing
@@ -512,6 +517,41 @@ class MasterService {
     tl::expected<void, ErrorCode> MarkTaskToComplete(
         const UUID& client_id, const TaskCompleteRequest& request);
 
+    // ====================================================================
+    // Radix Tree Public API
+    // ====================================================================
+
+    /**
+     * @brief Register or update a radix tree node's parent relationship.
+     * Called when BlockStored events arrive from SGLang/Indexer.
+     * @param prefix_hash The block hash (hex digest)
+     * @param parent_prefix_hash Parent's block hash, or "" for root
+     * @param keys Full keys registered under this prefix
+     * @return ErrorCode on failure
+     */
+    tl::expected<void, ErrorCode> RegisterRadixTreeNode(
+        const std::string& prefix_hash,
+        const std::string& parent_prefix_hash,
+        const std::vector<std::string>& keys);
+
+    /**
+     * @brief Query all keys sharing a prefix hash and the node's
+     * relationships (parent and children).
+     * @param prefix_hash The prefix hash to query
+     * @return GetKeysByPrefixResponse on success, ErrorCode on failure
+     */
+    tl::expected<GetKeysByPrefixResponse, ErrorCode> GetKeysByPrefix(
+        const std::string& prefix_hash);
+
+    /**
+     * @brief Batch register multiple radix tree nodes.
+     * @param requests Vector of registration requests
+     * @return Vector of results (one per request)
+     */
+    std::vector<tl::expected<RegisterRadixTreeNodeResponse, ErrorCode>>
+    BatchRegisterRadixTreeNode(
+        const std::vector<RegisterRadixTreeNodeRequest>& requests);
+
    private:
     void SnapshotThreadFunc();
 
@@ -785,6 +825,14 @@ class MasterService {
             return now >= lease_timeout;
         }
 
+        // Return the current lease timeout (last access + TTL).
+        // Used for eviction ordering: objects with the smallest
+        // lease_timeout (longest expired) are evicted first.
+        std::chrono::system_clock::time_point GetLeaseTimeout() const {
+            SpinLocker locker(&lock);
+            return lease_timeout;
+        }
+
         // Check if is in soft pin status
         bool IsSoftPinned() const {
             SpinLocker locker(&lock);
@@ -843,6 +891,223 @@ class MasterService {
         ReplicaID source_id;
         std::chrono::system_clock::time_point start_time;
     };
+
+    // ========================================================================
+    // Radix Tree Index: Supplementary index for prefix-based KV cache
+    // relationships. Maps prefix hashes (extracted from full object keys)
+    // to tree nodes with parent-child links. This enables leaf-only
+    // eviction with upward traversal and prefix-based queries.
+    // ========================================================================
+
+    static constexpr size_t kBlake3HexDigestLength = 64;
+
+    struct RadixTreeNode {
+        // The prefix hash (blake3 hex digest), e.g.,
+        // "13b825898e41332c2beeae39b161d50994fd2ea4af86f4b95fb5dd0e66893882"
+        std::string prefix_hash;
+
+        // Parent node's prefix hash, or "" for root nodes
+        std::string parent_prefix_hash;
+
+        // Child nodes' prefix hashes
+        std::unordered_set<std::string> children;
+
+        // Full object keys registered under this prefix hash.
+        // For MLA models: {"<hash>"}
+        // For MHA models: {"<hash>_0_k", "<hash>_0_v", "<hash>_1_k", ...}
+        // For MHA+TP:     {"<hash>_0_k_tp_0", "<hash>_0_k_tp_1", ...}
+        std::unordered_set<std::string> registered_keys;
+
+        bool IsLeaf() const { return children.empty(); }
+    };
+
+    static constexpr size_t kNumRadixTreeShards = 256;
+    // Maximum number of cascade rounds in RadixTreeAwareEvict.
+    // Each round evicts current leaf nodes; after eviction, parent nodes
+    // that lost all children become new leaves and are evicted in the
+    // next round.  16 rounds covers trees up to depth 16 (far beyond
+    // any realistic RadixAttention tree).
+    static constexpr size_t kMaxCascadeRounds = 16;
+
+    struct RadixTreeShard {
+        mutable SharedMutex mutex;
+        std::unordered_map<std::string, RadixTreeNode> nodes GUARDED_BY(mutex);
+    };
+
+    std::array<RadixTreeShard, kNumRadixTreeShards> radix_tree_shards_;
+
+    // Extract the prefix hash from a full object key.
+    // Key formats handled:
+    //   MLA:   "<hash>"                        -> "<hash>"
+    //   MHA:   "<hash>_<layer>_<k|v>"          -> "<hash>"
+    //   MHA+TP: "<hash>_<layer>_<k|v>_tp_<r>"  -> "<hash>"
+    //   TP:    "<hash>_tp_<r>"                  -> "<hash>"
+    // Strategy: blake3 hex digest is always 64 chars. If the first '_'
+    // is at position 64, the prefix is everything before it.
+    // Otherwise, the full key is used as the prefix (graceful fallback).
+    std::string extractPrefixHash(const std::string& key) const {
+        auto pos = key.find('_');
+        if (pos == kBlake3HexDigestLength) {
+            return key.substr(0, pos);
+        }
+        return key;
+    }
+
+    size_t getRadixTreeShardIndex(const std::string& prefix_hash) const {
+        return std::hash<std::string>{}(prefix_hash) % kNumRadixTreeShards;
+    }
+
+    // Accessor for a single radix tree shard (read-write)
+    class RadixTreeShardAccessorRW {
+       public:
+        RadixTreeShardAccessorRW(MasterService* master_service,
+                                  size_t shard_index)
+            : shard_(master_service->radix_tree_shards_[shard_index]),
+              lock_(&shard_.mutex) {}
+
+        RadixTreeShard* operator->() { return &shard_; }
+        const RadixTreeShard* operator->() const { return &shard_; }
+
+       private:
+        RadixTreeShard& shard_;
+        SharedMutexLocker lock_;
+    };
+
+    // Accessor for a single radix tree shard (read-only)
+    class RadixTreeShardAccessorRO {
+       public:
+        RadixTreeShardAccessorRO(const MasterService* master_service,
+                                 size_t shard_index)
+            : shard_(master_service->radix_tree_shards_[shard_index]),
+              lock_(&shard_.mutex, shared_lock) {}
+
+        const RadixTreeShard* operator->() const { return &shard_; }
+
+       private:
+        const RadixTreeShard& shard_;
+        SharedMutexLocker lock_;
+    };
+
+    // Helper to lock two radix tree shards in ascending index order,
+    // preventing ABBA deadlocks when parent and child reside in
+    // different shards. If both indices are the same, only one lock
+    // is acquired.
+    class ScopedRadixTreeDualLock {
+       public:
+        ScopedRadixTreeDualLock(MasterService* master_service,
+                                size_t shard_idx_a, size_t shard_idx_b)
+            : master_service_(master_service) {
+            if (shard_idx_a == shard_idx_b) {
+                // Same shard: single lock
+                lock1_ = std::make_unique<SharedMutexLocker>(
+                    &master_service_->radix_tree_shards_[shard_idx_a].mutex);
+            } else if (shard_idx_a < shard_idx_b) {
+                lock1_ = std::make_unique<SharedMutexLocker>(
+                    &master_service_->radix_tree_shards_[shard_idx_a].mutex);
+                lock2_ = std::make_unique<SharedMutexLocker>(
+                    &master_service_->radix_tree_shards_[shard_idx_b].mutex);
+            } else {
+                lock1_ = std::make_unique<SharedMutexLocker>(
+                    &master_service_->radix_tree_shards_[shard_idx_b].mutex);
+                lock2_ = std::make_unique<SharedMutexLocker>(
+                    &master_service_->radix_tree_shards_[shard_idx_a].mutex);
+            }
+        }
+
+       private:
+        MasterService* master_service_;
+        std::unique_ptr<SharedMutexLocker> lock1_;
+        std::unique_ptr<SharedMutexLocker> lock2_;
+    };
+
+    // Radix tree internal operations (no-op when enable_radix_tree_ is false)
+
+    // Register a full key under its prefix hash node, establishing
+    // the parent-child relationship if parent_prefix_hash is non-empty.
+    void RegisterRadixTreeNodeInternal(
+        const std::string& prefix_hash,
+        const std::string& parent_prefix_hash,
+        const std::string& full_key);
+
+    // Unregister a full key from its prefix hash node.
+    // If the node becomes empty (no registered keys, no children),
+    // it is removed and its parent is updated (cascade upward).
+    void UnregisterRadixTreeNodeInternal(
+        const std::string& prefix_hash,
+        const std::string& full_key);
+
+    // After evicting/removing a leaf node, cascade upward:
+    // if the parent now has no registered keys and no children,
+    // remove it too, and continue up.
+    void CascadeCleanup(const std::string& removed_prefix_hash,
+                        const std::string& parent_prefix_hash);
+
+    // Radix-tree-aware eviction: multi-round leaf-to-root cascading eviction.
+    // Round 1: evict all evictable leaf nodes.
+    // After FlushRadixTreeUnregister + CascadeCleanup, parent nodes that
+    // lost all children become new leaves.
+    // Round 2+: evict those new leaves, and so on, until enough space is
+    // freed or no more leaves exist.  Bounded by kMaxCascadeRounds.
+    struct RadixTreeEvictResult {
+        long evicted_count = 0;
+        uint64_t freed_size = 0;
+    };
+    RadixTreeEvictResult RadixTreeAwareEvict(
+        double evict_ratio_target,
+        double evict_ratio_lowerbound);
+
+    // Deferred radix tree cleanup helpers.
+    // Because the lock order requires radix_tree locks before metadata
+    // locks, we cannot call UnregisterRadixTreeNodeInternal while
+    // holding a metadata shard lock. Instead, callers collect keys to
+    // unregister via DeferRadixTreeUnregister() (which just appends
+    // to a local vector — no lock needed), then call
+    // FlushRadixTreeUnregister() after releasing the metadata lock.
+    void DeferRadixTreeUnregister(
+        std::vector<std::string>& deferred_keys,
+        const std::string& key) const {
+        if (enable_radix_tree_) {
+            deferred_keys.push_back(key);
+        }
+    }
+
+    void FlushRadixTreeUnregister(
+        const std::vector<std::string>& deferred_keys) {
+        for (const auto& key : deferred_keys) {
+            UnregisterRadixTreeNodeInternal(extractPrefixHash(key), key);
+        }
+    }
+
+    // Deferred radix tree registration helpers.
+    // Same rationale as DeferRadixTreeUnregister/FlushRadixTreeUnregister:
+    // we cannot call RegisterRadixTreeNodeInternal while holding a
+    // metadata shard lock. The deferred vector stores tuples of
+    // (prefix_hash, (parent_prefix_hash, full_key)).
+    using DeferredRadixTreeRegisterEntry =
+        std::pair<std::string, std::pair<std::string, std::string>>;
+
+    void DeferRadixTreeRegister(
+        std::vector<DeferredRadixTreeRegisterEntry>& deferred_registrations,
+        const std::string& prefix_hash,
+        const std::string& parent_prefix_hash,
+        const std::string& full_key) const {
+        if (enable_radix_tree_) {
+            deferred_registrations.emplace_back(
+                prefix_hash, std::make_pair(parent_prefix_hash, full_key));
+        }
+    }
+
+    void FlushRadixTreeRegister(
+        const std::vector<DeferredRadixTreeRegisterEntry>& deferred_registrations) {
+        for (const auto& entry : deferred_registrations) {
+            RegisterRadixTreeNodeInternal(
+                entry.first, entry.second.first, entry.second.second);
+        }
+    }
+
+    // ========================================================================
+    // End Radix Tree Index
+    // ========================================================================
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
@@ -904,19 +1169,28 @@ class MasterService {
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
+    // deferred_rt_register and deferred_rt_unregister collect radix tree
+    // operations that must be performed AFTER the metadata shard lock is
+    // released (to respect lock order: radix_tree before metadata).
     auto AllocateAndInsertMetadata(
         MetadataShardAccessorRW& shard, const UUID& client_id,
         const std::string& key, uint64_t value_length,
         const ReplicateConfig& config,
-        const std::chrono::system_clock::time_point& now)
+        const std::chrono::system_clock::time_point& now,
+        std::vector<std::string>& deferred_rt_unregister,
+        std::vector<DeferredRadixTreeRegisterEntry>& deferred_rt_register)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
      * @brief Helper to discard expired processing keys.
+     * @param deferred_rt_unregister Collects keys to unregister from radix
+     *        tree after the metadata shard lock is released (to respect lock
+     *        order: radix_tree before metadata).
      */
     void DiscardExpiredProcessingReplicas(
         MetadataShardAccessorRW& shard,
-        const std::chrono::system_clock::time_point& now);
+        const std::chrono::system_clock::time_point& now,
+        std::vector<std::string>& deferred_rt_unregister);
 
     /**
      * @brief Helper to release space of expired discarded replicas.
@@ -985,6 +1259,9 @@ class MasterService {
                 });
                 // If no valid replicas remain, delete the whole object.
                 if (!it_->second.IsValid()) {
+                    // The stale radix tree entries are cleaned up lazily by:
+                    // 1. ClearInvalidHandles() (periodic cleanup thread)
+                    // 2. RadixTreeAwareEvict (skip keys not in metadata)
                     this->Erase();
                     if (processing_it_ != shard_guard_->processing_keys.end()) {
                         this->EraseFromProcessing();
@@ -1175,6 +1452,9 @@ class MasterService {
     // exceeded (config: offload_force_evict, only effective when
     // offload_on_evict_=true)
     bool offload_force_evict_{false};
+
+    // If radix tree index is enabled for prefix-aware KV cache management
+    const bool enable_radix_tree_{false};
 
     const std::string ha_backend_type_;
 

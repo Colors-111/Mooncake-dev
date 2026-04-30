@@ -257,6 +257,21 @@ struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
     static constexpr const char* value = "BatchEvictDiskReplica";
 };
 
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegisterRadixTreeNode> {
+    static constexpr const char* value = "RegisterRadixTreeNode";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetKeysByPrefix> {
+    static constexpr const char* value = "GetKeysByPrefix";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchRegisterRadixTreeNode> {
+    static constexpr const char* value = "BatchRegisterRadixTreeNode";
+};
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
@@ -942,6 +957,49 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
     auto result =
         invoke_batch_rpc<&WrappedMasterService::BatchEvictDiskReplica, void>(
             keys.size(), client_id_, keys, replica_type);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+// Radix tree client methods
+
+tl::expected<void, ErrorCode> MasterClient::RegisterRadixTreeNode(
+    const std::string& prefix_hash,
+    const std::string& parent_prefix_hash,
+    const std::vector<std::string>& keys) {
+    ScopedVLogTimer timer(1, "MasterClient::RegisterRadixTreeNode");
+    timer.LogRequest("prefix_hash=", prefix_hash,
+                     ", parent=", parent_prefix_hash,
+                     ", keys_count=", keys.size());
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::RegisterRadixTreeNode, void>(
+            prefix_hash, parent_prefix_hash, keys);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<GetKeysByPrefixResponse, ErrorCode>
+MasterClient::GetKeysByPrefix(const std::string& prefix_hash) {
+    ScopedVLogTimer timer(1, "MasterClient::GetKeysByPrefix");
+    timer.LogRequest("prefix_hash=", prefix_hash);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::GetKeysByPrefix,
+                   GetKeysByPrefixResponse>(prefix_hash);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<RegisterRadixTreeNodeResponse, ErrorCode>>
+MasterClient::BatchRegisterRadixTreeNode(
+    const std::vector<RegisterRadixTreeNodeRequest>& requests) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchRegisterRadixTreeNode");
+    timer.LogRequest("count=", requests.size());
+
+    auto result = invoke_batch_rpc<
+        &WrappedMasterService::BatchRegisterRadixTreeNode,
+        RegisterRadixTreeNodeResponse>(requests.size(), requests);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

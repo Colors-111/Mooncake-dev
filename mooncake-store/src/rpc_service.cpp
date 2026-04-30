@@ -1510,6 +1510,67 @@ WrappedMasterService::BatchEvictDiskReplica(
     return results;
 }
 
+tl::expected<void, ErrorCode>
+WrappedMasterService::RegisterRadixTreeNode(
+    const std::string& prefix_hash,
+    const std::string& parent_prefix_hash,
+    const std::vector<std::string>& keys) {
+    ScopedVLogTimer timer(1, "RegisterRadixTreeNode");
+    timer.LogRequest("prefix_hash=", prefix_hash,
+                     ", parent=", parent_prefix_hash,
+                     ", keys_count=", keys.size());
+
+    auto result = master_service_.RegisterRadixTreeNode(
+        prefix_hash, parent_prefix_hash, keys);
+
+    if (!result.has_value()) {
+        LOG(WARNING) << "RegisterRadixTreeNode failed for prefix '"
+                     << prefix_hash << "': " << toString(result.error());
+    }
+
+    timer.LogResponse("success=", result.has_value());
+    return result;
+}
+
+tl::expected<GetKeysByPrefixResponse, ErrorCode>
+WrappedMasterService::GetKeysByPrefix(const std::string& prefix_hash) {
+    ScopedVLogTimer timer(1, "GetKeysByPrefix");
+    timer.LogRequest("prefix_hash=", prefix_hash);
+
+    auto result = master_service_.GetKeysByPrefix(prefix_hash);
+
+    if (!result.has_value()) {
+        LOG(WARNING) << "GetKeysByPrefix failed for prefix '"
+                     << prefix_hash << "': " << toString(result.error());
+    }
+
+    timer.LogResponse("success=", result.has_value());
+    return result;
+}
+
+std::vector<tl::expected<RegisterRadixTreeNodeResponse, ErrorCode>>
+WrappedMasterService::BatchRegisterRadixTreeNode(
+    const std::vector<RegisterRadixTreeNodeRequest>& requests) {
+    ScopedVLogTimer timer(1, "BatchRegisterRadixTreeNode");
+    timer.LogRequest("count=", requests.size());
+
+    auto results = master_service_.BatchRegisterRadixTreeNode(requests);
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            failure_count++;
+            LOG(WARNING) << "BatchRegisterRadixTreeNode failed for request["
+                         << i << "]: " << toString(results[i].error());
+        }
+    }
+
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
     return execute_rpc(
@@ -1785,6 +1846,16 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
             &wrapped_master_service);
+    // Radix tree RPC handlers
+    server.register_handler<
+        &mooncake::WrappedMasterService::RegisterRadixTreeNode>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetKeysByPrefix>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchRegisterRadixTreeNode>(
+        &wrapped_master_service);
 }
 
 }  // namespace mooncake

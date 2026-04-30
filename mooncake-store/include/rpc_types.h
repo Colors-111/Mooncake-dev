@@ -239,4 +239,33 @@ struct BatchGetOffloadObjectResponse {
 YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
          transfer_engine_addr, gc_ttl_ms);
 
+// ========================================================================
+// Radix Tree RPC Types
+// ========================================================================
+
+struct RegisterRadixTreeNodeRequest {
+    std::string prefix_hash;
+    std::string parent_prefix_hash;
+    std::vector<std::string> keys;
+};
+YLT_REFL(RegisterRadixTreeNodeRequest, prefix_hash, parent_prefix_hash, keys);
+
+struct RegisterRadixTreeNodeResponse {
+    // Empty on success. Error code is returned via tl::expected.
+};
+YLT_REFL(RegisterRadixTreeNodeResponse);
+
+struct GetKeysByPrefixRequest {
+    std::string prefix_hash;
+};
+YLT_REFL(GetKeysByPrefixRequest, prefix_hash);
+
+struct GetKeysByPrefixResponse {
+    std::vector<std::string> keys;
+    std::string parent_prefix_hash;
+    std::vector<std::string> children_prefix_hashes;
+};
+YLT_REFL(GetKeysByPrefixResponse, keys, parent_prefix_hash,
+         children_prefix_hashes);
+
 }  // namespace mooncake

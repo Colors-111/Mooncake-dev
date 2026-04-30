@@ -85,6 +85,9 @@ struct MasterConfig {
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+
+    // Radix tree index for prefix-aware KV cache management
+    bool enable_radix_tree = false;
 };
 
 class MasterServiceSupervisorConfig {
@@ -147,6 +150,9 @@ class MasterServiceSupervisorConfig {
     bool offload_on_evict = false;
     bool offload_force_evict = false;
     MasterServiceSupervisorConfig() = default;
+
+    // Radix tree index for prefix-aware KV cache management
+    bool enable_radix_tree = false;
 
     // From MasterConfig
     MasterServiceSupervisorConfig(const MasterConfig& config) {
@@ -214,6 +220,7 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        enable_radix_tree = config.enable_radix_tree;
         validate();
     }
 
@@ -312,6 +319,9 @@ class WrappedMasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+
+    // Radix tree index for prefix-aware KV cache management
+    bool enable_radix_tree = false;
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -390,6 +400,7 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        enable_radix_tree = config.enable_radix_tree;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -448,6 +459,7 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        enable_radix_tree = config.enable_radix_tree;
     }
 };
 
@@ -500,6 +512,7 @@ class MasterServiceConfigBuilder {
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
+    bool enable_radix_tree_ = false;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -724,6 +737,11 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_enable_radix_tree(bool enable) {
+        enable_radix_tree_ = enable;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -787,6 +805,9 @@ class MasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+
+    // Radix tree index for prefix-aware KV cache management
+    bool enable_radix_tree = false;
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
@@ -843,6 +864,7 @@ class MasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        enable_radix_tree = config.enable_radix_tree;
     }
 
     // Static factory method to create a builder
@@ -896,6 +918,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
+    config.enable_radix_tree = enable_radix_tree_;
     return config;
 }
 

@@ -202,6 +202,19 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type);
 
+    // Radix tree RPC methods
+    tl::expected<void, ErrorCode> RegisterRadixTreeNode(
+        const std::string& prefix_hash,
+        const std::string& parent_prefix_hash,
+        const std::vector<std::string>& keys);
+
+    tl::expected<GetKeysByPrefixResponse, ErrorCode> GetKeysByPrefix(
+        const std::string& prefix_hash);
+
+    std::vector<tl::expected<RegisterRadixTreeNodeResponse, ErrorCode>>
+    BatchRegisterRadixTreeNode(
+        const std::vector<RegisterRadixTreeNodeRequest>& requests);
+
    private:
     MasterService master_service_;
 };

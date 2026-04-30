@@ -20,6 +20,7 @@ type ReplicateConfig struct {
 	WithSoftPin       bool
 	WithHardPin       bool
 	PreferredSegments []string
+	ParentBlockHash   string
 }
 
 // DefaultReplicateConfig returns the default configuration (1 replica, no pinning).

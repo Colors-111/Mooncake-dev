@@ -55,6 +55,9 @@ mooncake::ReplicateConfig to_replicate_config(
             }
         }
     }
+    if (c_config->parent_block_hash) {
+        config.parent_block_hash = c_config->parent_block_hash;
+    }
     return config;
 }
 

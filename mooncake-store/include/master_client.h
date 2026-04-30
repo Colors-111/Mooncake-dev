@@ -483,6 +483,36 @@ class MasterClient {
     BatchEvictDiskReplica(const std::vector<std::string>& keys,
                           ReplicaType replica_type);
 
+    // Radix tree client API
+
+    /**
+     * @brief Register or update a radix tree node's parent relationship.
+     * @param prefix_hash The block hash (hex digest)
+     * @param parent_prefix_hash Parent's block hash, or "" for root
+     * @param keys Full keys registered under this prefix
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> RegisterRadixTreeNode(
+        const std::string& prefix_hash,
+        const std::string& parent_prefix_hash,
+        const std::vector<std::string>& keys);
+
+    /**
+     * @brief Query all keys sharing a prefix hash and the node's
+     * relationships.
+     * @param prefix_hash The prefix hash to query
+     */
+    [[nodiscard]] tl::expected<GetKeysByPrefixResponse, ErrorCode>
+    GetKeysByPrefix(const std::string& prefix_hash);
+
+    /**
+     * @brief Batch register multiple radix tree nodes.
+     * @param requests Vector of registration requests
+     */
+    [[nodiscard]] std::vector<
+        tl::expected<RegisterRadixTreeNodeResponse, ErrorCode>>
+    BatchRegisterRadixTreeNode(
+        const std::vector<RegisterRadixTreeNodeRequest>& requests);
+
    private:
     /**
      * @brief Generic RPC invocation helper for single-result operations

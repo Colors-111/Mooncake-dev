@@ -94,6 +94,12 @@ struct ReplicateConfig {
                                       // for backward compatibility
     bool prefer_alloc_in_same_node{false};
 
+    // Radix tree: parent block hash for prefix-aware KV cache management.
+    // When non-empty, the object's key will be registered under a radix
+    // tree node with this parent. Enables leaf-only eviction with
+    // upward traversal.
+    std::string parent_block_hash{};
+
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
         os << "ReplicateConfig: { replica_num: " << config.replica_num
@@ -110,7 +116,11 @@ struct ReplicateConfig {
                << config.preferred_segment;
         }
         os << ", prefer_alloc_in_same_node: "
-           << config.prefer_alloc_in_same_node << " }";
+           << config.prefer_alloc_in_same_node;
+        if (!config.parent_block_hash.empty()) {
+            os << ", parent_block_hash: " << config.parent_block_hash;
+        }
+        os << " }";
         return os;
     }
 };

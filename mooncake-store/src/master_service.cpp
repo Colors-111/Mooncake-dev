@@ -118,7 +118,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       task_manager_(config.task_manager_config),
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
-      enable_cxl_(config.enable_cxl) {
+      enable_cxl_(config.enable_cxl),
+      enable_radix_tree_(config.enable_radix_tree) {
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
             auto object_store_type =
@@ -383,6 +384,7 @@ void MasterService::ClearInvalidHandles() {
 
 void MasterService::ClearInvalidHandles(
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
+    std::vector<std::string> deferred_rt_unregister;
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
         auto it = shard->metadata.begin();
@@ -391,6 +393,7 @@ void MasterService::ClearInvalidHandles(
                 // If the object is empty, we need to erase the iterator and
                 // also erase the key from processing_keys,
                 // replication_tasks, and offloading_tasks.
+                DeferRadixTreeUnregister(deferred_rt_unregister, it->first);
                 shard->processing_keys.erase(it->first);
                 shard->replication_tasks.erase(it->first);
                 shard->offloading_tasks.erase(it->first);
@@ -400,6 +403,7 @@ void MasterService::ClearInvalidHandles(
             }
         }
     }
+    FlushRadixTreeUnregister(deferred_rt_unregister);
 }
 
 void MasterService::TaskCleanupThreadFunc() {
@@ -599,6 +603,7 @@ auto MasterService::BatchReplicaClear(
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     std::vector<std::string> cleared_keys;
     cleared_keys.reserve(object_keys.size());
+    std::vector<std::string> deferred_rt_unregister;
     const bool clear_all_segments = segment_name.empty();
 
     for (const auto& key : object_keys) {
@@ -651,6 +656,7 @@ auto MasterService::BatchReplicaClear(
                 });
 
             // Erase the entire metadata (all replicas will be deallocated)
+            DeferRadixTreeUnregister(deferred_rt_unregister, key);
             accessor.Erase();
             cleared_keys.emplace_back(key);
             VLOG(1) << "BatchReplicaClear: successfully cleared all replicas "
@@ -696,6 +702,7 @@ auto MasterService::BatchReplicaClear(
 
             // If no valid replicas remain, erase the entire metadata
             if (!metadata.IsValid()) {
+                DeferRadixTreeUnregister(deferred_rt_unregister, key);
                 accessor.Erase();
             }
 
@@ -707,6 +714,7 @@ auto MasterService::BatchReplicaClear(
         }
     }
 
+    FlushRadixTreeUnregister(deferred_rt_unregister);
     return cleared_keys;
 }
 
@@ -797,7 +805,9 @@ auto MasterService::AllocateAndInsertMetadata(
     MetadataShardAccessorRW& shard, const UUID& client_id,
     const std::string& key, uint64_t value_length,
     const ReplicateConfig& config,
-    const std::chrono::system_clock::time_point& now)
+    const std::chrono::system_clock::time_point& now,
+    std::vector<std::string>& deferred_rt_unregister,
+    std::vector<DeferredRadixTreeRegisterEntry>& deferred_rt_register)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     std::vector<Replica> replicas;
     {
@@ -848,6 +858,12 @@ auto MasterService::AllocateAndInsertMetadata(
                               config.with_soft_pin, config.with_hard_pin));
     shard->processing_keys.insert(key);
 
+    // Register in radix tree if enabled — deferred to avoid lock order
+    // violation (must acquire radix_tree lock before metadata lock).
+    DeferRadixTreeRegister(deferred_rt_register,
+                           extractPrefixHash(key),
+                           config.parent_block_hash, key);
+
     return replica_list;
 }
 
@@ -875,36 +891,60 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
     auto alive_clients = getAliveClientsSnapshot();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+
+    std::vector<std::string> deferred_rt_unregister;
+    std::vector<DeferredRadixTreeRegisterEntry> deferred_rt_register;
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> result =
+        tl::make_unexpected(ErrorCode::OK);  // sentinel: not yet set
+    bool already_exists = false;
+
     // Lock the shard and check if object already exists
-    MetadataShardAccessorRW shard(this, getShardIndex(key));
+    {
+        MetadataShardAccessorRW shard(this, getShardIndex(key));
 
-    const auto now = std::chrono::system_clock::now();
-    auto it = shard->metadata.find(key);
-    if (it != shard->metadata.end() &&
-        !CleanupStaleHandles(it->second, alive_clients)) {
-        auto& metadata = it->second;
-        // If the object's PutStart expired and has not completed any
-        // replicas, we can discard it and allow the new PutStart to
-        // go.
-        if (!metadata.HasReplica(&Replica::fn_is_completed) &&
-            metadata.put_start_time + put_start_discard_timeout_sec_ < now) {
-            auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
-            if (!replicas.empty()) {
-                std::lock_guard lock(discarded_replicas_mutex_);
-                discarded_replicas_.emplace_back(
-                    std::move(replicas),
-                    metadata.put_start_time + put_start_release_timeout_sec_);
+        const auto now = std::chrono::system_clock::now();
+        auto it = shard->metadata.find(key);
+        if (it != shard->metadata.end() &&
+            !CleanupStaleHandles(it->second, alive_clients)) {
+            auto& metadata = it->second;
+            // If the object's PutStart expired and has not completed any
+            // replicas, we can discard it and allow the new PutStart to
+            // go.
+            if (!metadata.HasReplica(&Replica::fn_is_completed) &&
+                metadata.put_start_time + put_start_discard_timeout_sec_ < now) {
+                auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
+                if (!replicas.empty()) {
+                    std::lock_guard lock(discarded_replicas_mutex_);
+                    discarded_replicas_.emplace_back(
+                        std::move(replicas),
+                        metadata.put_start_time + put_start_release_timeout_sec_);
+                }
+                shard->processing_keys.erase(key);
+                DeferRadixTreeUnregister(deferred_rt_unregister, key);
+                shard->metadata.erase(it);
+            } else {
+                LOG(INFO) << "key=" << key << ", info=object_already_exists";
+                already_exists = true;
+                result = tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
-            shard->processing_keys.erase(key);
-            shard->metadata.erase(it);
-        } else {
-            LOG(INFO) << "key=" << key << ", info=object_already_exists";
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
-    }
 
-    return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                     config, now);
+        if (!already_exists) {
+            // Either the key did not exist, or the old entry was erased above.
+            const auto now2 = std::chrono::system_clock::now();
+            result = AllocateAndInsertMetadata(shard, client_id, key, slice_length,
+                                              config, now2,
+                                              deferred_rt_unregister,
+                                              deferred_rt_register);
+        }
+    }  // shard destroyed here, metadata shard lock released
+
+    // Now safely perform deferred radix tree operations (acquires radix tree
+    // locks only, no metadata lock held).
+    FlushRadixTreeUnregister(deferred_rt_unregister);
+    FlushRadixTreeRegister(deferred_rt_register);
+
+    return result;
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
@@ -1011,49 +1051,61 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
-    if (!accessor.Exists()) {
-        LOG(INFO) << "key=" << key << ", info=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
+    std::vector<std::string> deferred_rt_unregister;
+    tl::expected<void, ErrorCode> result;
 
-    auto& metadata = accessor.Get();
-    if (client_id != metadata.client_id) {
-        LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
-                   << key << ", was PutStart-ed by " << metadata.client_id;
-        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
-    }
+    {
+        MetadataAccessorRW accessor(this, key);
+        if (!accessor.Exists()) {
+            LOG(INFO) << "key=" << key << ", info=object_not_found";
+            result = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        } else {
+            auto& metadata = accessor.Get();
+            if (client_id != metadata.client_id) {
+                LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
+                           << key << ", was PutStart-ed by " << metadata.client_id;
+                result = tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+            } else {
+                auto processing_rep =
+                    metadata.GetFirstReplica([replica_type](const Replica& replica) {
+                        return replica.type() == replica_type && !replica.is_processing();
+                    });
+                if (processing_rep != nullptr) {
+                    LOG(ERROR) << "key=" << key << ", status=" << processing_rep->status()
+                               << ", error=invalid_replica_status";
+                    result = tl::make_unexpected(ErrorCode::INVALID_WRITE);
+                } else {
+                    if (replica_type == ReplicaType::MEMORY) {
+                        MasterMetricManager::instance().dec_mem_cache_nums();
+                    } else if (replica_type == ReplicaType::DISK) {
+                        MasterMetricManager::instance().dec_file_cache_nums();
+                    }
 
-    auto processing_rep =
-        metadata.GetFirstReplica([replica_type](const Replica& replica) {
-            return replica.type() == replica_type && !replica.is_processing();
-        });
-    if (processing_rep != nullptr) {
-        LOG(ERROR) << "key=" << key << ", status=" << processing_rep->status()
-                   << ", error=invalid_replica_status";
-        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
-    }
+                    metadata.EraseReplicas([replica_type](const Replica& replica) {
+                        return replica.type() == replica_type;
+                    });
 
-    if (replica_type == ReplicaType::MEMORY) {
-        MasterMetricManager::instance().dec_mem_cache_nums();
-    } else if (replica_type == ReplicaType::DISK) {
-        MasterMetricManager::instance().dec_file_cache_nums();
-    }
+                    // If the object is completed, remove it from the processing set.
+                    if (metadata.AllReplicas(&Replica::fn_is_completed) &&
+                        accessor.InProcessing()) {
+                        accessor.EraseFromProcessing();
+                    }
 
-    metadata.EraseReplicas([replica_type](const Replica& replica) {
-        return replica.type() == replica_type;
-    });
+                    if (metadata.IsValid() == false) {
+                        DeferRadixTreeUnregister(deferred_rt_unregister, key);
+                        accessor.Erase();
+                    }
 
-    // If the object is completed, remove it from the processing set.
-    if (metadata.AllReplicas(&Replica::fn_is_completed) &&
-        accessor.InProcessing()) {
-        accessor.EraseFromProcessing();
-    }
+                    result = {};
+                }
+            }
+        }
+    }  // accessor destroyed here, metadata shard lock released
 
-    if (metadata.IsValid() == false) {
-        accessor.Erase();
-    }
-    return {};
+    // Now safely unregister from radix tree (acquires radix tree lock only).
+    FlushRadixTreeUnregister(deferred_rt_unregister);
+
+    return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
@@ -1120,149 +1172,177 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     //   operations on keys that hash to the same shard.
     auto alive_clients = getAliveClientsSnapshot();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataShardAccessorRW shard(this, getShardIndex(key));
 
-    const auto now = std::chrono::system_clock::now();
-    auto it = shard->metadata.find(key);
+    std::vector<std::string> deferred_rt_unregister;
+    std::vector<DeferredRadixTreeRegisterEntry> deferred_rt_register;
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> result =
+        tl::make_unexpected(ErrorCode::OK);  // sentinel: not yet set
+    bool early_return = false;
 
-    // --- Step 0: stale handle cleanup ---
-    // If all memory replicas point to unmounted segments (node crashed and
-    // restarted), the metadata is useless — erase it and treat as new key.
-    // Also clean up local_disk replicas whose owner client has expired.
-    if (it != shard->metadata.end() &&
-        CleanupStaleHandles(it->second, alive_clients)) {
-        shard->processing_keys.erase(key);
-        shard->metadata.erase(it);
-        it = shard->metadata.end();
-    }
+    {
+        MetadataShardAccessorRW shard(this, getShardIndex(key));
 
-    // --- Step 1: safety checks and preemption (only if key exists) ---
-    if (it != shard->metadata.end()) {
-        auto& metadata = it->second;
+        const auto now = std::chrono::system_clock::now();
+        auto it = shard->metadata.find(key);
 
-        // Reject if a Copy/Move task is actively reading this key's replicas.
-        // Writing during replication would corrupt the copy.
-        if (shard->replication_tasks.count(key) > 0) {
-            LOG(INFO) << "key=" << key << ", error=object_has_replication_task";
-            return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
-        }
-
-        // Reject if an offload-to-disk task is in progress (same reason).
-        if (shard->offloading_tasks.count(key) > 0) {
-            LOG(INFO) << "key=" << key << ", error=object_has_offloading_task";
-            return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
-        }
-
-        // Preempt an in-progress Put/Upsert on the same key.  The previous
-        // writer's PROCESSING replicas are moved to discarded_replicas_ with a
-        // TTL so they are not freed while the old writer may still be doing
-        // RDMA writes.  Unlike PutStart (which only preempts after a timeout),
-        // UpsertStart preempts immediately.
-        if (shard->processing_keys.count(key) > 0) {
-            auto processing_replicas =
-                metadata.PopReplicas(&Replica::fn_is_processing);
-            if (!processing_replicas.empty()) {
-                std::lock_guard lock(discarded_replicas_mutex_);
-                discarded_replicas_.emplace_back(
-                    std::move(processing_replicas),
-                    now + put_start_release_timeout_sec_);
-            }
+        // --- Step 0: stale handle cleanup ---
+        // If all memory replicas point to unmounted segments (node crashed and
+        // restarted), the metadata is useless — erase it and treat as new key.
+        // Also clean up local_disk replicas whose owner client has expired.
+        if (it != shard->metadata.end() &&
+            CleanupStaleHandles(it->second, alive_clients)) {
+            DeferRadixTreeUnregister(deferred_rt_unregister, key);
             shard->processing_keys.erase(key);
+            shard->metadata.erase(it);
+            it = shard->metadata.end();
+        }
 
-            // If no COMPLETE replicas survive the preemption, this key
-            // effectively does not exist — fall through to Case A.
-            if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+        // --- Step 1: safety checks and preemption (only if key exists) ---
+        if (it != shard->metadata.end()) {
+            auto& metadata = it->second;
+
+            // Reject if a Copy/Move task is actively reading this key's replicas.
+            // Writing during replication would corrupt the copy.
+            if (shard->replication_tasks.count(key) > 0) {
+                LOG(INFO) << "key=" << key << ", error=object_has_replication_task";
+                result = tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+                early_return = true;
+            }
+
+            // Reject if an offload-to-disk task is in progress (same reason).
+            if (!early_return && shard->offloading_tasks.count(key) > 0) {
+                LOG(INFO) << "key=" << key << ", error=object_has_offloading_task";
+                result = tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+                early_return = true;
+            }
+
+            // Preempt an in-progress Put/Upsert on the same key.  The previous
+            // writer's PROCESSING replicas are moved to discarded_replicas_ with a
+            // TTL so they are not freed while the old writer may still be doing
+            // RDMA writes.  Unlike PutStart (which only preempts after a timeout),
+            // UpsertStart preempts immediately.
+            if (!early_return && shard->processing_keys.count(key) > 0) {
+                auto processing_replicas =
+                    metadata.PopReplicas(&Replica::fn_is_processing);
+                if (!processing_replicas.empty()) {
+                    std::lock_guard lock(discarded_replicas_mutex_);
+                    discarded_replicas_.emplace_back(
+                        std::move(processing_replicas),
+                        now + put_start_release_timeout_sec_);
+                }
+                shard->processing_keys.erase(key);
+
+                // If no COMPLETE replicas survive the preemption, this key
+                // effectively does not exist — fall through to Case A.
+                if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+                    DeferRadixTreeUnregister(deferred_rt_unregister, key);
+                    shard->metadata.erase(it);
+                    it = shard->metadata.end();
+                }
+            }
+        }
+
+        if (early_return) {
+            // result already set above
+        } else if (it == shard->metadata.end()) {
+            // --- Case A: key does not exist (or was erased above) ---
+            // Allocate fresh buffers, identical to PutStart.
+            VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
+            result = AllocateAndInsertMetadata(shard, client_id, key, slice_length,
+                                               config, now,
+                                               deferred_rt_unregister,
+                                               deferred_rt_register);
+        } else {
+            // --- Step 2: key exists with COMPLETE replicas -> Case B or C ---
+            auto& metadata = it->second;
+
+            // Reject if any reader holds a reference (refcnt > 0).  Overwriting a
+            // buffer that an RDMA read is streaming from would cause data corruption.
+            // The client should retry after readers finish.
+            if (metadata.HasReplica(&Replica::fn_is_busy)) {
+                LOG(INFO) << "key=" << key << ", error=object_replica_busy";
+                result = tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
+            } else if (metadata.size == slice_length) {
+                // --- Case B: same size — in-place update ---
+                // Reuse existing buffer addresses.  No allocation or deallocation.
+                // The client will RDMA-write new data to the same addresses.
+                //
+                // hard_pinned is const and preserved automatically — upsert does not
+                // change the eviction protection level of an existing object.
+                metadata.client_id = client_id;
+                metadata.put_start_time = now;
+
+                // Reconcile soft_pin state with the incoming config.
+                {
+                    SpinLocker locker(&metadata.lock);
+                    if (config.with_soft_pin && !metadata.soft_pin_timeout) {
+                        metadata.soft_pin_timeout.emplace();
+                        MasterMetricManager::instance().inc_soft_pin_key_count(1);
+                    } else if (!config.with_soft_pin && metadata.soft_pin_timeout) {
+                        metadata.soft_pin_timeout.reset();
+                        MasterMetricManager::instance().dec_soft_pin_key_count(1);
+                    }
+                }
+
+                // Mark COMPLETE -> PROCESSING so readers won't see stale data
+                // mid-transfer.  The key becomes unreadable until UpsertEnd.
+                metadata.VisitReplicas(&Replica::fn_is_completed, [](Replica& replica) {
+                    replica.mark_processing();
+                });
+
+                shard->processing_keys.insert(key);
+
+                // Return the existing descriptors — same buffer addresses as before.
+                std::vector<Replica::Descriptor> replica_list;
+                const auto& all_replicas = metadata.GetAllReplicas();
+                replica_list.reserve(all_replicas.size());
+                for (const auto& replica : all_replicas) {
+                    replica_list.emplace_back(replica.get_descriptor());
+                }
+
+                VLOG(1) << "key=" << key << ", action=upsert_start_case_b_inplace";
+                result = std::move(replica_list);
+            } else {
+                // --- Case C: different size — discard old replicas and reallocate ---
+                // Old buffers cannot be reused.  Move them to discarded_replicas_ for
+                // delayed release (readers may still hold descriptors without refcnt),
+                // then allocate fresh buffers at the new size.
+                //
+                // Preserve hard_pin and soft_pin from the old metadata so that eviction
+                // protection survives a size-changing upsert (RFC S2.2.2).
+                ReplicateConfig merged_config = config;
+                merged_config.with_hard_pin =
+                    merged_config.with_hard_pin || metadata.IsHardPinned();
+                merged_config.with_soft_pin =
+                    merged_config.with_soft_pin || metadata.IsSoftPinned();
+
+                auto old_replicas = metadata.PopReplicas();
+                if (!old_replicas.empty()) {
+                    std::lock_guard lock(discarded_replicas_mutex_);
+                    discarded_replicas_.emplace_back(std::move(old_replicas),
+                                                     now + put_start_release_timeout_sec_);
+                }
                 shard->metadata.erase(it);
-                it = shard->metadata.end();
+
+                // Unregister from radix tree before re-registering via
+                // AllocateAndInsertMetadata (parent may have changed)
+                DeferRadixTreeUnregister(deferred_rt_unregister, key);
+
+                VLOG(1) << "key=" << key << ", action=upsert_start_case_c_reallocate";
+                result = AllocateAndInsertMetadata(shard, client_id, key, slice_length,
+                                                   merged_config, now,
+                                                   deferred_rt_unregister,
+                                                   deferred_rt_register);
             }
         }
-    }
+    }  // shard destroyed here, metadata shard lock released
 
-    // --- Case A: key does not exist (or was erased above) ---
-    // Allocate fresh buffers, identical to PutStart.
-    if (it == shard->metadata.end()) {
-        VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
-        return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                         config, now);
-    }
+    // Now safely perform deferred radix tree operations (acquires radix tree
+    // locks only, no metadata lock held).
+    FlushRadixTreeUnregister(deferred_rt_unregister);
+    FlushRadixTreeRegister(deferred_rt_register);
 
-    // --- Step 2: key exists with COMPLETE replicas → Case B or C ---
-    auto& metadata = it->second;
-
-    // Reject if any reader holds a reference (refcnt > 0).  Overwriting a
-    // buffer that an RDMA read is streaming from would cause data corruption.
-    // The client should retry after readers finish.
-    if (metadata.HasReplica(&Replica::fn_is_busy)) {
-        LOG(INFO) << "key=" << key << ", error=object_replica_busy";
-        return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
-    }
-
-    if (metadata.size == slice_length) {
-        // --- Case B: same size — in-place update ---
-        // Reuse existing buffer addresses.  No allocation or deallocation.
-        // The client will RDMA-write new data to the same addresses.
-        //
-        // hard_pinned is const and preserved automatically — upsert does not
-        // change the eviction protection level of an existing object.
-        metadata.client_id = client_id;
-        metadata.put_start_time = now;
-
-        // Reconcile soft_pin state with the incoming config.
-        {
-            SpinLocker locker(&metadata.lock);
-            if (config.with_soft_pin && !metadata.soft_pin_timeout) {
-                metadata.soft_pin_timeout.emplace();
-                MasterMetricManager::instance().inc_soft_pin_key_count(1);
-            } else if (!config.with_soft_pin && metadata.soft_pin_timeout) {
-                metadata.soft_pin_timeout.reset();
-                MasterMetricManager::instance().dec_soft_pin_key_count(1);
-            }
-        }
-
-        // Mark COMPLETE → PROCESSING so readers won't see stale data
-        // mid-transfer.  The key becomes unreadable until UpsertEnd.
-        metadata.VisitReplicas(&Replica::fn_is_completed, [](Replica& replica) {
-            replica.mark_processing();
-        });
-
-        shard->processing_keys.insert(key);
-
-        // Return the existing descriptors — same buffer addresses as before.
-        std::vector<Replica::Descriptor> replica_list;
-        const auto& all_replicas = metadata.GetAllReplicas();
-        replica_list.reserve(all_replicas.size());
-        for (const auto& replica : all_replicas) {
-            replica_list.emplace_back(replica.get_descriptor());
-        }
-
-        VLOG(1) << "key=" << key << ", action=upsert_start_case_b_inplace";
-        return replica_list;
-    }
-
-    // --- Case C: different size — discard old replicas and reallocate ---
-    // Old buffers cannot be reused.  Move them to discarded_replicas_ for
-    // delayed release (readers may still hold descriptors without refcnt),
-    // then allocate fresh buffers at the new size.
-    //
-    // Preserve hard_pin and soft_pin from the old metadata so that eviction
-    // protection survives a size-changing upsert (RFC §2.2.2).
-    ReplicateConfig merged_config = config;
-    merged_config.with_hard_pin =
-        merged_config.with_hard_pin || metadata.IsHardPinned();
-    merged_config.with_soft_pin =
-        merged_config.with_soft_pin || metadata.IsSoftPinned();
-
-    auto old_replicas = metadata.PopReplicas();
-    if (!old_replicas.empty()) {
-        std::lock_guard lock(discarded_replicas_mutex_);
-        discarded_replicas_.emplace_back(std::move(old_replicas),
-                                         now + put_start_release_timeout_sec_);
-    }
-    shard->metadata.erase(it);
-
-    VLOG(1) << "key=" << key << ", action=upsert_start_case_c_reallocate";
-    return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                     merged_config, now);
+    return result;
 }
 
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
@@ -1313,35 +1393,50 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
                                      const std::string& key,
                                      ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    MetadataAccessorRW accessor(this, key);
-    if (!accessor.Exists()) {
-        LOG(INFO) << "key=" << key << ", info=object_not_found_for_eviction";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
+    std::vector<std::string> deferred_rt_unregister;
+    tl::expected<void, ErrorCode> result;
 
-    auto& metadata = accessor.Get();
+    {
+        MetadataAccessorRW accessor(this, key);
+        if (!accessor.Exists()) {
+            LOG(INFO) << "key=" << key << ", info=object_not_found_for_eviction";
+            result = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        } else {
+            auto& metadata = accessor.Get();
 
-    if (replica_type == ReplicaType::DISK) {
-        metadata.EraseReplicas(
-            [](const Replica& replica) { return replica.is_disk_replica(); });
-        MasterMetricManager::instance().dec_file_cache_nums();
-    } else if (replica_type == ReplicaType::LOCAL_DISK) {
-        metadata.EraseReplicas([&client_id](const Replica& replica) {
-            return replica.is_local_disk_replica() &&
-                   replica.get_descriptor()
-                           .get_local_disk_descriptor()
-                           .client_id == client_id;
-        });
-    } else {
-        LOG(ERROR) << "key=" << key
-                   << ", error=invalid_replica_type_for_eviction";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
+            if (replica_type == ReplicaType::DISK) {
+                metadata.EraseReplicas(
+                    [](const Replica& replica) { return replica.is_disk_replica(); });
+                MasterMetricManager::instance().dec_file_cache_nums();
+            } else if (replica_type == ReplicaType::LOCAL_DISK) {
+                metadata.EraseReplicas([&client_id](const Replica& replica) {
+                    return replica.is_local_disk_replica() &&
+                           replica.get_descriptor()
+                                   .get_local_disk_descriptor()
+                                   .client_id == client_id;
+                });
+            } else {
+                LOG(ERROR) << "key=" << key
+                           << ", error=invalid_replica_type_for_eviction";
+                result = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
 
-    if (!metadata.IsValid()) {
-        accessor.Erase();
-    }
-    return {};
+            if (!result.has_value()) {
+                // error already set above
+            } else if (!metadata.IsValid()) {
+                DeferRadixTreeUnregister(deferred_rt_unregister, key);
+                accessor.Erase();
+                result = {};
+            } else {
+                result = {};
+            }
+        }
+    }  // accessor destroyed here, metadata shard lock released
+
+    // Now safely unregister from radix tree (acquires radix tree lock only).
+    FlushRadixTreeUnregister(deferred_rt_unregister);
+
+    return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
@@ -1454,125 +1549,139 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
 tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
                                                      const std::string& key) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
-    if (!accessor.Exists()) {
-        LOG(ERROR) << "key=" << key << ", error=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
+    std::vector<std::string> deferred_rt_unregister;
+    tl::expected<void, ErrorCode> result;
 
-    if (!accessor.HasReplicationTask()) {
-        LOG(ERROR) << "key=" << key
-                   << ", error=object has no ongoing replication task";
-        return tl::make_unexpected(ErrorCode::OBJECT_NO_REPLICATION_TASK);
-    }
-
-    auto& task = accessor.GetReplicationTask();
-    if (task.client_id != client_id) {
-        LOG(ERROR) << "Illegal client " << client_id << " to CopyEnd key "
-                   << key << ", was CopyStart-ed by " << task.client_id;
-        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
-    }
-
-    if (task.type != ReplicationTask::Type::COPY) {
-        LOG(ERROR) << "Ongoing replication task type is MOVE instead of COPY";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto& metadata = accessor.Get();
-    auto source_id = task.source_id;
-    auto source = metadata.GetReplicaByID(source_id);
-    if (source == nullptr || !source->is_completed() ||
-        source->has_invalid_mem_handle()) {
-        LOG(ERROR) << "key=" << key << ", source_id=" << source_id
-                   << ", status=" << (source == nullptr ? "nullptr" : "invalid")
-                   << ", copy source becomes invalid during data transfer";
-        // Discard target replicas and clear the replication task.
-        metadata.EraseReplicas([&task](const Replica& replica) {
-            return std::find(task.replica_ids.begin(), task.replica_ids.end(),
-                             replica.id()) != task.replica_ids.end();
-        });
-        accessor.EraseReplicationTask();
-        if (!metadata.IsValid()) {
-            // Remove the object if it does not have any replicas.
-            accessor.Erase();
-        }
-        return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
-    }
-
-    // Decrement source reference count
-    source->dec_refcnt();
-
-    // Mark all replica_ids as complete
-    bool all_complete = true;
-    for (const auto& replica_id : task.replica_ids) {
-        auto replica = metadata.GetReplicaByID(replica_id);
-        if (replica == nullptr || replica->has_invalid_mem_handle()) {
-            LOG(WARNING)
-                << "key=" << key << ", replica_id=" << replica_id
-                << ", copy target becomes invalid during data transfer";
-            all_complete = false;
+    {
+        MetadataAccessorRW accessor(this, key);
+        if (!accessor.Exists()) {
+            LOG(ERROR) << "key=" << key << ", error=object_not_found";
+            result = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        } else if (!accessor.HasReplicationTask()) {
+            LOG(ERROR) << "key=" << key
+                       << ", error=object has no ongoing replication task";
+            result = tl::make_unexpected(ErrorCode::OBJECT_NO_REPLICATION_TASK);
         } else {
-            replica->mark_complete();
+            auto& task = accessor.GetReplicationTask();
+            if (task.client_id != client_id) {
+                LOG(ERROR) << "Illegal client " << client_id << " to CopyEnd key "
+                           << key << ", was CopyStart-ed by " << task.client_id;
+                result = tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+            } else if (task.type != ReplicationTask::Type::COPY) {
+                LOG(ERROR) << "Ongoing replication task type is MOVE instead of COPY";
+                result = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            } else {
+                auto& metadata = accessor.Get();
+                auto source_id = task.source_id;
+                auto source = metadata.GetReplicaByID(source_id);
+                if (source == nullptr || !source->is_completed() ||
+                    source->has_invalid_mem_handle()) {
+                    LOG(ERROR) << "key=" << key << ", source_id=" << source_id
+                               << ", status=" << (source == nullptr ? "nullptr" : "invalid")
+                               << ", copy source becomes invalid during data transfer";
+                    // Discard target replicas and clear the replication task.
+                    metadata.EraseReplicas([&task](const Replica& replica) {
+                        return std::find(task.replica_ids.begin(), task.replica_ids.end(),
+                                         replica.id()) != task.replica_ids.end();
+                    });
+                    accessor.EraseReplicationTask();
+                    if (!metadata.IsValid()) {
+                        // Remove the object if it does not have any replicas.
+                        DeferRadixTreeUnregister(deferred_rt_unregister, key);
+                        accessor.Erase();
+                    }
+                    result = tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
+                } else {
+                    // Decrement source reference count
+                    source->dec_refcnt();
+
+                    // Mark all replica_ids as complete
+                    bool all_complete = true;
+                    for (const auto& replica_id : task.replica_ids) {
+                        auto replica = metadata.GetReplicaByID(replica_id);
+                        if (replica == nullptr || replica->has_invalid_mem_handle()) {
+                            LOG(WARNING)
+                                << "key=" << key << ", replica_id=" << replica_id
+                                << ", copy target becomes invalid during data transfer";
+                            all_complete = false;
+                        } else {
+                            replica->mark_complete();
+                        }
+                    }
+
+                    accessor.EraseReplicationTask();
+
+                    result = all_complete ? tl::expected<void, ErrorCode>()
+                                          : tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
+                }
+            }
         }
-    }
+    }  // accessor destroyed here, metadata shard lock released
 
-    accessor.EraseReplicationTask();
+    // Now safely unregister from radix tree (acquires radix tree lock only).
+    FlushRadixTreeUnregister(deferred_rt_unregister);
 
-    return all_complete ? tl::expected<void, ErrorCode>()
-                        : tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
+    return result;
 }
 
 tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     const UUID& client_id, const std::string& key) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
-    if (!accessor.Exists()) {
-        LOG(ERROR) << "key=" << key << ", error=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
+    std::vector<std::string> deferred_rt_unregister;
+    tl::expected<void, ErrorCode> result;
 
-    if (!accessor.HasReplicationTask()) {
-        LOG(ERROR) << "key=" << key
-                   << ", error=object has no ongoing replication task";
-        return tl::make_unexpected(ErrorCode::OBJECT_NO_REPLICATION_TASK);
-    }
+    {
+        MetadataAccessorRW accessor(this, key);
+        if (!accessor.Exists()) {
+            LOG(ERROR) << "key=" << key << ", error=object_not_found";
+            result = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        } else if (!accessor.HasReplicationTask()) {
+            LOG(ERROR) << "key=" << key
+                       << ", error=object has no ongoing replication task";
+            result = tl::make_unexpected(ErrorCode::OBJECT_NO_REPLICATION_TASK);
+        } else {
+            auto& task = accessor.GetReplicationTask();
+            if (task.client_id != client_id) {
+                LOG(ERROR) << "Illegal client " << client_id << " to CopyRevoke key "
+                           << key << ", was CopyStart-ed by " << task.client_id;
+                result = tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+            } else if (task.type != ReplicationTask::Type::COPY) {
+                LOG(ERROR) << "Ongoing replication task type is MOVE instead of COPY";
+                result = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            } else {
+                auto& metadata = accessor.Get();
+                auto source_id = task.source_id;
+                auto source = metadata.GetReplicaByID(source_id);
+                if (source == nullptr) {
+                    LOG(WARNING) << "key=" << key << ", source_id=" << source_id
+                                 << ", copy source not found during revoke";
+                } else {
+                    // Decrement source reference count
+                    source->dec_refcnt();
+                }
 
-    auto& task = accessor.GetReplicationTask();
-    if (task.client_id != client_id) {
-        LOG(ERROR) << "Illegal client " << client_id << " to CopyRevoke key "
-                   << key << ", was CopyStart-ed by " << task.client_id;
-        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
-    }
+                // Erase all replica_ids
+                for (const auto& replica_id : task.replica_ids) {
+                    metadata.EraseReplicaByID(replica_id);
+                }
 
-    if (task.type != ReplicationTask::Type::COPY) {
-        LOG(ERROR) << "Ongoing replication task type is MOVE instead of COPY";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
+                accessor.EraseReplicationTask();
 
-    auto& metadata = accessor.Get();
-    auto source_id = task.source_id;
-    auto source = metadata.GetReplicaByID(source_id);
-    if (source == nullptr) {
-        LOG(WARNING) << "key=" << key << ", source_id=" << source_id
-                     << ", copy source not found during revoke";
-    } else {
-        // Decrement source reference count
-        source->dec_refcnt();
-    }
+                if (!metadata.IsValid()) {
+                    // Remove the object if it does not have any replicas.
+                    DeferRadixTreeUnregister(deferred_rt_unregister, key);
+                    accessor.Erase();
+                }
 
-    // Erase all replica_ids
-    for (const auto& replica_id : task.replica_ids) {
-        metadata.EraseReplicaByID(replica_id);
-    }
+                result = {};
+            }
+        }
+    }  // accessor destroyed here, metadata shard lock released
 
-    accessor.EraseReplicationTask();
+    // Now safely unregister from radix tree (acquires radix tree lock only).
+    FlushRadixTreeUnregister(deferred_rt_unregister);
 
-    if (!metadata.IsValid()) {
-        // Remove the object if it does not have any replicas.
-        accessor.Erase();
-    }
-
-    return {};
+    return result;
 }
 
 tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
@@ -1669,177 +1778,194 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
 tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
                                                      const std::string& key) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
-    if (!accessor.Exists()) {
-        LOG(ERROR) << "key=" << key << ", error=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
+    std::vector<std::string> deferred_rt_unregister;
+    tl::expected<void, ErrorCode> result;
 
-    if (!accessor.HasReplicationTask()) {
-        LOG(ERROR) << "key=" << key
-                   << ", error=object has no ongoing replication task";
-        return tl::make_unexpected(ErrorCode::OBJECT_NO_REPLICATION_TASK);
-    }
+    {
+        MetadataAccessorRW accessor(this, key);
+        if (!accessor.Exists()) {
+            LOG(ERROR) << "key=" << key << ", error=object_not_found";
+            result = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        } else if (!accessor.HasReplicationTask()) {
+            LOG(ERROR) << "key=" << key
+                       << ", error=object has no ongoing replication task";
+            result = tl::make_unexpected(ErrorCode::OBJECT_NO_REPLICATION_TASK);
+        } else {
+            auto& task = accessor.GetReplicationTask();
+            if (task.client_id != client_id) {
+                LOG(ERROR) << "Illegal client " << client_id << " to MoveEnd key "
+                           << key << ", was MoveStart-ed by " << task.client_id;
+                result = tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+            } else if (task.type != ReplicationTask::Type::MOVE) {
+                LOG(ERROR) << "Ongoing replication task type is COPY instead of MOVE";
+                result = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            } else {
+                auto& metadata = accessor.Get();
+                auto source_id = task.source_id;
+                auto source = metadata.GetReplicaByID(source_id);
+                if (source == nullptr || !source->is_completed() ||
+                    source->has_invalid_mem_handle()) {
+                    LOG(ERROR) << "key=" << key << ", source_id=" << source_id
+                               << ", status=" << (source == nullptr ? "nullptr" : "invalid")
+                               << ", move source becomes invalid during data transfer";
+                    // Discard target replica and clear the replication task.
+                    metadata.EraseReplicas([&task](const Replica& replica) {
+                        return std::find(task.replica_ids.begin(), task.replica_ids.end(),
+                                         replica.id()) != task.replica_ids.end();
+                    });
+                    accessor.EraseReplicationTask();
+                    if (!metadata.IsValid()) {
+                        // Remove the object if it does not have any replicas.
+                        DeferRadixTreeUnregister(deferred_rt_unregister, key);
+                        accessor.Erase();
+                    }
+                    result = tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
+                } else {
+                    // Decrement source reference count
+                    source->dec_refcnt();
 
-    auto& task = accessor.GetReplicationTask();
-    if (task.client_id != client_id) {
-        LOG(ERROR) << "Illegal client " << client_id << " to MoveEnd key "
-                   << key << ", was MoveStart-ed by " << task.client_id;
-        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
-    }
+                    // If the move target has already existed on MoveStart, task.replica_ids
+                    // will be empty. Thus we need to check whether we have replica_ids to
+                    // process.
+                    if (!task.replica_ids.empty()) {
+                        auto replica_id = task.replica_ids[0];
+                        auto replica = metadata.GetReplicaByID(replica_id);
+                        if (replica == nullptr || replica->has_invalid_mem_handle()) {
+                            LOG(WARNING)
+                                << "key=" << key << ", replica_id=" << replica_id
+                                << ", move target becomes invalid during data transfer";
+                            accessor.EraseReplicationTask();
+                            result = tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
+                        } else {
+                            // Mark replica as complete
+                            replica->mark_complete();
+                        }
+                    }
 
-    if (task.type != ReplicationTask::Type::MOVE) {
-        LOG(ERROR) << "Ongoing replication task type is COPY instead of MOVE";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
+                    if (!result.has_value() || result.error() != ErrorCode::REPLICA_IS_GONE) {
+                        // Remove the source replica and release its space later.
+                        auto source_replica =
+                            metadata.PopReplicas([&source_id](const Replica& replica) {
+                                return replica.id() == source_id;
+                            });
+                        if (!source_replica.empty()) {
+                            std::lock_guard lock(discarded_replicas_mutex_);
+                            discarded_replicas_.emplace_back(
+                                std::move(source_replica),
+                                std::chrono::system_clock::now() + put_start_release_timeout_sec_);
+                        }
 
-    auto& metadata = accessor.Get();
-    auto source_id = task.source_id;
-    auto source = metadata.GetReplicaByID(source_id);
-    if (source == nullptr || !source->is_completed() ||
-        source->has_invalid_mem_handle()) {
-        LOG(ERROR) << "key=" << key << ", source_id=" << source_id
-                   << ", status=" << (source == nullptr ? "nullptr" : "invalid")
-                   << ", move source becomes invalid during data transfer";
-        // Discard target replica and clear the replication task.
-        metadata.EraseReplicas([&task](const Replica& replica) {
-            return std::find(task.replica_ids.begin(), task.replica_ids.end(),
-                             replica.id()) != task.replica_ids.end();
-        });
-        accessor.EraseReplicationTask();
-        if (!metadata.IsValid()) {
-            // Remove the object if it does not have any replicas.
-            accessor.Erase();
+                        accessor.EraseReplicationTask();
+                        result = {};
+                    }
+                }
+            }
         }
-        return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
-    }
+    }  // accessor destroyed here, metadata shard lock released
 
-    // Decrement source reference count
-    source->dec_refcnt();
+    // Now safely unregister from radix tree (acquires radix tree lock only).
+    FlushRadixTreeUnregister(deferred_rt_unregister);
 
-    // If the move target has already existed on MoveStart, task.replica_ids
-    // will be empty. Thus we need to check whether we have replica_ids to
-    // process.
-    if (!task.replica_ids.empty()) {
-        auto replica_id = task.replica_ids[0];
-        auto replica = metadata.GetReplicaByID(replica_id);
-        if (replica == nullptr || replica->has_invalid_mem_handle()) {
-            LOG(WARNING)
-                << "key=" << key << ", replica_id=" << replica_id
-                << ", move target becomes invalid during data transfer";
-            accessor.EraseReplicationTask();
-            return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
-        }
-
-        // Mark replica as complete
-        replica->mark_complete();
-    }
-
-    // Remove the source replica and release its space later.
-    auto source_replica =
-        metadata.PopReplicas([&source_id](const Replica& replica) {
-            return replica.id() == source_id;
-        });
-    if (!source_replica.empty()) {
-        std::lock_guard lock(discarded_replicas_mutex_);
-        discarded_replicas_.emplace_back(
-            std::move(source_replica),
-            std::chrono::system_clock::now() + put_start_release_timeout_sec_);
-    }
-
-    accessor.EraseReplicationTask();
-
-    return {};
+    return result;
 }
 
 tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     const UUID& client_id, const std::string& key) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
-    if (!accessor.Exists()) {
-        LOG(ERROR) << "key=" << key << ", error=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
+    std::vector<std::string> deferred_rt_unregister;
+    tl::expected<void, ErrorCode> result;
 
-    if (!accessor.HasReplicationTask()) {
-        LOG(ERROR) << "key=" << key
-                   << ", error=object has no ongoing replication task";
-        return tl::make_unexpected(ErrorCode::OBJECT_NO_REPLICATION_TASK);
-    }
+    {
+        MetadataAccessorRW accessor(this, key);
+        if (!accessor.Exists()) {
+            LOG(ERROR) << "key=" << key << ", error=object_not_found";
+            result = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        } else if (!accessor.HasReplicationTask()) {
+            LOG(ERROR) << "key=" << key
+                       << ", error=object has no ongoing replication task";
+            result = tl::make_unexpected(ErrorCode::OBJECT_NO_REPLICATION_TASK);
+        } else {
+            auto& task = accessor.GetReplicationTask();
+            if (task.client_id != client_id) {
+                LOG(ERROR) << "Illegal client " << client_id << " to MoveRevoke key "
+                           << key << ", was MoveStart-ed by " << task.client_id;
+                result = tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+            } else if (task.type != ReplicationTask::Type::MOVE) {
+                LOG(ERROR) << "Ongoing replication task type is COPY instead of MOVE";
+                result = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            } else {
+                auto& metadata = accessor.Get();
+                auto source_id = task.source_id;
+                auto source = metadata.GetReplicaByID(source_id);
+                if (source == nullptr) {
+                    LOG(WARNING) << "key=" << key << ", source_id=" << source_id
+                                 << ", move source not found during revoke";
+                } else {
+                    // Decrement source reference count
+                    source->dec_refcnt();
+                }
 
-    auto& task = accessor.GetReplicationTask();
-    if (task.client_id != client_id) {
-        LOG(ERROR) << "Illegal client " << client_id << " to MoveRevoke key "
-                   << key << ", was MoveStart-ed by " << task.client_id;
-        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
-    }
+                // Erase all replica_ids (in MOVE operation, there should be at most one)
+                for (const auto& replica_id : task.replica_ids) {
+                    metadata.EraseReplicaByID(replica_id);
+                }
 
-    if (task.type != ReplicationTask::Type::MOVE) {
-        LOG(ERROR) << "Ongoing replication task type is COPY instead of MOVE";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
+                accessor.EraseReplicationTask();
 
-    auto& metadata = accessor.Get();
-    auto source_id = task.source_id;
-    auto source = metadata.GetReplicaByID(source_id);
-    if (source == nullptr) {
-        LOG(WARNING) << "key=" << key << ", source_id=" << source_id
-                     << ", move source not found during revoke";
-    } else {
-        // Decrement source reference count
-        source->dec_refcnt();
-    }
+                if (!metadata.IsValid()) {
+                    // Remove the object if it does not have any replicas.
+                    DeferRadixTreeUnregister(deferred_rt_unregister, key);
+                    accessor.Erase();
+                }
 
-    // Erase all replica_ids (in MOVE operation, there should be at most one)
-    for (const auto& replica_id : task.replica_ids) {
-        metadata.EraseReplicaByID(replica_id);
-    }
+                result = {};
+            }
+        }
+    }  // accessor destroyed here, metadata shard lock released
 
-    accessor.EraseReplicationTask();
+    // Now safely unregister from radix tree (acquires radix tree lock only).
+    FlushRadixTreeUnregister(deferred_rt_unregister);
 
-    if (!metadata.IsValid()) {
-        // Remove the object if it does not have any replicas.
-        accessor.Erase();
-    }
-
-    return {};
+    return result;
 }
 
 auto MasterService::Remove(const std::string& key, bool force)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
-    if (!accessor.Exists()) {
-        VLOG(1) << "key=" << key << ", error=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
+    std::vector<std::string> deferred_rt_unregister;
+    tl::expected<void, ErrorCode> result;
 
-    auto& metadata = accessor.Get();
+    {
+        MetadataAccessorRW accessor(this, key);
+        if (!accessor.Exists()) {
+            VLOG(1) << "key=" << key << ", error=object_not_found";
+            result = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        } else {
+            auto& metadata = accessor.Get();
 
-    if (!force && !metadata.IsLeaseExpired()) {
-        VLOG(1) << "key=" << key << ", error=object_has_lease";
-        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
-    }
+            if (!force && !metadata.IsLeaseExpired()) {
+                VLOG(1) << "key=" << key << ", error=object_has_lease";
+                result = tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+            } else if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
+                LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
+                result = tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+            } else if (accessor.HasReplicationTask()) {
+                LOG(ERROR) << "key=" << key
+                           << ", error=object_has_replication_task";
+                result = tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+            } else {
+                DeferRadixTreeUnregister(deferred_rt_unregister, key);
+                // Remove object metadata (lock held by accessor)
+                accessor.Erase();
+                result = {};
+            }
+        }
+    }  // accessor destroyed here, metadata shard lock released
 
-    /**
-     * The reason the force operation here does not bypass the replica
-     * check is that put operations (which could also be copy or move)
-     * and remove operations might be happening concurrently, making it
-     * extremely dangerous to perform a direct removal at this point.
-     */
-    if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
-        LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
-        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
-    }
+    // Now safely unregister from radix tree (acquires radix tree lock only).
+    FlushRadixTreeUnregister(deferred_rt_unregister);
 
-    if (accessor.HasReplicationTask()) {
-        LOG(ERROR) << "key=" << key << ", error=object_has_replication_task";
-        return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
-    }
-
-    // Remove object metadata
-    accessor.Erase();
-    return {};
+    return result;
 }
 
 auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
@@ -1856,6 +1982,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    std::vector<std::string> deferred_rt_unregister;
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRW shard(this, i);
 
@@ -1892,13 +2019,17 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
+                DeferRadixTreeUnregister(deferred_rt_unregister, it->first);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
                 ++it;
             }
         }
-    }
+    }  // all shards processed, metadata locks released
+
+    // Now safely unregister from radix tree (acquires radix tree locks only).
+    FlushRadixTreeUnregister(deferred_rt_unregister);
 
     VLOG(1) << "action=remove_by_regex, pattern=" << regex_pattern
             << ", removed_count=" << removed_count;
@@ -1912,6 +2043,7 @@ long MasterService::RemoveAll(bool force) {
     // calling std::chrono::steady_clock::now()
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
+    std::vector<std::string> deferred_rt_unregister;
 
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
@@ -1934,13 +2066,17 @@ long MasterService::RemoveAll(bool force) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
+                DeferRadixTreeUnregister(deferred_rt_unregister, it->first);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
                 ++it;
             }
         }
-    }
+    }  // all shards processed, metadata locks released
+
+    // Now safely unregister from radix tree (acquires radix tree locks only).
+    FlushRadixTreeUnregister(deferred_rt_unregister);
 
     VLOG(1) << "action=remove_all_objects"
             << ", removed_count=" << removed_count
@@ -1968,6 +2104,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
 
     auto alive_clients = getAliveClientsSnapshot();
+    std::vector<std::string> deferred_rt_unregister;
 
     // Process each shard once, acquiring lock per shard
     for (auto& [shard_idx, key_group] : keys_by_shard) {
@@ -1987,6 +2124,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
             // Clean up stale replica handles (consistent with single Remove)
             if (CleanupStaleHandles(it->second, alive_clients)) {
+                DeferRadixTreeUnregister(deferred_rt_unregister, key);
                 shard->processing_keys.erase(key);
                 shard->replication_tasks.erase(key);
                 shard->offloading_tasks.erase(key);
@@ -2025,11 +2163,16 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 continue;
             }
 
+            // Defer radix tree unregister until after metadata lock is released
+            DeferRadixTreeUnregister(deferred_rt_unregister, key);
             // Remove object metadata
             shard->metadata.erase(it);
             results[original_idx] = {};  // Success
         }
-    }
+    }  // all shards processed, metadata locks released
+
+    // Now safely unregister from radix tree (acquires radix tree locks only).
+    FlushRadixTreeUnregister(deferred_rt_unregister);
 
     return results;
 }
@@ -2254,13 +2397,19 @@ void MasterService::EvictionThreadFunc() {
             // Try discarding expired processing keys and ongoing replication
             // tasks if we have not done this for a long time.
             {
-                std::shared_lock<std::shared_mutex> shared_lock(
-                    snapshot_mutex_);
-                for (size_t i = 0; i < kNumShards; i++) {
-                    MetadataShardAccessorRW shard(this, i);
-                    DiscardExpiredProcessingReplicas(shard, now);
-                }
-                ReleaseExpiredDiscardedReplicas(now);
+                std::vector<std::string> deferred_rt_unregister;
+                {
+                    std::shared_lock<std::shared_mutex> shared_lock(
+                        snapshot_mutex_);
+                    for (size_t i = 0; i < kNumShards; i++) {
+                        MetadataShardAccessorRW shard(this, i);
+                        DiscardExpiredProcessingReplicas(shard, now, deferred_rt_unregister);
+                    }
+                    ReleaseExpiredDiscardedReplicas(now);
+                }  // shards and snapshot lock destroyed here
+                // Flush deferred radix tree unregisters after releasing all
+                // metadata shard locks.
+                FlushRadixTreeUnregister(deferred_rt_unregister);
             }
             last_discard_time = now;
         }
@@ -2274,7 +2423,8 @@ void MasterService::EvictionThreadFunc() {
 
 void MasterService::DiscardExpiredProcessingReplicas(
     MetadataShardAccessorRW& shard,
-    const std::chrono::system_clock::time_point& now) {
+    const std::chrono::system_clock::time_point& now,
+    std::vector<std::string>& deferred_rt_unregister) {
     std::list<DiscardedReplicas> discarded_replicas;
 
     // Part 1: Discard expired PutStart operations.
@@ -2296,6 +2446,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
         if (!metadata.IsValid() ||
             metadata.AllReplicas(&Replica::fn_is_completed)) {
             if (!metadata.IsValid()) {
+                DeferRadixTreeUnregister(deferred_rt_unregister, it->first);
                 shard->metadata.erase(it);
             }
             key_it = shard->processing_keys.erase(key_it);
@@ -2318,6 +2469,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (!metadata.IsValid()) {
                 // All replicas of this object are discarded, just
                 // remove the whole object.
+                DeferRadixTreeUnregister(deferred_rt_unregister, it->first);
                 shard->metadata.erase(it);
             }
 
@@ -2371,6 +2523,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         // Check whether the object is still valid.
         if (!metadata.IsValid()) {
+            DeferRadixTreeUnregister(deferred_rt_unregister, metadata_it->first);
             shard->metadata.erase(metadata_it);
         }
 
@@ -3342,6 +3495,12 @@ bool MasterService::TryRestoreStateFromSnapshot(
                                 ReplicaStatus::COMPLETE) ||
                             (it->second.IsLeaseExpired(cleanup_now) &&
                              !it->second.IsSoftPinned(cleanup_now))) {
+                            if (enable_radix_tree_) {
+                                auto prefix_hash =
+                                    extractPrefixHash(it->first);
+                                UnregisterRadixTreeNodeInternal(
+                                    prefix_hash, it->first);
+                            }
                             VLOG(1)
                                 << "clear metadata key=" << it->first
                                 << " ,lease_timeout="
@@ -3488,6 +3647,49 @@ void MasterService::BatchEvict(double evict_ratio_target,
         evict_ratio_lowerbound = evict_ratio_target;
     }
 
+    // Phase 0: Radix-tree-aware leaf eviction (if enabled)
+    if (enable_radix_tree_) {
+        auto rt_result = RadixTreeAwareEvict(evict_ratio_target,
+                                             evict_ratio_lowerbound);
+        if (rt_result.evicted_count > 0) {
+            VLOG(1) << "Radix-tree-aware eviction evicted "
+                    << rt_result.evicted_count
+                    << " objects, freed " << rt_result.freed_size
+                    << " bytes";
+        }
+        // If we freed enough via radix-tree eviction, skip traditional
+        // eviction. We check against the lowerbound because traditional
+        // eviction is a fallback.
+        long object_count = 0;
+        for (size_t i = 0; i < kNumShards; i++) {
+            MetadataShardAccessorRO shard(this, i);
+            object_count += shard->metadata.size();
+        }
+        double current_used_ratio = 0;
+        {
+            ScopedAllocatorAccess allocator_access =
+                segment_manager_.getAllocatorAccess();
+            const auto& allocator_manager =
+                allocator_access.getAllocatorManager();
+            uint64_t total_capacity = 0;
+            uint64_t total_used = 0;
+            for (const auto& [name, allocators] :
+                 allocator_manager.getAllocators()) {
+                for (const auto& allocator : allocators) {
+                    total_capacity += allocator->capacity();
+                    total_used += allocator->size();
+                }
+            }
+            if (total_capacity > 0) {
+                current_used_ratio =
+                    static_cast<double>(total_used) / total_capacity;
+            }
+        }
+        if (current_used_ratio <= eviction_high_watermark_ratio_) {
+            return;  // Sufficient space freed, skip traditional eviction
+        }
+    }
+
     auto now = std::chrono::system_clock::now();
     long evicted_count = 0;
     long object_count = 0;
@@ -3590,6 +3792,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // shards. No need to use expensive random_device here.
     size_t start_idx = rand() % kNumShards;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    std::vector<std::string> deferred_rt_unregister;
 
     // First pass: evict objects without soft pin and lease expired
     for (size_t i = 0; i < kNumShards; i++) {
@@ -3597,7 +3800,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         // Discard expired processing keys first so that they won't be counted
         // in later evictions.
-        DiscardExpiredProcessingReplicas(shard, now);
+        DiscardExpiredProcessingReplicas(shard, now, deferred_rt_unregister);
 
         // object_count must be updated at beginning as it will be used later
         // to compute ideal_evict_num
@@ -3663,6 +3866,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         try_evict_or_offload(it->first, it->second, shard);
                     total_freed_size += freed;
                     if (it->second.IsValid() == false) {
+                        DeferRadixTreeUnregister(deferred_rt_unregister, it->first);
                         it = shard->metadata.erase(it);
                     } else {
                         ++it;
@@ -3726,6 +3930,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             try_evict_or_offload(it->first, it->second, shard);
                         total_freed_size += freed;
                         if (it->second.IsValid() == false) {
+                            DeferRadixTreeUnregister(deferred_rt_unregister, it->first);
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
@@ -3777,6 +3982,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             try_evict_or_offload(it->first, it->second, shard);
                         total_freed_size += freed;
                         if (it->second.IsValid() == false) {
+                            DeferRadixTreeUnregister(deferred_rt_unregister, it->first);
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
@@ -3841,6 +4047,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
                      << " object(s); force-evicted without disk offload "
                         "(offload_force_evict=true).";
     }
+
+    // Now safely unregister from radix tree (acquires radix tree locks only,
+    // no metadata lock held).  This must come after all shard accessors are
+    // destroyed.
+    FlushRadixTreeUnregister(deferred_rt_unregister);
 }
 
 void MasterService::ClientMonitorFunc() {
@@ -5162,6 +5373,399 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
     }
 
     return {};
+}
+
+// ========================================================================
+// Radix Tree Index Implementation
+// ========================================================================
+
+tl::expected<void, ErrorCode> MasterService::RegisterRadixTreeNode(
+    const std::string& prefix_hash,
+    const std::string& parent_prefix_hash,
+    const std::vector<std::string>& keys) {
+    if (!enable_radix_tree_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+
+    for (const auto& key : keys) {
+        RegisterRadixTreeNodeInternal(prefix_hash, parent_prefix_hash, key);
+    }
+
+    return {};
+}
+
+tl::expected<GetKeysByPrefixResponse, ErrorCode>
+MasterService::GetKeysByPrefix(const std::string& prefix_hash) {
+    if (!enable_radix_tree_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+
+    GetKeysByPrefixResponse response;
+    size_t shard_idx = getRadixTreeShardIndex(prefix_hash);
+    RadixTreeShardAccessorRO shard(this, shard_idx);
+
+    auto it = shard->nodes.find(prefix_hash);
+    if (it == shard->nodes.end()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    const auto& node = it->second;
+    response.keys.assign(node.registered_keys.begin(),
+                         node.registered_keys.end());
+    response.parent_prefix_hash = node.parent_prefix_hash;
+    response.children_prefix_hashes.assign(node.children.begin(),
+                                           node.children.end());
+
+    return response;
+}
+
+std::vector<tl::expected<RegisterRadixTreeNodeResponse, ErrorCode>>
+MasterService::BatchRegisterRadixTreeNode(
+    const std::vector<RegisterRadixTreeNodeRequest>& requests) {
+    std::vector<tl::expected<RegisterRadixTreeNodeResponse, ErrorCode>> results;
+    results.reserve(requests.size());
+
+    for (const auto& request : requests) {
+        auto result = RegisterRadixTreeNode(request.prefix_hash,
+                                             request.parent_prefix_hash,
+                                             request.keys);
+        if (result.has_value()) {
+            results.emplace_back(RegisterRadixTreeNodeResponse{});
+        } else {
+            results.emplace_back(tl::make_unexpected(result.error()));
+        }
+    }
+
+    return results;
+}
+
+void MasterService::RegisterRadixTreeNodeInternal(
+    const std::string& prefix_hash,
+    const std::string& parent_prefix_hash,
+    const std::string& full_key) {
+    if (!enable_radix_tree_) return;
+
+    size_t shard_idx = getRadixTreeShardIndex(prefix_hash);
+
+    if (parent_prefix_hash.empty()) {
+        // No parent: simple case, only need one shard lock
+        RadixTreeShardAccessorRW shard(this, shard_idx);
+        auto& nodes = shard->nodes;
+        auto it = nodes.find(prefix_hash);
+        if (it == nodes.end()) {
+            RadixTreeNode node;
+            node.prefix_hash = prefix_hash;
+            node.parent_prefix_hash = "";
+            node.registered_keys.insert(full_key);
+            nodes.emplace(prefix_hash, std::move(node));
+        } else {
+            it->second.registered_keys.insert(full_key);
+        }
+    } else {
+        // Parent exists: need dual-shard lock
+        size_t parent_shard_idx = getRadixTreeShardIndex(parent_prefix_hash);
+        ScopedRadixTreeDualLock dual_lock(this, shard_idx, parent_shard_idx);
+
+        auto& nodes =
+            radix_tree_shards_[shard_idx].nodes;
+        auto it = nodes.find(prefix_hash);
+        if (it == nodes.end()) {
+            RadixTreeNode node;
+            node.prefix_hash = prefix_hash;
+            node.parent_prefix_hash = parent_prefix_hash;
+            node.registered_keys.insert(full_key);
+            nodes.emplace(prefix_hash, std::move(node));
+        } else {
+            it->second.registered_keys.insert(full_key);
+            // If node already existed but didn't have a parent, update it
+            if (it->second.parent_prefix_hash.empty() &&
+                !parent_prefix_hash.empty()) {
+                it->second.parent_prefix_hash = parent_prefix_hash;
+            }
+        }
+
+        // Add this node as a child of the parent
+        auto& parent_nodes =
+            radix_tree_shards_[parent_shard_idx].nodes;
+        auto parent_it = parent_nodes.find(parent_prefix_hash);
+        if (parent_it != parent_nodes.end()) {
+            parent_it->second.children.insert(prefix_hash);
+        } else {
+            // Create the parent node if it doesn't exist yet
+            RadixTreeNode parent_node;
+            parent_node.prefix_hash = parent_prefix_hash;
+            parent_node.children.insert(prefix_hash);
+            parent_nodes.emplace(parent_prefix_hash, std::move(parent_node));
+        }
+    }
+}
+
+void MasterService::UnregisterRadixTreeNodeInternal(
+    const std::string& prefix_hash,
+    const std::string& full_key) {
+    if (!enable_radix_tree_) return;
+
+    size_t shard_idx = getRadixTreeShardIndex(prefix_hash);
+    std::string parent_hash;
+
+    {
+        RadixTreeShardAccessorRW shard(this, shard_idx);
+        auto& nodes = shard->nodes;
+        auto it = nodes.find(prefix_hash);
+        if (it == nodes.end()) return;
+
+        it->second.registered_keys.erase(full_key);
+
+        // If the node is now empty and has no children, remove it
+        if (it->second.registered_keys.empty() && it->second.IsLeaf()) {
+            parent_hash = it->second.parent_prefix_hash;
+            nodes.erase(it);
+        } else {
+            // Node still has keys or children, no cascade needed
+            return;
+        }
+    }
+
+    // If we removed a node, cascade cleanup upward
+    if (!parent_hash.empty()) {
+        CascadeCleanup(prefix_hash, parent_hash);
+    }
+}
+
+void MasterService::CascadeCleanup(const std::string& removed_prefix_hash,
+                                    const std::string& parent_prefix_hash) {
+    // Iteratively walk up the tree, removing empty+leaf nodes
+    std::string current_parent = parent_prefix_hash;
+    std::string removed_child = removed_prefix_hash;
+
+    while (!current_parent.empty()) {
+        size_t parent_shard_idx = getRadixTreeShardIndex(current_parent);
+        std::string next_parent;
+
+        {
+            RadixTreeShardAccessorRW shard(this, parent_shard_idx);
+            auto& nodes = shard->nodes;
+            auto it = nodes.find(current_parent);
+            if (it == nodes.end()) {
+                // Parent already removed, stop
+                break;
+            }
+
+            // Remove the child from parent's children set
+            it->second.children.erase(removed_child);
+
+            // Check if parent is now empty and leaf
+            if (it->second.registered_keys.empty() && it->second.IsLeaf()) {
+                next_parent = it->second.parent_prefix_hash;
+                nodes.erase(it);
+                removed_child = current_parent;
+                current_parent = next_parent;
+            } else {
+                // Parent still has content or children, stop cascading
+                break;
+            }
+        }
+    }
+}
+
+MasterService::RadixTreeEvictResult
+MasterService::RadixTreeAwareEvict(double evict_ratio_target,
+                                    double evict_ratio_lowerbound) {
+    RadixTreeEvictResult result;
+    if (!enable_radix_tree_) return result;
+
+    auto now = std::chrono::system_clock::now();
+
+    // ================================================================
+    // Multi-round leaf-to-root cascading eviction
+    // ================================================================
+    // Round 1: evict all evictable leaf nodes.
+    // FlushRadixTreeUnregister + CascadeCleanup removes empty shells
+    // and removes child references from parents.  Parents that lost
+    // ALL children become new leaves (but still have registered_keys).
+    // Round 2+: evict those new leaves.  Repeat until memory usage
+    // drops below the high watermark, no more leaves exist, or
+    // kMaxCascadeRounds is reached.
+    //
+    // The exit condition is memory watermark only (not object count
+    // ratio)
+    // ================================================================
+    for (size_t cascade_round = 0; cascade_round < kMaxCascadeRounds;
+         ++cascade_round) {
+        // Check memory watermark before each round — if we've already
+        // freed enough, stop immediately.
+        double current_used_ratio =
+            MasterMetricManager::instance().get_global_mem_used_ratio();
+        if (current_used_ratio <= eviction_high_watermark_ratio_) {
+            break;
+        }
+
+        // ---- Phase 1: Collect leaf node candidates (radix tree shared locks) ----
+        struct LeafCandidate {
+            std::string prefix_hash;
+            std::vector<std::string> keys;
+        };
+        std::vector<LeafCandidate> leaf_candidates;
+
+        for (size_t i = 0; i < kNumRadixTreeShards; i++) {
+            RadixTreeShardAccessorRO shard(this, i);
+            for (const auto& [prefix, node] : shard->nodes) {
+                if (node.IsLeaf() && !node.registered_keys.empty()) {
+                    LeafCandidate candidate;
+                    candidate.prefix_hash = prefix;
+                    candidate.keys.assign(node.registered_keys.begin(),
+                                          node.registered_keys.end());
+                    leaf_candidates.push_back(std::move(candidate));
+                }
+            }
+        }
+
+        if (leaf_candidates.empty()) break;  // No more leaves to evict
+
+        // ---- Phase 2: Check evictability per leaf (metadata shared locks) ----
+        struct EvictableLeaf {
+            std::chrono::system_clock::time_point oldest_lease;
+            std::string prefix_hash;
+            std::vector<std::string> keys;
+        };
+        std::vector<EvictableLeaf> evictable_leaves;
+
+        for (auto& candidate : leaf_candidates) {
+            bool all_evictable = true;
+            std::chrono::system_clock::time_point oldest_lease =
+                std::chrono::system_clock::time_point::max();
+
+            for (const auto& key : candidate.keys) {
+                MetadataAccessorRO meta(this, key);
+                if (!meta.Exists()) {
+                    all_evictable = false;
+                    break;
+                }
+                const auto& metadata = meta.Get();
+                if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now)) {
+                    all_evictable = false;
+                    break;
+                }
+                bool has_evictable_replica = metadata.HasReplica(
+                    [](const Replica& replica) {
+                        return replica.is_memory_replica() &&
+                               replica.is_completed() &&
+                               replica.get_refcnt() == 0;
+                    });
+                if (!has_evictable_replica) {
+                    all_evictable = false;
+                    break;
+                }
+
+                // Use lease_timeout for eviction ordering:
+                // objects with the smallest lease_timeout (longest
+                // expired / least recently used) are evicted first.
+                // Thread-safe via GetLeaseTimeout() which acquires
+                // the per-object SpinLock.
+                auto key_lease_timeout = metadata.GetLeaseTimeout();
+                if (key_lease_timeout < oldest_lease) {
+                    oldest_lease = key_lease_timeout;
+                }
+            }
+
+            if (all_evictable) {
+                evictable_leaves.push_back({oldest_lease,
+                                            std::move(candidate.prefix_hash),
+                                            std::move(candidate.keys)});
+            }
+        }
+
+        if (evictable_leaves.empty()) break;  // No evictable leaves remain
+
+        // Sort by smallest lease_timeout (evict longest-expired / least-recently-used first)
+        std::sort(evictable_leaves.begin(), evictable_leaves.end(),
+                  [](const EvictableLeaf& a, const EvictableLeaf& b) {
+                      return a.oldest_lease < b.oldest_lease;
+                  });
+
+        // ---- Phase 3: Execute eviction (metadata write locks + deferred) ----
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        std::vector<std::string> deferred_rt_unregister;
+
+        for (auto& leaf : evictable_leaves) {
+
+            // Re-check that this is still a leaf (radix tree may have changed)
+            {
+                size_t rt_shard_idx =
+                    getRadixTreeShardIndex(leaf.prefix_hash);
+                RadixTreeShardAccessorRO rt_shard(this, rt_shard_idx);
+                auto it = rt_shard->nodes.find(leaf.prefix_hash);
+                if (it == rt_shard->nodes.end() || !it->second.IsLeaf()) {
+                    continue;  // No longer a leaf, skip
+                }
+            }
+
+            // Evict all keys under this leaf
+            for (const auto& key : leaf.keys) {
+                size_t meta_shard_idx = getShardIndex(key);
+                MetadataShardAccessorRW meta_shard(this, meta_shard_idx);
+                auto it = meta_shard->metadata.find(key);
+                if (it == meta_shard->metadata.end()) continue;
+
+                // Re-validate (state may have changed since Phase 2)
+                if (it->second.IsHardPinned() ||
+                    !it->second.IsLeaseExpired(now)) {
+                    continue;
+                }
+
+                uint64_t freed = 0;
+                auto evict_replicas = [&freed](ObjectMetadata& metadata) {
+                    return metadata.EraseReplicas(
+                        [&freed](const Replica& replica) {
+                            if (replica.is_memory_replica() &&
+                                replica.is_completed() &&
+                                replica.get_refcnt() == 0) {
+                                freed += replica.get_memory_buffer_size();
+                                return true;
+                            }
+                            return false;
+                        });
+                };
+
+                if (evict_replicas(it->second) > 0) {
+                    result.freed_size += freed;
+                    result.evicted_count++;
+                    DeferRadixTreeUnregister(deferred_rt_unregister, key);
+                    meta_shard->metadata.erase(it);
+                }
+            }
+        }  // <<<< all metadata shard locks released >>>>
+
+        // Now safely unregister from radix tree (acquires radix tree locks
+        // only, no metadata lock held).  UnregisterRadixTreeNodeInternal
+        // will remove empty leaf nodes, and CascadeCleanup will:
+        //   - Remove child references from parents
+        //   - If a parent becomes empty+leaf, delete it and continue up
+        //   - If a parent still has other children, keep it (it will
+        //     remain a non-leaf and won't be evicted this round; if all
+        //     its children are eventually evicted, it becomes a leaf in
+        //     a subsequent cascade round)
+        FlushRadixTreeUnregister(deferred_rt_unregister);
+
+        // Check memory watermark after each round — if usage has dropped
+        // below the high watermark, the eviction goal is met.
+        double current_used_ratio =
+            MasterMetricManager::instance().get_global_mem_used_ratio();
+        if (current_used_ratio <= eviction_high_watermark_ratio_) {
+            VLOG(1) << "Cascading eviction round " << cascade_round
+                    << " freed " << result.freed_size << " bytes, "
+                    << "memory ratio " << current_used_ratio
+                    << " <= high_watermark " << eviction_high_watermark_ratio_
+                    << ", eviction goal met";
+            break;
+        }
+    }  // end cascade round
+
+    return result;
 }
 
 }  // namespace mooncake

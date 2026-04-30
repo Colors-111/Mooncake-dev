@@ -46,6 +46,8 @@ pub struct ReplicateConfig {
     pub with_hard_pin: bool,
     /// Whitelist of segment names that should host a replica.
     pub preferred_segments: Vec<String>,
+    /// Radix tree: parent block hash for prefix-aware KV cache management.
+    pub parent_block_hash: String,
 }
 
 impl ReplicateConfig {
@@ -60,13 +62,28 @@ impl ReplicateConfig {
         (ffi::mooncake_replicate_config_t, Vec<CString>, Vec<*const libc::c_char>),
         StoreError,
     > {
-        let strings: Vec<CString> = self
+        let mut strings: Vec<CString> = self
             .preferred_segments
             .iter()
             .map(|s| CString::new(s.as_str()).map_err(StoreError::from))
             .collect::<Result<_, _>>()?;
 
         let ptrs: Vec<*const libc::c_char> = strings.iter().map(|s| s.as_ptr()).collect();
+
+        let parent_block_hash_c = if self.parent_block_hash.is_empty() {
+            None
+        } else {
+            Some(CString::new(self.parent_block_hash.as_str()).map_err(StoreError::from)?)
+        };
+
+        let parent_block_hash_ptr = parent_block_hash_c
+            .as_ref()
+            .map_or(std::ptr::null(), |s| s.as_ptr());
+
+        // Push parent_block_hash CString into `strings` to keep it alive
+        if let Some(s) = parent_block_hash_c {
+            strings.push(s);
+        }
 
         let c_config = ffi::mooncake_replicate_config_t {
             replica_num: self.replica_num,
@@ -78,6 +95,7 @@ impl ReplicateConfig {
                 ptrs.as_ptr() as *mut *const libc::c_char
             },
             preferred_segments_count: ptrs.len(),
+            parent_block_hash: parent_block_hash_ptr as *const libc::c_char,
         };
 
         Ok((c_config, strings, ptrs))
@@ -470,6 +488,7 @@ mod tests {
             with_soft_pin: true,
             with_hard_pin: false,
             preferred_segments: Vec::new(),
+            parent_block_hash: String::new(),
         };
 
         let (ffi_cfg, strings, ptrs) = config.to_ffi().expect("to_ffi should succeed");
@@ -489,6 +508,7 @@ mod tests {
             with_soft_pin: false,
             with_hard_pin: false,
             preferred_segments: vec!["seg-a".to_string(), "seg-b".to_string()],
+            parent_block_hash: String::new(),
         };
 
         let (ffi_cfg, strings, ptrs) = config.to_ffi().expect("to_ffi should succeed");
@@ -513,6 +533,7 @@ mod tests {
             with_soft_pin: false,
             with_hard_pin: false,
             preferred_segments: vec!["bad\0segment".to_string()],
+            parent_block_hash: String::new(),
         };
 
         assert!(matches!(
@@ -536,6 +557,7 @@ mod tests {
             with_soft_pin: true,
             with_hard_pin: false,
             preferred_segments: vec!["x".to_string(), "y".to_string()],
+            parent_block_hash: String::new(),
         };
 
         let (c_cfg, strings, ptrs) =

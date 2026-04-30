@@ -30,6 +30,7 @@ struct mooncake_replicate_config {
     int with_hard_pin;
     const char **preferred_segments;
     size_t preferred_segments_count;
+    const char *parent_block_hash;  // Radix tree: parent block hash (or NULL)
 };
 typedef struct mooncake_replicate_config mooncake_replicate_config_t;
 

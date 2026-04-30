@@ -123,17 +123,18 @@ func (s *Store) Close() {
 // Put operations
 // ---------------------------------------------------------------------------
 
-func (s *Store) toCConfig(cfg *ReplicateConfig) (C.mooncake_replicate_config_t, []*C.char, error) {
+func (s *Store) toCConfig(cfg *ReplicateConfig) (C.mooncake_replicate_config_t, []*C.char, *C.char, error) {
 	var cc C.mooncake_replicate_config_t
 	var cSegs []*C.char
+	var cParentBlockHash *C.char
 
 	if cfg == nil {
 		cc.replica_num = 1
-		return cc, nil, nil
+		return cc, nil, nil, nil
 	}
 
 	if cfg.ReplicaNum <= 0 {
-		return cc, nil, ErrInvalidArgument
+		return cc, nil, nil, ErrInvalidArgument
 	}
 
 	cc.replica_num = C.size_t(cfg.ReplicaNum)
@@ -153,7 +154,12 @@ func (s *Store) toCConfig(cfg *ReplicateConfig) (C.mooncake_replicate_config_t, 
 		cc.preferred_segments_count = C.size_t(len(cSegs))
 	}
 
-	return cc, cSegs, nil
+	if cfg.ParentBlockHash != "" {
+		cParentBlockHash = C.CString(cfg.ParentBlockHash)
+		cc.parent_block_hash = cParentBlockHash
+	}
+
+	return cc, cSegs, cParentBlockHash, nil
 }
 
 func freeCStrings(strs []*C.char) {
@@ -168,11 +174,14 @@ func (s *Store) Put(key string, value []byte, config *ReplicateConfig) error {
 		return ErrStoreNil
 	}
 
-	cc, cSegs, err := s.toCConfig(config)
+	cc, cSegs, cParentBlockHash, err := s.toCConfig(config)
 	if err != nil {
 		return err
 	}
 	defer freeCStrings(cSegs)
+	if cParentBlockHash != nil {
+		defer C.free(unsafe.Pointer(cParentBlockHash))
+	}
 
 	cKey := C.CString(key)
 	defer C.free(unsafe.Pointer(cKey))
@@ -199,11 +208,14 @@ func (s *Store) PutFrom(key string, ptr uintptr, size uint64, config *ReplicateC
 		return ErrInvalidArgument
 	}
 
-	cc, cSegs, err := s.toCConfig(config)
+	cc, cSegs, cParentBlockHash, err := s.toCConfig(config)
 	if err != nil {
 		return err
 	}
 	defer freeCStrings(cSegs)
+	if cParentBlockHash != nil {
+		defer C.free(unsafe.Pointer(cParentBlockHash))
+	}
 
 	cKey := C.CString(key)
 	defer C.free(unsafe.Pointer(cKey))
@@ -248,11 +260,14 @@ func (s *Store) BatchPutFrom(keys []string, ptrs []uintptr, sizes []uint64,
 		cSizes[i] = C.size_t(sizes[i])
 	}
 
-	cc, cSegs, err := s.toCConfig(config)
+	cc, cSegs, cParentBlockHash, err := s.toCConfig(config)
 	if err != nil {
 		return nil, err
 	}
 	defer freeCStrings(cSegs)
+	if cParentBlockHash != nil {
+		defer C.free(unsafe.Pointer(cParentBlockHash))
+	}
 
 	results := make([]C.int, count)
 	ret := C.mooncake_store_batch_put_from(s.handle,
