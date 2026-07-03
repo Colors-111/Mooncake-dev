@@ -4853,14 +4853,26 @@ auto MasterService::NotifyOffloadSuccess(
                                           ErrorCode::OBJECT_ALREADY_EXISTS) {
                             // Refresh start_time to reset the offload-task TTL,
                             // preventing the reaper from erasing the task.
-                            task_it->second = OffloadingTask{
-                                task_it->second.source_id,
-                                std::chrono::system_clock::now()};
+                            // offloading_tasks maps to `const OffloadingTask`,
+                            // so the entry cannot be mutated in place — erase
+                            // and re-emplace with a fresh start_time instead.
+                            const auto source_id = task_it->second.source_id;
+                            tenant_state.offloading_tasks.erase(task_it);
+                            tenant_state.offloading_tasks.emplace(
+                                request_object_id.user_key,
+                                OffloadingTask{source_id,
+                                               std::chrono::system_clock::now()});
                             continue;  // pin retained; skip dec/erase
                         }
-                        // Re-enqueue failed (e.g. UNABLE_OFFLOADING) -> degrade.
+                        // Re-enqueue failed (e.g. UNABLE_OFFLOADING) -> degrade:
+                        // release the pin and erase the task (existing path).
+                        if (source != nullptr) {
+                            source->dec_refcnt();
+                        }
+                        tenant_state.offloading_tasks.erase(task_it);
+                        continue;
                     }
-                    // Non-guaranteed or degraded: existing behavior.
+                    // Non-guaranteed: existing behavior.
                     if (source != nullptr) {
                         source->dec_refcnt();
                     }
