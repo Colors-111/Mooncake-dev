@@ -35,6 +35,8 @@ struct BucketMetadata {
     int64_t data_size;
     std::vector<std::string> keys;
     std::vector<BucketObjectMetadata> metadatas;
+    bool guaranteed{false};  // true => bucket is never selected for eviction
+                             // (Phase 2: set when all keys are guaranteed).
 
     // Runtime-only fields (not serialized) for safe deletion support
     // Tracks number of in-flight reads to enable safe bucket deletion
@@ -52,6 +54,7 @@ struct BucketMetadata {
           data_size(other.data_size),
           keys(other.keys),
           metadatas(other.metadatas),
+          guaranteed(other.guaranteed),
           inflight_reads_(0),
           last_access_ns_(0) {}
 
@@ -61,6 +64,7 @@ struct BucketMetadata {
           data_size(other.data_size),
           keys(std::move(other.keys)),
           metadatas(std::move(other.metadatas)),
+          guaranteed(other.guaranteed),
           inflight_reads_(0),
           last_access_ns_(0) {}
 
@@ -71,6 +75,7 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = other.keys;
             metadatas = other.metadatas;
+            guaranteed = other.guaranteed;
             // Don't copy runtime state
         }
         return *this;
@@ -83,12 +88,13 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = std::move(other.keys);
             metadatas = std::move(other.metadatas);
+            guaranteed = other.guaranteed;
             // Don't move runtime state
         }
         return *this;
     }
 };
-YLT_REFL(BucketMetadata, data_size, keys, metadatas);
+YLT_REFL(BucketMetadata, data_size, keys, metadatas, guaranteed);
 
 /**
  * @brief RAII guard for tracking in-flight bucket reads.
@@ -258,7 +264,8 @@ class StorageBackendInterface {
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
         std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) = 0;
+            eviction_handler = nullptr,
+        bool guaranteed = false) = 0;
 
     virtual tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) = 0;
@@ -629,7 +636,8 @@ class StorageBackendAdaptor : public StorageBackendInterface {
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
         std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) override;
+            eviction_handler = nullptr,
+        bool guaranteed = false) override;
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
@@ -704,7 +712,8 @@ class BucketStorageBackend : public StorageBackendInterface {
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
         std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) override;
+            eviction_handler = nullptr,
+        bool guaranteed = false) override;
 
     /**
      * @brief Retrieves metadata for multiple objects in a single batch
@@ -840,7 +849,8 @@ class BucketStorageBackend : public StorageBackendInterface {
         int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::vector<iovec>& iovs,
-        std::vector<StorageObjectMetadata>& metadatas);
+        std::vector<StorageObjectMetadata>& metadatas,
+        bool guaranteed = false);
 
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
@@ -1016,7 +1026,8 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
         std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) override;
+            eviction_handler = nullptr,
+        bool guaranteed = false) override;
 
     /**
      * @brief Loads data for multiple objects in a batch operation.

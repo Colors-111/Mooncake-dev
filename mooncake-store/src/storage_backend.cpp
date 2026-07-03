@@ -1009,7 +1009,8 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
     std::function<void(const std::vector<std::string>& evicted_keys)>
-        eviction_handler) {
+        eviction_handler,
+    bool guaranteed) {
     if (batch_object.empty()) {
         LOG(ERROR) << "batch object is empty";
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
@@ -1282,7 +1283,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
     std::function<void(const std::vector<std::string>& evicted_keys)>
-        eviction_handler) {
+        eviction_handler,
+    bool guaranteed) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -1304,7 +1306,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     std::vector<iovec> iovs;
     std::vector<StorageObjectMetadata> metadatas;
     auto build_bucket_result =
-        BuildBucket(bucket_id, batch_object, iovs, metadatas);
+        BuildBucket(bucket_id, batch_object, iovs, metadatas, guaranteed);
     if (!build_bucket_result) {
         LOG(ERROR) << "Failed to build bucket with id: " << bucket_id;
         return tl::make_unexpected(build_bucket_result.error());
@@ -1978,8 +1980,10 @@ tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
 BucketStorageBackend::BuildBucket(
     int64_t bucket_id,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
-    std::vector<iovec>& iovs, std::vector<StorageObjectMetadata>& metadatas) {
+    std::vector<iovec>& iovs, std::vector<StorageObjectMetadata>& metadatas,
+    bool guaranteed) {
     auto bucket = std::make_shared<BucketMetadata>();
+    bucket->guaranteed = guaranteed;
     int64_t storage_offset = 0;
     for (const auto& object : batch_object) {
         if (object.second.empty()) {
@@ -2183,8 +2187,14 @@ BucketStorageBackend::SelectEvictionCandidate() {
     switch (bucket_backend_config_.eviction_policy) {
         case BucketEvictionPolicy::FIFO:
             // buckets_ is ordered by bucket_id (monotonically increasing),
-            // so begin() is always the oldest bucket.
-            return buckets_.begin();
+            // so begin() is always the oldest bucket. Skip guaranteed buckets
+            // (they are never eviction candidates).
+            for (auto it = buckets_.begin(); it != buckets_.end(); ++it) {
+                if (!it->second->guaranteed) {
+                    return it;
+                }
+            }
+            return buckets_.end();
 
         case BucketEvictionPolicy::LRU:
             // Use lru_index_ (a std::set ordered by {last_access_ns_,
@@ -2203,6 +2213,55 @@ BucketStorageBackend::SelectEvictionCandidate() {
                 auto bucket_it = buckets_.find(id);
                 if (bucket_it == buckets_.end()) {
                     lru_index_.erase(top_it);
+                    continue;
+                }
+                // Skip guaranteed buckets WITHOUT erasing from lru_index_:
+                // erasing would lose the entry permanently (reads don't
+                // re-insert), so the bucket could never be evicted even after
+                // its TTL expires (Phase 3). Instead, scan forward through the
+                // index (ordered by {ts, id}) for the first non-guaranteed,
+                // still-existing entry. We do NOT erase the skipped guaranteed
+                // entries. If none is found, return end() so the caller breaks
+                // out of its eviction loop instead of spinning forever.
+                if (bucket_it->second->guaranteed) {
+                    auto scan_it = top_it;
+                    ++scan_it;
+                    auto chosen_it = lru_index_.end();
+                    for (; scan_it != lru_index_.end(); ++scan_it) {
+                        auto [s_ts, s_id] = *scan_it;
+                        auto s_bucket_it = buckets_.find(s_id);
+                        if (s_bucket_it == buckets_.end()) {
+                            // Stale/missing bucket: skip it. It is not
+                            // guaranteed (guaranteed entries are caught by the
+                            // check below), so it will be lazily discarded by
+                            // the normal top-of-loop erase path if/when it ever
+                            // surfaces to begin(). We deliberately do NOT erase
+                            // here to keep this branch focused on the skip.
+                            continue;
+                        }
+                        if (s_bucket_it->second->guaranteed) {
+                            continue;
+                        }
+                        chosen_it = scan_it;
+                        break;
+                    }
+                    if (chosen_it == lru_index_.end()) {
+                        // No evictable (non-guaranteed) candidate remains.
+                        return buckets_.end();
+                    }
+                    // Validate the chosen entry's timestamp (it may be stale,
+                    // same as the top-of-loop check). If stale, repair and let
+                    // the outer while loop retry from the (repaired) top.
+                    auto [c_ts, c_id] = *chosen_it;
+                    auto c_bucket_it = buckets_.find(c_id);
+                    int64_t actual_ts = c_bucket_it->second->last_access_ns_.load(
+                        std::memory_order_relaxed);
+                    if (actual_ts == c_ts) {
+                        lru_index_.erase(chosen_it);
+                        return c_bucket_it;
+                    }
+                    lru_index_.erase(chosen_it);
+                    lru_index_.emplace(actual_ts, c_id);
                     continue;
                 }
                 int64_t actual_ts = bucket_it->second->last_access_ns_.load(
@@ -2839,7 +2898,8 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
     std::function<void(const std::vector<std::string>& /*evicted_keys*/)>
-    /*eviction_handler*/) {
+    /*eviction_handler*/,
+    bool /*guaranteed*/) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";

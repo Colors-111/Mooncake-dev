@@ -363,34 +363,66 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     if (offloading_objects.empty()) {
         return {};
     }
-    std::unordered_map<std::string, int64_t> storage_object_sizes;
+    std::unordered_map<std::string, int64_t> guaranteed_sizes;
+    std::unordered_map<std::string, int64_t> normal_sizes;
     std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key;
-    storage_object_sizes.reserve(offloading_objects.size());
+    guaranteed_sizes.reserve(offloading_objects.size());
+    normal_sizes.reserve(offloading_objects.size());
     task_by_storage_key.reserve(offloading_objects.size());
     for (const auto& task : offloading_objects) {
         const auto storage_key =
             MakeTenantScopedStorageKey(task.tenant_id, task.key);
-        storage_object_sizes.emplace(storage_key, task.size);
         task_by_storage_key.emplace(storage_key, task);
+        if (task.guaranteed) {
+            guaranteed_sizes.emplace(storage_key, task.size);
+        } else {
+            normal_sizes.emplace(storage_key, task.size);
+        }
     }
 
-    std::vector<std::vector<std::string>> buckets_keys;
-    if (auto bucket_backend =
-            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
-        auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
-            storage_object_sizes, buckets_keys);
-        if (!allocate_res) {
-            LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
-                       << allocate_res.error();
-            return allocate_res;
+    // Bucket each guarantee-class separately so buckets are homogeneous
+    // (all-guaranteed or all-normal). A guaranteed bucket is never selected
+    // for eviction (SelectEvictionCandidate, storage_backend.cpp).
+    struct BucketGroup {
+        std::vector<std::vector<std::string>> buckets_keys;
+        bool guaranteed;
+    };
+    std::vector<BucketGroup> groups;
+
+    auto allocate_group =
+        [this](const std::unordered_map<std::string, int64_t>& sizes,
+               bool guaranteed) -> tl::expected<BucketGroup, ErrorCode> {
+        BucketGroup group;
+        group.guaranteed = guaranteed;
+        if (auto bucket_backend = std::dynamic_pointer_cast<BucketStorageBackend>(
+                storage_backend_)) {
+            auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
+                sizes, group.buckets_keys);
+            if (!allocate_res) {
+                LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
+                           << allocate_res.error();
+                return tl::make_unexpected(allocate_res.error());
+            }
+        } else {
+            std::vector<std::string> keys;
+            keys.reserve(sizes.size());
+            for (const auto& it : sizes) {
+                keys.emplace_back(it.first);
+            }
+            group.buckets_keys.emplace_back(std::move(keys));
         }
-    } else {
-        std::vector<std::string> keys;
-        keys.reserve(storage_object_sizes.size());
-        for (const auto& it : storage_object_sizes) {
-            keys.emplace_back(it.first);
-        }
-        buckets_keys.emplace_back(std::move(keys));
+        return group;
+    };
+
+    if (!guaranteed_sizes.empty()) {
+        auto res = allocate_group(guaranteed_sizes, /*guaranteed=*/true);
+        if (!res) return res.error();
+        groups.push_back(std::move(res.value()));
+    }
+    if (!normal_sizes.empty()) {
+        auto res = allocate_group(normal_sizes, /*guaranteed=*/false);
+        if (!res) return res.error();
+        groups.push_back(std::move(res.value()));
     }
 
     auto complete_handler =
@@ -426,7 +458,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     std::vector<OffloadTaskItem> failed_tasks;
     std::unordered_set<std::string> all_bucket_keys;
 
-    for (const auto& keys : buckets_keys) {
+    for (const auto& group : groups) {
+        const bool group_guaranteed = group.guaranteed;
+    for (const auto& keys : group.buckets_keys) {
         for (const auto& k : keys) all_bucket_keys.insert(k);
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         std::unordered_map<std::string, std::vector<std::string>>
@@ -554,7 +588,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             return res;
         };
         auto offload_res = storage_backend_->BatchOffload(
-            host_batch_object, bucket_complete_handler, eviction_handler);
+            host_batch_object, bucket_complete_handler, eviction_handler,
+            group_guaranteed);
 
         // Release staging buffers back to pool.
         for (auto& buf : staging_bufs) {
@@ -576,6 +611,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 return tl::make_unexpected(offload_res.error());
             }
         }
+    }
     }
 
     // Keys skipped by GroupOffloadingKeysByBucket don't appear in any bucket,

@@ -1,61 +1,61 @@
-# Guaranteed SSD Offload Priority — Phase 1 Implementation Plan
+# Guaranteed SSD Offload 优先级 — Phase 1 实施计划（中文）
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **给执行 agent：** 必用子技能：superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans，逐任务执行。步骤用 checkbox（`- [ ]`）跟踪。
 
-**Goal:** Ensure a `guaranteed` object is always written to SSD — never rejected for a full offload queue (independent per-client queue, no limit), never abandoned on SSD write failure (retry) — behind an `enable_guaranteed_cache` flag that defaults off.
+**目标：** 确保 `guaranteed` 对象一定写入 SSD —— 不因 offload 队列满被拒（独立 per-client 队列、无 limit），不因 SSD 写失败被放弃（重试）—— 全程由 `enable_guaranteed_cache` flag 门控（默认 false）。
 
-**Architecture:** Master-side only. A `guaranteed` boolean flows ReplicateConfig → ObjectMetadata → PushOffloadingQueue, which routes guaranteed objects into a separate per-client `guaranteed_offloading_objects` map (parallel to the existing `promotion_objects` precedent) that has no size limit. `PutEnd` always offloads guaranteed objects regardless of `offload_on_evict_`. `OffloadObjectHeartbeat` drains both maps. `NotifyOffloadSuccess` re-enqueues guaranteed objects on NACK. Everything is gated by `enable_guaranteed_cache_` (default false → zero behavior change).
+**架构：** 仅 master 侧。`guaranteed` 布尔沿 ReplicateConfig → ObjectMetadata → PushOffloadingQueue 流转，把 guaranteed 对象路由进独立的 per-client `guaranteed_offloading_objects` map（与现有 `promotion_objects` 先例并列，无 size limit）。`PutEnd` 无视 `offload_on_evict_` 总 offload guaranteed 对象。`OffloadObjectHeartbeat` drain 两个 map。`NotifyOffloadSuccess` 在 NACK 时重新入队 guaranteed 对象。全部由 `enable_guaranteed_cache_`（默认 false → 零行为变化）门控。
 
-**Tech Stack:** C++17, GoogleTest, glog, struct_pack (`YLT_REFL`), Mooncake Store master service.
+**技术栈：** C++17、GoogleTest、glog、struct_pack（`YLT_REFL`）、Mooncake Store master service。
 
-**Reference spec:** `docs/superpowers/specs/2026-07-02-guaranteed-ssd-offload-priority-design-zh.md` (§4–§14).
+**参考 spec：** `docs/superpowers/specs/2026-07-02-guaranteed-ssd-offload-priority-design-zh.md`（§4–§14）。
 
-**Git convention for this work:** The user prefers staging over committing per-step. End each task with `git add` (not `git commit`); make one commit at the end of the task (or defer all commits to the user). Adjust per user preference.
-
----
-
-## Scope
-
-This plan implements **Phase 1 (ensure write to SSD)** — master-side only. It covers spec §4–§10, test cases 1–9.
-
-**Deferred to Phase 2** (flagged to user): client-side `BuildBucket` bucket splitting by `OffloadTaskItem.guaranteed` (spec §6.4, test case 10). Rationale: it has no observable effect without Phase 2's client-side bucket-level pin (eviction protection), and it lives in `storage_backend.cpp` (a different module). The master already propagates the `guaranteed` flag to the client via `OffloadTaskItem` (Task 1) and `OffloadObjectHeartbeat` (Task 8), so the client has the information it needs; Phase 2 just uses it in `BuildBucket` + `SelectEvictionCandidate`.
+**Git 约定：** 用户偏好逐步 staging 而非逐步 commit。每个任务以 `git add` 结尾（非 `git commit`）；任务末尾或交由用户统一 commit。按用户偏好调整。
 
 ---
 
-## File Structure
+## 范围
 
-| File | Responsibility | Task |
-|------|---------------|------|
-| `mooncake-store/include/types.h` | `OffloadTaskItem.guaranteed` wire flag | 1 |
-| `mooncake-store/include/replica.h` | `ReplicateConfig.guaranteed_until_ms` marker | 2 |
-| `mooncake-store/src/master.cpp` | gflag `enable_guaranteed_cache` + config read + log | 3 |
-| `mooncake-store/include/master_config.h` | config structs + copy blocks | 3 |
-| `mooncake-store/include/master_service.h` | `enable_guaranteed_cache_` member; `ObjectMetadata.guaranteed_`; `PushOffloadingQueue` decl | 3, 4, 6 |
-| `mooncake-store/src/master_service.cpp` | flag init; marking; PutEnd; PushOffloadingQueue; heartbeat drain; NACK retry | 3, 4, 6, 7, 8, 9 |
+本计划实现 **Phase 1（确保写入 SSD）** —— 仅 master 侧。覆盖 spec §4–§10、测试用例 1–9。
+
+**推迟到 Phase 2**（已告知用户）：client 侧 `BuildBucket` 按 `OffloadTaskItem.guaranteed` 分流组桶（spec §6.4、测试用例 10）。理由：没有 Phase 2 的 client 侧 bucket 级 pin（驱逐保护），分流无可观察效果；且它在 `storage_backend.cpp`（不同模块）。master 已通过 `OffloadTaskItem`（Task 1）和 `OffloadObjectHeartbeat`（Task 8）把 `guaranteed` 标记传给 client，Phase 2 在 `BuildBucket` + `SelectEvictionCandidate` 消费即可。
+
+---
+
+## 文件结构
+
+| 文件 | 职责 | 任务 |
+|------|------|------|
+| `mooncake-store/include/types.h` | `OffloadTaskItem.guaranteed` 线上字段 | 1 |
+| `mooncake-store/include/replica.h` | `ReplicateConfig.guaranteed_until_ms` 标记 | 2 |
+| `mooncake-store/src/master.cpp` | gflag `enable_guaranteed_cache` + config 读取 + 日志 | 3 |
+| `mooncake-store/include/master_config.h` | config 结构 + copy 块 | 3 |
+| `mooncake-store/include/master_service.h` | `enable_guaranteed_cache_` 成员；`ObjectMetadata.guaranteed_`；`PushOffloadingQueue` 声明 | 3, 4, 6 |
+| `mooncake-store/src/master_service.cpp` | flag 初始化；标记；PutEnd；PushOffloadingQueue；heartbeat drain；NACK 重试 | 3, 4, 6, 7, 8, 9 |
 | `mooncake-store/include/segment.h` | `LocalDiskSegment.guaranteed_offloading_objects` map | 5 |
-| `mooncake-store/tests/guaranteed_offload_test.cpp` | new test file | 1, 7, 8, 9 |
-| `mooncake-store/tests/CMakeLists.txt` | register new test target | 1 |
+| `mooncake-store/tests/guaranteed_offload_test.cpp` | 新测试文件 | 1, 7, 8, 9 |
+| `mooncake-store/tests/CMakeLists.txt` | 注册新测试 target | 1 |
 
 ---
 
-## Task 1: Add `guaranteed` field to `OffloadTaskItem`
+## Task 1: 给 `OffloadTaskItem` 加 `guaranteed` 字段
 
-**Files:**
-- Modify: `mooncake-store/include/types.h:263-273`
-- Create: `mooncake-store/tests/guaranteed_offload_test.cpp`
-- Modify: `mooncake-store/tests/CMakeLists.txt:46`
+**文件：**
+- 修改：`mooncake-store/include/types.h:263-273`
+- 新建：`mooncake-store/tests/guaranteed_offload_test.cpp`
+- 修改：`mooncake-store/tests/CMakeLists.txt:46`
 
-- [ ] **Step 1: Register the new test target in CMake**
+- [ ] **Step 1: 在 CMake 注册新测试 target**
 
-In `mooncake-store/tests/CMakeLists.txt`, after line 46 (`add_store_test(offload_on_evict_test offload_on_evict_test.cpp)`), add:
+在 `mooncake-store/tests/CMakeLists.txt`，line 46（`add_store_test(offload_on_evict_test offload_on_evict_test.cpp)`）之后加：
 
 ```cmake
 add_store_test(guaranteed_offload_test guaranteed_offload_test.cpp)
 ```
 
-- [ ] **Step 2: Write the failing test (file scaffold + equality/flag test)**
+- [ ] **Step 2: 写失败测试（文件 scaffold + 等值/标记测试）**
 
-Create `mooncake-store/tests/guaranteed_offload_test.cpp` with the fixture (adapted from `offload_on_evict_test.cpp:1-120`) and the first test:
+新建 `mooncake-store/tests/guaranteed_offload_test.cpp`，fixture 改编自 `offload_on_evict_test.cpp:1-120`，含第一个测试：
 
 ```cpp
 #include "master_service.h"
@@ -63,13 +63,9 @@ Create `mooncake-store/tests/guaranteed_offload_test.cpp` with the fixture (adap
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <chrono>
-#include <memory>
 #include <string>
 #include <thread>
-#include <unordered_map>
-#include <vector>
 
 #include "types.h"
 
@@ -111,45 +107,8 @@ class GuaranteedOffloadTest : public ::testing::Test {
         return {.segment_id = segment.id, .client_id = client_id};
     }
 
-    // Put an object and complete it. guaranteed_until_ms>0 marks it guaranteed.
-    void PutObject(MasterService& service, const UUID& client_id,
-                   const std::string& key, int64_t guaranteed_until_ms = 0,
-                   size_t size = 1024) {
-        ReplicateConfig config;
-        config.replica_num = 1;
-        config.guaranteed_until_ms = guaranteed_until_ms;
-        auto put_start =
-            service.PutStart(client_id, key, "default", size, config);
-        ASSERT_TRUE(put_start.has_value()) << "PutStart failed for key=" << key;
-        auto put_end =
-            service.PutEnd(client_id, key, "default", ReplicaType::MEMORY);
-        ASSERT_TRUE(put_end.has_value()) << "PutEnd failed for key=" << key;
-    }
-
-    // Drain the offload queue via OffloadObjectHeartbeat.
-    std::vector<OffloadTaskItem> DrainOffloadQueue(MasterService& service,
-                                                    const UUID& client_id) {
-        auto res = service.OffloadObjectHeartbeat(client_id, true);
-        if (!res) {
-            return {};
-        }
-        return res.value();
-    }
-
-    template <typename Predicate>
-    void WaitUntil(Predicate&& predicate,
-                   std::chrono::milliseconds timeout = std::chrono::milliseconds(4000),
-                   std::chrono::milliseconds interval =
-                       std::chrono::milliseconds(50)) const {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (predicate()) {
-                return;
-            }
-            std::this_thread::sleep_for(interval);
-        }
-        EXPECT_TRUE(predicate());
-    }
+    // NOTE: PutObject / DrainOffloadQueue helpers are added in Task 7, when
+    // ReplicateConfig::guaranteed_until_ms and the offload-gating logic land.
 };
 
 // Task 1: OffloadTaskItem carries a guaranteed flag and compares on it.
@@ -167,17 +126,18 @@ TEST_F(GuaranteedOffloadTest, OffloadTaskItemCarriesGuaranteedFlag) {
 }  // namespace mooncake::test
 ```
 
-- [ ] **Step 3: Run test to verify it fails**
+选择（b）：保持 Task 1 自包含 —— 不引用尚不存在的 `ReplicateConfig::guaranteed_until_ms` 或 `MasterServiceConfig::enable_guaranteed_cache`。`PutObject`/`DrainOffloadQueue` helper 推迟到 Task 7 再加。目标：Task 1 后 `guaranteed_offload_test` 能编译、等值测试通过。
 
-Run:
+- [ ] **Step 3: 跑测试确认失败**
+
 ```bash
 cmake --build build --target guaranteed_offload_test -j"$(nproc)" 2>&1 | tail -20
 ```
-Expected: **compile failure** — `OffloadTaskItem` has no `.guaranteed` field (designated initializer `guaranteed` does not exist).
+预期：**编译失败** —— `OffloadTaskItem` 无 `.guaranteed` 字段。
 
-- [ ] **Step 4: Add the `guaranteed` field to `OffloadTaskItem`**
+- [ ] **Step 4: 给 `OffloadTaskItem` 加 `guaranteed` 字段**
 
-In `mooncake-store/include/types.h:263-273`, replace:
+在 `mooncake-store/include/types.h:263-273`，把：
 
 ```cpp
 struct OffloadTaskItem {
@@ -193,7 +153,7 @@ struct OffloadTaskItem {
 YLT_REFL(OffloadTaskItem, tenant_id, key, size);
 ```
 
-with:
+替换为：
 
 ```cpp
 struct OffloadTaskItem {
@@ -210,17 +170,16 @@ struct OffloadTaskItem {
 YLT_REFL(OffloadTaskItem, tenant_id, key, size, guaranteed);
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- [ ] **Step 5: 跑测试确认通过**
 
-Run:
 ```bash
 cmake --build build --target guaranteed_offload_test -j"$(nproc)" && \
 ./build/mooncake-store/tests/guaranteed_offload_test \
     --gtest_filter=GuaranteedOffloadTest.OffloadTaskItemCarriesGuaranteedFlag
 ```
-Expected: PASS.
+预期：PASS。
 
-- [ ] **Step 6: Stage**
+- [ ] **Step 6: 暂存**
 
 ```bash
 git add mooncake-store/include/types.h mooncake-store/tests/guaranteed_offload_test.cpp mooncake-store/tests/CMakeLists.txt
@@ -228,14 +187,14 @@ git add mooncake-store/include/types.h mooncake-store/tests/guaranteed_offload_t
 
 ---
 
-## Task 2: Add `guaranteed_until_ms` to `ReplicateConfig`
+## Task 2: 给 `ReplicateConfig` 加 `guaranteed_until_ms`
 
-**Files:**
-- Modify: `mooncake-store/include/replica.h:81-144`
+**文件：**
+- 修改：`mooncake-store/include/replica.h:81-144`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: 写失败测试**
 
-Append to `mooncake-store/tests/guaranteed_offload_test.cpp` (before the closing `}  // namespace`):
+在 `mooncake-store/tests/guaranteed_offload_test.cpp` 末尾、`}  // namespace mooncake::test` 之前追加：
 
 ```cpp
 // Task 2: ReplicateConfig carries guaranteed_until_ms (Phase 1: only >0 is checked).
@@ -247,17 +206,16 @@ TEST_F(GuaranteedOffloadTest, ReplicateConfigCarriesGuaranteedUntilMs) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: 跑测试确认失败**
 
-Run:
 ```bash
 cmake --build build --target guaranteed_offload_test -j"$(nproc)" 2>&1 | tail -10
 ```
-Expected: **compile failure** — `ReplicateConfig` has no member `guaranteed_until_ms`.
+预期：**编译失败** —— `ReplicateConfig` 无 `guaranteed_until_ms` 成员。
 
-- [ ] **Step 3: Add the field**
+- [ ] **Step 3: 加字段**
 
-In `mooncake-store/include/replica.h`, after line 97 (`std::optional<std::vector<std::string>> group_ids{};`) and before line 99 (`ReplicateConfig ForSingleKey...`), insert:
+在 `mooncake-store/include/replica.h`，line 97（`std::optional<std::vector<std::string>> group_ids{};`）之后、line 99（`ReplicateConfig ForSingleKey...`）之前插入：
 
 ```cpp
     // Guaranteed offload: when >0, this object's SSD offload is mandatory
@@ -266,25 +224,26 @@ In `mooncake-store/include/replica.h`, after line 97 (`std::optional<std::vector
     int64_t guaranteed_until_ms{0};
 ```
 
-- [ ] **Step 4: Update the `operator<<` (so logging includes it)**
+- [ ] **Step 4: 更新 `operator<<`（日志含此字段）**
 
-In the same file, in `operator<<` (around line 132, after the `group_ids` block and before `os << " }";`), add:
+同文件，`operator<<` 内（约 line 132，`group_ids` 块之后、`os << " }";` 之前）加：
 
 ```cpp
         os << ", guaranteed_until_ms: " << config.guaranteed_until_ms;
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+放在 `if` 块外，使其总是打印（和 `data_type` 一样）。
 
-Run:
+- [ ] **Step 5: 跑测试确认通过**
+
 ```bash
 cmake --build build --target guaranteed_offload_test -j"$(nproc)" && \
 ./build/mooncake-store/tests/guaranteed_offload_test \
     --gtest_filter=GuaranteedOffloadTest.ReplicateConfigCarriesGuaranteedUntilMs
 ```
-Expected: PASS.
+预期：PASS。
 
-- [ ] **Step 6: Stage**
+- [ ] **Step 6: 暂存**
 
 ```bash
 git add mooncake-store/include/replica.h mooncake-store/tests/guaranteed_offload_test.cpp
@@ -292,20 +251,20 @@ git add mooncake-store/include/replica.h mooncake-store/tests/guaranteed_offload
 
 ---
 
-## Task 3: Wire the `enable_guaranteed_cache` config flag (default false)
+## Task 3: 布线 `enable_guaranteed_cache` config flag（默认 false）
 
-This is infrastructure (no isolated behavior; gating is verified in Task 7). It mirrors `enable_offload` through the config layers. Tests construct `MasterServiceConfig` directly, so the **test-essential** parts are the `MasterServiceConfig` field + `MasterService` member + initializer (Steps 3-5). The **production CLI** parts (gflag, `MasterConfig`, `WrappedMasterServiceConfig`, copy blocks, log — Steps 6-7) mirror `enable_offload` everywhere it appears.
+基础设施（无独立行为；门控在 Task 7 验证）。镜像 `enable_offload` 贯穿 config 层。测试直接构造 `MasterServiceConfig`，所以**测试必需**部分是 `MasterServiceConfig` 字段 + `MasterService` 成员 + 初始化器（Step 3-5）；**生产 CLI** 部分（gflag、`MasterConfig`、`Wrapped`、copy 块、log）镜像 `enable_offload`（Step 7-8）。
 
-**Files:**
-- Modify: `mooncake-store/include/master_config.h` (MasterServiceConfig ~974, MasterConfig ~53, Wrapped + copy blocks, builder)
-- Modify: `mooncake-store/include/master_service.h:1902` (member)
-- Modify: `mooncake-store/src/master_service.cpp:205` (initializer)
-- Modify: `mooncake-store/src/master.cpp` (gflag, GetBool, override, log)
-- Modify: `mooncake-store/tests/guaranteed_offload_test.cpp` (test)
+**文件：**
+- 修改：`mooncake-store/include/master_config.h`（MasterServiceConfig ~974、MasterConfig ~53、Wrapped + copy 块、builder、InProc）
+- 修改：`mooncake-store/include/master_service.h:1902`（成员）
+- 修改：`mooncake-store/src/master_service.cpp:205`（初始化器）
+- 修改：`mooncake-store/src/master.cpp`（gflag、GetBool、override、log）
+- 修改：`mooncake-store/tests/guaranteed_offload_test.cpp`（测试）
 
-- [ ] **Step 1: Write the failing test (config field default + assignable)**
+- [ ] **Step 1: 写失败测试（config 字段默认值 + 可赋值）**
 
-Append to `guaranteed_offload_test.cpp`:
+追加到 `guaranteed_offload_test.cpp`：
 
 ```cpp
 // Task 3: enable_guaranteed_cache defaults false and is settable on MasterServiceConfig.
@@ -317,100 +276,88 @@ TEST_F(GuaranteedOffloadTest, EnableGuaranteedCacheConfigField) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: 跑测试确认失败**
 
-Run:
 ```bash
 cmake --build build --target guaranteed_offload_test -j"$(nproc)" 2>&1 | tail -10
 ```
-Expected: **compile failure** — `MasterServiceConfig` has no `enable_guaranteed_cache`.
+预期：**编译失败** —— `MasterServiceConfig` 无 `enable_guaranteed_cache`。
 
-- [ ] **Step 3 (test-essential): Add the field to `MasterServiceConfig`**
+- [ ] **Step 3（测试必需）：给 `MasterServiceConfig` 加字段**
 
-In `mooncake-store/include/master_config.h`, in `class MasterServiceConfig` after line 974 (`bool enable_offload = false;`), add:
+在 `mooncake-store/include/master_config.h`，`class MasterServiceConfig` 内 `bool enable_offload = false;`（约 line 974）之后加：
 
 ```cpp
     bool enable_guaranteed_cache = false;
 ```
 
-- [ ] **Step 4 (test-essential): Add the `MasterService` member**
+- [ ] **Step 4（测试必需）：加 `MasterService` 成员**
 
-In `mooncake-store/include/master_service.h`, after line 1902 (`const bool enable_offload_;`), add:
+在 `mooncake-store/include/master_service.h`，`const bool enable_offload_;`（约 line 1902）之后加：
 
 ```cpp
     const bool enable_guaranteed_cache_{false};
 ```
 
-- [ ] **Step 5 (test-essential): Initialize the member in the constructor**
+- [ ] **Step 5（测试必需）：构造函数初始化该成员**
 
-In `mooncake-store/src/master_service.cpp`, in the initializer list after line 205 (`enable_offload_(config.enable_offload),`), add:
+在 `mooncake-store/src/master_service.cpp`，初始化列表里 `enable_offload_(config.enable_offload),`（约 line 205）之后加：
 
 ```cpp
       enable_guaranteed_cache_(config.enable_guaranteed_cache),
 ```
 
-- [ ] **Step 6 (test-essential): Run test to verify it passes**
+- [ ] **Step 6（测试必需）：自审** —— 确认测试必需链完整（config 字段 → 成员 → 初始化器）。
 
-Run:
-```bash
-cmake --build build --target guaranteed_offload_test -j"$(nproc)" && \
-./build/mooncake-store/tests/guaranteed_offload_test \
-    --gtest_filter=GuaranteedOffloadTest.EnableGuaranteedCacheConfigField
-```
-Expected: PASS. (The flag is now functional in tests. Steps 7-8 add production CLI parity.)
+- [ ] **Step 7（生产 CLI）：在 `master_config.h` 和 `master.cpp` 处处镜像 `enable_offload`**
 
-- [ ] **Step 7 (production CLI): Mirror `enable_offload` everywhere it appears**
-
-The flag must also flow from the `--enable_guaranteed_cache` gflag through `MasterConfig` and the `WrappedMasterServiceConfig`/builder conversion variants into `MasterServiceConfig` for production. Rather than enumerate fragile line numbers, mirror `enable_offload` at every occurrence. First, find them:
+先找全部出现处：
 
 ```bash
 grep -n "enable_offload" mooncake-store/include/master_config.h mooncake-store/src/master.cpp
 ```
 
-At **each** returned line, add a parallel `enable_guaranteed_cache` line in the same style. The occurrences to handle:
+每处加并行的 `enable_guaranteed_cache` 行，风格相同。需处理的出现处：
 
-1. **gflag definition** (`master.cpp`, `DEFINE_bool(enable_offload, false, ...)`): after it add
+1. **gflag 定义**（`master.cpp`，`DEFINE_bool(enable_offload, false, ...)`）之后加：
    ```cpp
    DEFINE_bool(enable_guaranteed_cache, false,
                "Enable guaranteed offload: objects put with guaranteed_until_ms>0 "
                "are always written to SSD (independent queue, retried on failure). "
                "Defaults off for zero behavior change.");
    ```
-2. **config-file read** (`master.cpp`, `default_config.GetBool("enable_offload", &master_config.enable_offload, FLAGS_enable_offload);`): after it add
+2. **config 文件读取**（`master.cpp`，`default_config.GetBool("enable_offload", ...)`）之后加：
    ```cpp
    default_config.GetBool("enable_guaranteed_cache",
                            &master_config.enable_guaranteed_cache,
                            FLAGS_enable_guaranteed_cache);
    ```
-3. **explicit-CLI-override block** (`master.cpp`, the `if ((google::GetCommandLineFlagInfo("enable_offload", &info) && !info.is_default) || !conf_set) { master_config.enable_offload = FLAGS_enable_offload; }`): after it add the parallel block for `enable_guaranteed_cache`.
-4. **startup log line** (`master.cpp`, `<< ", enable_offload=" << master_config.enable_offload`): after it add
+3. **显式 CLI override 块**（`master.cpp`，`enable_offload` 的 `if ((google::GetCommandLineFlagInfo(...) && !info.is_default) || !conf_set) {...}`）之后加 `enable_guaranteed_cache` 的并行块。
+4. **启动日志行**（`master.cpp`，`<< ", enable_offload=" << ...`）之后加：
    ```cpp
    << ", enable_guaranteed_cache=" << master_config.enable_guaranteed_cache
    ```
-5. **`MasterConfig` struct field** (`master_config.h`, `bool enable_offload;`): add `bool enable_guaranteed_cache = false;` near it.
-6. **`WrappedMasterServiceConfig` and other config variants** (`master_config.h`): `enable_offload` appears as `RequiredParam<bool> enable_offload{...}` in WrappedMasterServiceConfig. Since `enable_guaranteed_cache` **defaults off** (not required), add it as a **plain bool** `bool enable_guaranteed_cache = false;` (do **not** use `RequiredParam`) in each config struct that declares `enable_offload`.
-7. **copy blocks** (`master_config.h`, lines like `enable_offload = config.enable_offload;`): at each, add
+5. **`MasterConfig` 结构字段**（`master_config.h`，`bool enable_offload;`）附近加 `bool enable_guaranteed_cache = false;`。
+6. **`WrappedMasterServiceConfig` 等配置变体**（`master_config.h`）：`enable_offload` 在 `WrappedMasterServiceConfig` 里是 `RequiredParam<bool>`。因 `enable_guaranteed_cache` **默认关（非必需）**，加为**普通 bool** `bool enable_guaranteed_cache = false;`（**不要**用 `RequiredParam`）。
+7. **copy 块**（`master_config.h`，`enable_offload = config.enable_offload;`，约 4 处：~247/470/564/1043）每处加：
    ```cpp
    enable_guaranteed_cache = config.enable_guaranteed_cache;
    ```
-   (match indentation). Find them all with:
+   全部定位：
    ```bash
    grep -n "enable_offload = config.enable_offload" mooncake-store/include/master_config.h
    ```
-8. **builder** (`master_config.h`, `set_enable_offload` + `enable_offload_` member + `config.enable_offload = enable_offload_;` build write-back): mirror with `set_enable_guaranteed_cache` + `enable_guaranteed_cache_` + the write-back line.
-9. **`InProcMasterConfig`** (`master_config.h`, `std::optional<bool> enable_offload;` ~1169 + its builder `enable_offload_` ~1186, setter ~1218, write-back ~1272): mirror as `std::optional<bool> enable_guaranteed_cache;`; in the write-back use `config.enable_guaranteed_cache = enable_guaranteed_cache_.value_or(false);` (default off when unset).
+8. **builder**（`master_config.h`，`set_enable_offload` + `enable_offload_` 成员 + `config.enable_offload = enable_offload_;` 写回）：镜像加 `set_enable_guaranteed_cache` + `enable_guaranteed_cache_` + 写回行。
+9. **`InProcMasterConfig`**（`master_config.h`，`std::optional<bool> enable_offload;` ~1169 + InProc builder `enable_offload_` ~1186、setter `set_enable_offload` ~1218、写回 ~1272）：镜像为 `std::optional<bool> enable_guaranteed_cache;`；写回用 `config.enable_guaranteed_cache = enable_guaranteed_cache_.value_or(false);`（未设时默认关）。
 
-If any occurrence is ambiguous, build and let the compiler pinpoint missing spots.
+- [ ] **Step 8（生产 CLI）：构建 master 确认全链编译**
 
-- [ ] **Step 8 (production CLI): Build the master to verify the full wiring compiles**
-
-Run:
 ```bash
 cmake --build build --target mooncake_master -j"$(nproc)" 2>&1 | tail -20
 ```
-Expected: builds cleanly. (If a copy block's source struct lacks the field, the compiler points to it — add the plain-bool field there per Step 6.)
+预期：编译通过。若有 copy 块的源结构缺字段，编译器会指出——按 Step 6 加普通 bool 字段。
 
-- [ ] **Step 9: Stage**
+- [ ] **Step 9: 暂存**
 
 ```bash
 git add mooncake-store/src/master.cpp mooncake-store/include/master_config.h \
@@ -420,17 +367,17 @@ git add mooncake-store/src/master.cpp mooncake-store/include/master_config.h \
 
 ---
 
-## Task 4: Mark `ObjectMetadata` guaranteed + thread from config
+## Task 4: 标记 `ObjectMetadata` guaranteed + 从 config 传入
 
-Adds the `guaranteed_` member (const, immutable after construction) and threads it from `ReplicateConfig.guaranteed_until_ms` under the `enable_guaranteed_cache_` gate. Verified behaviorally in Task 7 (no isolated assertion — `guaranteed_` is private).
+加 `guaranteed_` 成员（const，构造后不可变），由 `ReplicateConfig.guaranteed_until_ms > 0`（门控 `enable_guaranteed_cache_`）传入。Task 7 行为验证。
 
-**Files:**
-- Modify: `mooncake-store/include/master_service.h:862-887` (ctor), `~912` (member)
-- Modify: `mooncake-store/src/master_service.cpp:2816-2820` (marking), `~8527` (deserialize — NO change needed, trailing default)
+**文件：**
+- 修改：`mooncake-store/include/master_service.h:862-887`（ctor）、`~912`（成员）
+- 修改：`mooncake-store/src/master_service.cpp:2816-2820`（标记）。HA 站点 ~8330、~8527 无需改（尾随默认）。
 
-- [ ] **Step 1: Add the `guaranteed_` member**
+- [ ] **Step 1: 加 `guaranteed_` 成员**
 
-In `mooncake-store/include/master_service.h`, after line 912 (`const bool hard_pinned{false};          // immutable, set at creation`), add:
+在 `mooncake-store/include/master_service.h`，`const bool hard_pinned{false};`（约 line 912）之后加：
 
 ```cpp
     const bool guaranteed_{false};        // immutable, set at creation
@@ -438,16 +385,16 @@ In `mooncake-store/include/master_service.h`, after line 912 (`const bool hard_p
                                           // upgrades to guaranteed_until TTL)
 ```
 
-- [ ] **Step 2: Add a trailing ctor parameter + initializer**
+- [ ] **Step 2: 加尾随 ctor 参数 + 初始化器**
 
-In `mooncake-store/include/master_service.h`, the constructor signature ends (line 869) with:
+ctor 签名当前结尾（约 line 869）：
 
 ```cpp
         std::string tenant_id_ = "default",
         std::string user_key_ = {})
 ```
 
-Change the closing to add a trailing defaulted param:
+改为加尾随默认参数：
 
 ```cpp
         std::string tenant_id_ = "default",
@@ -455,25 +402,15 @@ Change the closing to add a trailing defaulted param:
         bool enable_guaranteed = false)
 ```
 
-Then in the member initializer list (line 879, `hard_pinned(enable_hard_pin),`), after it add:
+初始化列表里 `hard_pinned(enable_hard_pin),`（约 line 879）之后加：
 
 ```cpp
           guaranteed_(enable_guaranteed),
 ```
 
-- [ ] **Step 3: Thread it in `AllocateAndInsertMetadata`**
+- [ ] **Step 3: 在 `AllocateAndInsertMetadata` 传入**
 
-In `mooncake-store/src/master_service.cpp:2816-2820`, the `emplace` forwards positional args. The current call:
-
-```cpp
-    auto [it, inserted] = tenant_state.metadata.emplace(
-        std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
-                              config.with_soft_pin, config.with_hard_pin,
-                              config.data_type, group_id, tenant_id, key));
-```
-
-Append the guaranteed arg (it maps to the new trailing `enable_guaranteed` param, after `key`):
+`mooncake-store/src/master_service.cpp:2816-2820`，`emplace` 的 `forward_as_tuple` 末尾加 guaranteed 参数：
 
 ```cpp
     auto [it, inserted] = tenant_state.metadata.emplace(
@@ -485,30 +422,27 @@ Append the guaranteed arg (it maps to the new trailing `enable_guaranteed` param
                                   config.guaranteed_until_ms > 0));
 ```
 
-- [ ] **Step 4: Confirm the HA-deserialize call sites need no change**
-
-Grep for all `ObjectMetadata` construction sites:
+- [ ] **Step 4: 确认 HA 反序列化站点无需改**
 
 ```bash
 grep -n "make_unique<ObjectMetadata>\|metadata.emplace" mooncake-store/src/master_service.cpp
 ```
 
-There are **three** construction sites:
-- **Line 2816** (`AllocateAndInsertMetadata`) — the live path; updated in Step 3.
-- **Line 8330** (HA snapshot `emplace` into shard, ending `..., metadata_ptr->group_id, tenant_id, user_key`) — HA deserialize.
-- **Line 8527** (`DeserializeMetadata` `make_unique<ObjectMetadata>(...)`, ending `..., is_hard_pinned, data_type, group_id`) — HA deserialize.
+三个构造站点：
+- **line 2816**（`AllocateAndInsertMetadata`）—— live 路径，Step 3 已改。
+- **line 8330**（HA 快照 emplace，参数结尾 `..., metadata_ptr->group_id, tenant_id, user_key`）—— HA 反序列化。
+- **line 8527**（`DeserializeMetadata` `make_unique<ObjectMetadata>(...)`，参数结尾 `..., is_hard_pinned, data_type, group_id`）—— HA 反序列化。
 
-Because `enable_guaranteed` is a **trailing defaulted param** (after `user_key_`), both HA sites (8330 and 8527) pick up the default `false` — correct for HA restart (guaranteed_ resets to false per spec §7.10). **Do not edit them.** Verify they still compile (they will — all new params have defaults).
+因 `enable_guaranteed` 是**尾随默认参数**（`user_key_` 之后），两 HA 站点都取默认 `false` —— 对 HA 重启正确（guaranteed_ 重置为 false，spec §7.10）。**不要改它们**。确认它们仍编译（会，因新参数都有默认值）。
 
-- [ ] **Step 5: Build to verify compilation**
+- [ ] **Step 5: 构建验证编译**
 
-Run:
 ```bash
 cmake --build build --target guaranteed_offload_test -j"$(nproc)" 2>&1 | tail -15
 ```
-Expected: builds cleanly. (No new test here — `guaranteed_` is private; behavior is verified in Task 7.)
+预期：编译通过。
 
-- [ ] **Step 6: Stage**
+- [ ] **Step 6: 暂存**
 
 ```bash
 git add mooncake-store/include/master_service.h mooncake-store/src/master_service.cpp
@@ -516,23 +450,16 @@ git add mooncake-store/include/master_service.h mooncake-store/src/master_servic
 
 ---
 
-## Task 5: Add `guaranteed_offloading_objects` map to `LocalDiskSegment`
+## Task 5: 给 `LocalDiskSegment` 加 `guaranteed_offloading_objects` map
 
-Infrastructure only (verified by Task 8). `LocalDiskSegment` lives in `segment.h`, **not** `master_service.h`.
+仅基础设施（Task 8 验证）。`LocalDiskSegment` 在 `segment.h`，**不是** `master_service.h`。
 
-**Files:**
-- Modify: `mooncake-store/include/segment.h:85-106`
+**文件：**
+- 修改：`mooncake-store/include/segment.h:85-106`
 
-- [ ] **Step 1: Add the map**
+- [ ] **Step 1: 加 map**
 
-In `mooncake-store/include/segment.h`, after line 91 (the `offloading_objects` declaration):
-
-```cpp
-    std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(
-        offloading_mutex_) offloading_objects;
-```
-
-add:
+`mooncake-store/include/segment.h`，`offloading_objects` 声明（line 90-91）之后加：
 
 ```cpp
     // Guaranteed offload queue (parallel to offloading_objects). Populated by
@@ -543,15 +470,14 @@ add:
         offloading_mutex_) guaranteed_offloading_objects;
 ```
 
-- [ ] **Step 2: Build to verify compilation**
+- [ ] **Step 2: 构建验证编译**
 
-Run:
 ```bash
 cmake --build build --target guaranteed_offload_test -j"$(nproc)" 2>&1 | tail -10
 ```
-Expected: builds cleanly. (The constructor at segment.h:98 needs no change — the map default-constructs.)
+预期：编译通过。构造函数无需改（map 默认构造）。
 
-- [ ] **Step 3: Stage**
+- [ ] **Step 3: 暂存**
 
 ```bash
 git add mooncake-store/include/segment.h
@@ -559,30 +485,30 @@ git add mooncake-store/include/segment.h
 
 ---
 
-## Task 6: Route guaranteed objects to the independent queue in `PushOffloadingQueue`
+## Task 6: `PushOffloadingQueue` 把 guaranteed 路由到独立队列
 
-Adds a trailing `bool guaranteed = false` param and selects the map; guaranteed skips the size-limit check. Default param keeps existing callers (PutEnd, eviction-path 6821/7066) compiling unchanged. Behavior verified in Task 7.
+加尾随 `bool guaranteed = false` 参数（默认 false → 既有调用方不变），在 `offloading_objects`（normal）和 `guaranteed_offloading_objects`（guaranteed，无 limit）间选择，guaranteed 跳过 limit 检查。Task 7 验证行为。
 
-**Files:**
-- Modify: `mooncake-store/include/master_service.h` (declaration)
-- Modify: `mooncake-store/src/master_service.cpp:4932-4978` (definition)
+**文件：**
+- 修改：`mooncake-store/include/master_service.h`（声明）
+- 修改：`mooncake-store/src/master_service.cpp:4932-4978`（定义）
 
-- [ ] **Step 1: Update the declaration**
+- [ ] **Step 1: 更新声明**
 
-Find the `PushOffloadingQueue` declaration in `mooncake-store/include/master_service.h`:
+在 `mooncake-store/include/master_service.h` 找 `PushOffloadingQueue` 声明：
 
 ```bash
 grep -n "tl::expected<void, ErrorCode> PushOffloadingQueue" mooncake-store/include/master_service.h
 ```
 
-Change its signature from:
+签名从：
 
 ```cpp
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica);
 ```
 
-to:
+改为：
 
 ```cpp
     tl::expected<void, ErrorCode> PushOffloadingQueue(
@@ -590,9 +516,9 @@ to:
         bool guaranteed = false);
 ```
 
-- [ ] **Step 2: Update the definition to select the map + skip limit for guaranteed**
+- [ ] **Step 2: 更新定义：选 map + guaranteed 跳过 limit**
 
-In `mooncake-store/src/master_service.cpp:4932-4978`, replace the whole function body with:
+`mooncake-store/src/master_service.cpp:4932-4978`，整个函数体替换为：
 
 ```cpp
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
@@ -650,15 +576,14 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
 }
 ```
 
-- [ ] **Step 3: Build to verify compilation**
+- [ ] **Step 3: 构建验证编译**
 
-Run:
 ```bash
 cmake --build build --target guaranteed_offload_test -j"$(nproc)" 2>&1 | tail -15
 ```
-Expected: builds cleanly. Existing callers omit `guaranteed` (default false) → unchanged behavior.
+预期：编译通过。既有调用方省略 `guaranteed`（默认 false）→ 行为不变。
 
-- [ ] **Step 4: Stage**
+- [ ] **Step 4: 暂存**
 
 ```bash
 git add mooncake-store/include/master_service.h mooncake-store/src/master_service.cpp
@@ -666,17 +591,61 @@ git add mooncake-store/include/master_service.h mooncake-store/src/master_servic
 
 ---
 
-## Task 7: `PutEnd` always offloads guaranteed objects (core behavior)
+## Task 7: `PutEnd` 总 offload guaranteed 对象（核心行为）
 
-This is the heart of Phase 1. Changes the PutEnd offload condition so guaranteed objects offload at PutEnd regardless of `offload_on_evict_`, passing `guaranteed` to `PushOffloadingQueue`. Three behavioral tests verify: (A) guaranteed exempt from the normal-queue limit; (C) guaranteed offloads even under `offload_on_evict=true`; (D) flag-off degrades guaranteed to normal.
+Phase 1 的核心。改 PutEnd offload 条件，使 guaranteed 对象无视 `offload_on_evict_` 总 offload，并传 `guaranteed` 给 `PushOffloadingQueue`。4 个行为测试。
 
-**Files:**
-- Modify: `mooncake-store/src/master_service.cpp:3064-3084`
-- Modify: `mooncake-store/tests/guaranteed_offload_test.cpp` (tests)
+**文件：**
+- 修改：`mooncake-store/src/master_service.cpp:3064-3084`
+- 修改：`mooncake-store/tests/guaranteed_offload_test.cpp`（测试）
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: 写失败测试**
 
-Append to `guaranteed_offload_test.cpp`:
+先在 fixture 里加 `PutObject`/`DrainOffloadQueue`/`WaitUntil` helper（Task 1 的 NOTE 注释处替换），再加 4 个测试。helper 代码：
+
+```cpp
+    // Put an object and complete it. guaranteed_until_ms>0 marks it guaranteed.
+    void PutObject(MasterService& service, const UUID& client_id,
+                   const std::string& key, int64_t guaranteed_until_ms = 0,
+                   size_t size = 1024) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.guaranteed_until_ms = guaranteed_until_ms;
+        auto put_start =
+            service.PutStart(client_id, key, "default", size, config);
+        ASSERT_TRUE(put_start.has_value()) << "PutStart failed for key=" << key;
+        auto put_end =
+            service.PutEnd(client_id, key, "default", ReplicaType::MEMORY);
+        ASSERT_TRUE(put_end.has_value()) << "PutEnd failed for key=" << key;
+    }
+
+    // Drain the offload queue via OffloadObjectHeartbeat.
+    std::vector<OffloadTaskItem> DrainOffloadQueue(MasterService& service,
+                                                    const UUID& client_id) {
+        auto res = service.OffloadObjectHeartbeat(client_id, true);
+        if (!res) {
+            return {};
+        }
+        return res.value();
+    }
+
+    template <typename Predicate>
+    void WaitUntil(Predicate&& predicate,
+                   std::chrono::milliseconds timeout = std::chrono::milliseconds(4000),
+                   std::chrono::milliseconds interval =
+                       std::chrono::milliseconds(50)) const {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) {
+                return;
+            }
+            std::this_thread::sleep_for(interval);
+        }
+        EXPECT_TRUE(predicate());
+    }
+```
+
+4 个测试（7A/7B/7C/7D）：
 
 ```cpp
 // Task 7A: guaranteed object is enqueued even when the normal offload queue is full.
@@ -797,19 +766,18 @@ TEST_F(GuaranteedOffloadTest, FlagOffDegradesGuaranteedToNormal) {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: 跑测试确认失败**
 
-Run:
 ```bash
 cmake --build build --target guaranteed_offload_test -j"$(nproc)" && \
 ./build/mooncake-store/tests/guaranteed_offload_test \
     --gtest_filter='GuaranteedOffloadTest.Guaranteed*:GuaranteedOffloadTest.Normal*:GuaranteedOffloadTest.FlagOff*'
 ```
-Expected: 7A/7C **FAIL** (guaranteed not offloaded — PutEnd still gated on `!offload_on_evict_` and/or not passing guaranteed); 7D may already pass; 7B may already pass (existing limit behavior).
+预期：7A/7C FAIL（guaranteed 未 offload —— 条件仍是 `!offload_on_evict_` 且/或未传 guaranteed）；7D 可能已过；7B 可能已过。
 
-- [ ] **Step 3: Change the PutEnd offload condition + pass guaranteed**
+- [ ] **Step 3: 改 PutEnd offload 条件 + 传 guaranteed**
 
-In `mooncake-store/src/master_service.cpp:3064-3084`, replace:
+`mooncake-store/src/master_service.cpp:3064-3084`，把：
 
 ```cpp
     if (enable_offload_ && !offload_on_evict_) {
@@ -835,7 +803,7 @@ In `mooncake-store/src/master_service.cpp:3064-3084`, replace:
     }
 ```
 
-with:
+替换为：
 
 ```cpp
     if (enable_offload_ && (!offload_on_evict_ || metadata.guaranteed_)) {
@@ -863,26 +831,24 @@ with:
     }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 4: 跑测试确认通过**
 
-Run:
 ```bash
 ./build/mooncake-store/tests/guaranteed_offload_test \
     --gtest_filter='GuaranteedOffloadTest.Guaranteed*:GuaranteedOffloadTest.Normal*:GuaranteedOffloadTest.FlagOff*'
 ```
-Expected: all PASS.
+预期：全 PASS。
 
-- [ ] **Step 5: Run the full new test file + existing offload tests (no regression)**
+- [ ] **Step 5: 跑全量新测试 + 既有 offload 测试（无回归）**
 
-Run:
 ```bash
 ./build/mooncake-store/tests/guaranteed_offload_test && \
 cmake --build build --target offload_on_evict_test -j"$(nproc)" && \
 ./build/mooncake-store/tests/offload_on_evict_test
 ```
-Expected: both PASS (existing offload behavior unchanged — guaranteed defaults off, normal path untouched).
+预期：都 PASS（既有 offload 行为不变 —— guaranteed 默认关，normal 路径未动）。
 
-- [ ] **Step 6: Stage**
+- [ ] **Step 6: 暂存**
 
 ```bash
 git add mooncake-store/src/master_service.cpp mooncake-store/tests/guaranteed_offload_test.cpp
@@ -890,17 +856,17 @@ git add mooncake-store/src/master_service.cpp mooncake-store/tests/guaranteed_of
 
 ---
 
-## Task 8: `OffloadObjectHeartbeat` drains both maps + cleans both on disable
+## Task 8: `OffloadObjectHeartbeat` drain 两个 map + disable 时清理两个
 
-Extends the drain to return `guaranteed_offloading_objects` contents (with their `guaranteed` flag) alongside `offloading_objects`, and extends the disabled-cleanup to clear + refcnt-dec both maps.
+扩展 drain 返回 `guaranteed_offloading_objects` 内容（带 `guaranteed` 标记），扩展 disable 清理清两个 map。
 
-**Files:**
-- Modify: `mooncake-store/src/master_service.cpp:4690-4750`
-- Modify: `mooncake-store/tests/guaranteed_offload_test.cpp` (tests)
+**文件：**
+- 修改：`mooncake-store/src/master_service.cpp:4690-4750`
+- 修改：`mooncake-store/tests/guaranteed_offload_test.cpp`（2 个测试）
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: 写失败测试**
 
-Append to `guaranteed_offload_test.cpp`:
+追加到 `guaranteed_offload_test.cpp`：
 
 ```cpp
 // Task 8A: drain returns both guaranteed and normal tasks, each with its flag.
@@ -965,35 +931,18 @@ TEST_F(GuaranteedOffloadTest, DisableCleansGuaranteedQueue) {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: 跑测试确认失败**
 
-Run:
 ```bash
 cmake --build build --target guaranteed_offload_test -j"$(nproc)" && \
 ./build/mooncake-store/tests/guaranteed_offload_test \
     --gtest_filter='GuaranteedOffloadTest.Drain*:GuaranteedOffloadTest.Disable*'
 ```
-Expected: 8A may partially fail (drained size 2 might already work since both go to... no — without the drain change, guaranteed tasks are in `guaranteed_offloading_objects` which the current drain does NOT return, so 8A sees only 1 task → size 1 → FAIL). 8B fails (guaranteed task not cleaned by disable → next drain returns it, or it leaks).
+预期：8A FAIL（drain 只返回 offloading_objects，guaranteed "guar" 缺失 → size 1 非 2）；8B FAIL（disable 未清 guaranteed → 下次 drain 返回它，或泄漏）。
 
-- [ ] **Step 3: Extend the drain (enable) branch to return both maps**
+- [ ] **Step 3: 扩展 drain（enable）分支返回两个 map**
 
-In `mooncake-store/src/master_service.cpp`, replace the enable-drain block (lines 4708-4718):
-
-```cpp
-        if (enable_offloading) {
-            std::vector<OffloadTaskItem> result;
-            result.reserve(
-                local_disk_segment_it->second->offloading_objects.size());
-            for (const auto& [_, task] :
-                 local_disk_segment_it->second->offloading_objects) {
-                result.push_back(task);
-            }
-            local_disk_segment_it->second->offloading_objects.clear();
-            return result;
-        }
-```
-
-with:
+`mooncake-store/src/master_service.cpp`，enable-drain 块（`if (enable_offloading) {...}`）替换为：
 
 ```cpp
         if (enable_offloading) {
@@ -1016,36 +965,9 @@ with:
         }
 ```
 
-- [ ] **Step 4: Extend the disable-cleanup to move + clean both maps**
+- [ ] **Step 4: 扩展 disable 清理：move + 清两个 map**
 
-In the same function, replace the disable branch (lines 4728-4748):
-
-```cpp
-        offloading_objects_copy =
-            std::move(local_disk_segment_it->second->offloading_objects);
-    }
-
-    for (auto& [_, task] : offloading_objects_copy) {
-        const auto object_id = MakeObjectIdentity(task.key, task.tenant_id);
-        MetadataAccessorRW accessor(this, object_id);
-        if (accessor.Exists()) {
-            auto& tenant_state = accessor.GetTenantState();
-            auto task_it =
-                tenant_state.offloading_tasks.find(object_id.user_key);
-            if (task_it != tenant_state.offloading_tasks.end()) {
-                auto source =
-                    accessor.Get().GetReplicaByID(task_it->second.source_id);
-                if (source) {
-                    source->dec_refcnt();
-                }
-                tenant_state.offloading_tasks.erase(task_it);
-            }
-        }
-    }
-    return {};
-```
-
-with (add a second copy map + a second loop):
+disable 分支（从 `offloading_objects_copy = std::move(...)` 到末尾 `return {};`）替换为（加第二个 copy map + cleanup lambda + 第二个循环）：
 
 ```cpp
         offloading_objects_copy =
@@ -1080,39 +1002,31 @@ with (add a second copy map + a second loop):
     return {};
 ```
 
-And add the second copy map declaration near line 4704. Find:
-
-```cpp
-    std::unordered_map<std::string, OffloadTaskItem> offloading_objects_copy;
-```
-
-and change to:
+并在 `std::unordered_map<std::string, OffloadTaskItem> offloading_objects_copy;` 旁加第二个 copy map 声明：
 
 ```cpp
     std::unordered_map<std::string, OffloadTaskItem> offloading_objects_copy;
     std::unordered_map<std::string, OffloadTaskItem> guaranteed_objects_copy;
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [ ] **Step 5: 跑测试确认通过**
 
-Run:
 ```bash
 cmake --build build --target guaranteed_offload_test -j"$(nproc)" && \
 ./build/mooncake-store/tests/guaranteed_offload_test \
     --gtest_filter='GuaranteedOffloadTest.Drain*:GuaranteedOffloadTest.Disable*'
 ```
-Expected: PASS.
+预期：PASS。
 
-- [ ] **Step 6: Run full new test suite + existing offload tests**
+- [ ] **Step 6: 跑全量新测试 + 既有 offload 测试**
 
-Run:
 ```bash
 ./build/mooncake-store/tests/guaranteed_offload_test && \
 ./build/mooncake-store/tests/offload_on_evict_test
 ```
-Expected: both PASS.
+预期：都 PASS。
 
-- [ ] **Step 7: Stage**
+- [ ] **Step 7: 暂存**
 
 ```bash
 git add mooncake-store/src/master_service.cpp mooncake-store/tests/guaranteed_offload_test.cpp
@@ -1120,17 +1034,17 @@ git add mooncake-store/src/master_service.cpp mooncake-store/tests/guaranteed_of
 
 ---
 
-## Task 9: Re-enqueue guaranteed objects on SSD-write NACK
+## Task 9: SSD 写 NACK 时重新入队 guaranteed
 
-On NACK (`metadata.data_size < 0`), a guaranteed object is re-enqueued into the independent queue (pin retained — no `dec_refcnt`), refreshing `start_time`, to be retried on the next drain. Non-guaranteed keeps the existing dec/erase path.
+NACK（`metadata.data_size < 0`）时，guaranteed 对象重新入独立队列（pin 保持 —— 不 `dec_refcnt`），刷新 `start_time`，等下一批 drain 重试。非 guaranteed 保持既有 dec/erase 路径。
 
-**Files:**
-- Modify: `mooncake-store/src/master_service.cpp:4813-4829`
-- Modify: `mooncake-store/tests/guaranteed_offload_test.cpp` (test)
+**文件：**
+- 修改：`mooncake-store/src/master_service.cpp:4813-4829`
+- 修改：`mooncake-store/tests/guaranteed_offload_test.cpp`（测试）
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: 写失败测试**
 
-Append to `guaranteed_offload_test.cpp`:
+追加到 `guaranteed_offload_test.cpp`：
 
 ```cpp
 // Task 9: on SSD-write NACK, a guaranteed object is re-enqueued (retry).
@@ -1172,42 +1086,18 @@ TEST_F(GuaranteedOffloadTest, GuaranteedReenqueuedOnNack) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: 跑测试确认失败**
 
-Run:
 ```bash
 cmake --build build --target guaranteed_offload_test -j"$(nproc)" && \
 ./build/mooncake-store/tests/guaranteed_offload_test \
     --gtest_filter=GuaranteedOffloadTest.GuaranteedReenqueuedOnNack
 ```
-Expected: FAIL — current NACK branch does dec_refcnt + erase, does not re-enqueue; `second_drain` is empty.
+预期：FAIL —— 当前 NACK 分支 dec_refcnt + erase，不重新入队；`second_drain` 空。
 
-- [ ] **Step 3: Add the guaranteed re-enqueue in the NACK branch**
+- [ ] **Step 3: 在 NACK 分支加 guaranteed 重新入队**
 
-In `mooncake-store/src/master_service.cpp`, replace the NACK branch (lines 4813-4829):
-
-```cpp
-        if (metadata.data_size < 0) {
-            std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-            MetadataAccessorRW accessor(this, request_object_id);
-            if (accessor.Exists()) {
-                auto& tenant_state = accessor.GetTenantState();
-                auto task_it = tenant_state.offloading_tasks.find(
-                    request_object_id.user_key);
-                if (task_it != tenant_state.offloading_tasks.end()) {
-                    auto source = accessor.Get().GetReplicaByID(
-                        task_it->second.source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
-                    }
-                    tenant_state.offloading_tasks.erase(task_it);
-                }
-            }
-            continue;
-        }
-```
-
-with (guaranteed re-enqueue before the existing dec/erase):
+`mooncake-store/src/master_service.cpp`，NACK 分支（`if (metadata.data_size < 0) {...}`）替换为（guaranteed 重新入队在既有 dec/erase 之前）：
 
 ```cpp
         if (metadata.data_size < 0) {
@@ -1232,10 +1122,9 @@ with (guaranteed re-enqueue before the existing dec/erase):
                                           ErrorCode::OBJECT_ALREADY_EXISTS) {
                             // Refresh start_time to reset the offload-task TTL,
                             // preventing the reaper from erasing the task.
-                            // offloading_tasks maps to `const OffloadingTask`
-                            // (master_service.h:1216), so the entry cannot be
-                            // mutated in place — erase and re-emplace with a
-                            // fresh start_time instead.
+                            // offloading_tasks maps to `const OffloadingTask`,
+                            // so the entry cannot be mutated in place — erase
+                            // and re-emplace with a fresh start_time instead.
                             const auto source_id = task_it->second.source_id;
                             tenant_state.offloading_tasks.erase(task_it);
                             tenant_state.offloading_tasks.emplace(
@@ -1263,29 +1152,28 @@ with (guaranteed re-enqueue before the existing dec/erase):
         }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+**注意**：`offloading_tasks` 的 mapped type 是 `const OffloadingTask`（[master_service.h:1216](../../../mooncake-store/include/master_service.h)），不能原地赋值 —— 必须 `erase` + 重新 `emplace`（带新 `start_time`）。这是 Phase 1 实现中踩过的坑，已修。
 
-Run:
+- [ ] **Step 4: 跑测试确认通过**
+
 ```bash
 cmake --build build --target guaranteed_offload_test -j"$(nproc)" && \
 ./build/mooncake-store/tests/guaranteed_offload_test \
     --gtest_filter=GuaranteedOffloadTest.GuaranteedReenqueuedOnNack
 ```
-Expected: PASS.
+预期：PASS。
 
-- [ ] **Step 5: Run the full new test suite + existing offload/promotion tests (no regression)**
+- [ ] **Step 5: 跑全量新测试 + 既有 offload/promotion 测试（无回归）**
 
-Run:
 ```bash
-cmake --build build --target mooncake_store_tests -j"$(nproc)" 2>/dev/null || \
 cmake --build build --target guaranteed_offload_test offload_on_evict_test promotion_on_hit_test -j"$(nproc)"
 ./build/mooncake-store/tests/guaranteed_offload_test
 ./build/mooncake-store/tests/offload_on_evict_test
 ./build/mooncake-store/tests/promotion_on_hit_test
 ```
-Expected: all PASS.
+预期：全 PASS。
 
-- [ ] **Step 6: Stage**
+- [ ] **Step 6: 暂存**
 
 ```bash
 git add mooncake-store/src/master_service.cpp mooncake-store/tests/guaranteed_offload_test.cpp
@@ -1293,46 +1181,13 @@ git add mooncake-store/src/master_service.cpp mooncake-store/tests/guaranteed_of
 
 ---
 
-## Final Verification
+## 补充测试：用例 5 & 9（覆盖缺口）
 
-- [ ] **Step 1: Build all store tests**
+spec §10 用例 5（SSD 写成功后 guaranteed 变可驱逐）和用例 9（`enable_offload=false` 降级）。
 
-```bash
-cmake --build build --target mooncake_store_tests -j"$(nproc)" 2>/dev/null || \
-cmake --build build -j"$(nproc)"
-```
+- [ ] **加 `#include <algorithm>`**（用 `std::any_of`），在 includes 区。
 
-- [ ] **Step 2: Run the full guaranteed test file**
-
-```bash
-./build/mooncake-store/tests/guaranteed_offload_test
-```
-Expected: all tests PASS (12 tests).
-
-- [ ] **Step 3: Run the broader offload/promotion regression suite**
-
-```bash
-cd build && ctest -R "offload_on_evict_test|promotion_on_hit_test|guaranteed_offload_test" -V
-```
-Expected: all PASS — no regression to existing offload/promotion behavior.
-
-- [ ] **Step 4: Confirm zero behavior change with flag off**
-
-The default `enable_guaranteed_cache=false` means: `guaranteed_` is never set (Task 4 gate), so `metadata.guaranteed_` is always false, so the PutEnd condition reduces to `!offload_on_evict_` (original) and `PushOffloadingQueue` is called with `guaranteed=false` (original). `offload_on_evict_test` passing is the proof.
-
-- [ ] **Step 5: (Optional) Full local CI**
-
-If `scripts/run_ci_test.sh` exists, run it per the `mooncake-ci-local` skill. Otherwise the targeted ctest run above is sufficient for Phase 1.
-
----
-
-## Supplemental Tests: Cases 5 & 9 (coverage gaps)
-
-Spec §10 case 5 (guaranteed becomes normally evictable after SSD success) and case 9 (`enable_offload=false` degrades guaranteed to normal).
-
-- [ ] **Add `#include <algorithm>`** (for `std::any_of`) to the test file's includes.
-
-- [ ] **Case 5: `GuaranteedBecomesEvictableAfterSsdSuccess`**
+- [ ] **用例 5：`GuaranteedBecomesEvictableAfterSsdSuccess`**
 
 ```cpp
 // Task 5: after SSD write success, a guaranteed object's pin is released and a
@@ -1384,7 +1239,7 @@ TEST_F(GuaranteedOffloadTest, GuaranteedBecomesEvictableAfterSsdSuccess) {
 }
 ```
 
-- [ ] **Case 9: `GuaranteedDegradesWhenOffloadDisabled`**
+- [ ] **用例 9：`GuaranteedDegradesWhenOffloadDisabled`**
 
 ```cpp
 // Task 9 (enable_offload=false): with offload entirely disabled, a guaranteed
@@ -1426,7 +1281,7 @@ TEST_F(GuaranteedOffloadTest, GuaranteedDegradesWhenOffloadDisabled) {
 }
 ```
 
-- [ ] **Stage**
+- [ ] **暂存**
 
 ```bash
 git add mooncake-store/tests/guaranteed_offload_test.cpp
@@ -1434,9 +1289,39 @@ git add mooncake-store/tests/guaranteed_offload_test.cpp
 
 ---
 
-## Notes
+## 最终验证
 
-- **`guaranteed_` is const** (immutable after construction), threaded via a trailing defaulted ctor param so the HA-deserialize call site needs no change (defaults false = reset on restart, per spec §7.10).
-- **No capacity limit** on the guaranteed queue — it is implicitly bounded by in-memory guaranteed objects awaiting offload (each holds a pinned memory replica).
-- **Retry has no cap** — guaranteed means "must be written"; persistent SSD failure pins memory until ops intervenes (spec §7).
-- **Client-side `BuildBucket` splitting** (spec §6.4, test case 10) is deferred to Phase 2 — it has no observable effect without Phase 2's bucket-level pin and lives in a different module. The master already propagates `OffloadTaskItem.guaranteed` to the client.
+- [ ] **Step 1: 构建所有 store 测试**
+
+```bash
+cmake --build build --target mooncake_store_tests -j"$(nproc)" 2>/dev/null || \
+cmake --build build -j"$(nproc)"
+```
+
+- [ ] **Step 2: 跑全量 guaranteed 测试**
+
+```bash
+./build/mooncake-store/tests/guaranteed_offload_test
+```
+预期：全 PASS（12 个测试）。
+
+- [ ] **Step 3: 跑更广的 offload/promotion 回归套件**
+
+```bash
+cd build && ctest -R "offload_on_evict_test|promotion_on_hit_test|guaranteed_offload_test" -V
+```
+预期：全 PASS —— 无回归。
+
+- [ ] **Step 4: 确认 flag 关时零行为变化**
+
+默认 `enable_guaranteed_cache=false` → `guaranteed_` 永不被设（Task 4 门控）→ `metadata.guaranteed_` 恒 false → PutEnd 条件退化为 `!offload_on_evict_`（原始）→ `PushOffloadingQueue` 传 `guaranteed=false`（原始）。`offload_on_evict_test` 通过即证明。
+
+---
+
+## 备注
+
+- **`guaranteed_` 是 const**（构造后不可变），经尾随默认 ctor 参数传入，故两 HA 反序列化站点无需改（默认 false = HA 重启重置，spec §7.10）。
+- **guaranteed 队列无 limit** —— 隐式有界于内存中待 offload 的 guaranteed 对象（各持一个 pinned memory replica）。
+- **重试无上限** —— guaranteed 意为"必须写入"；SSD 持续故障时 pin 内存直至运维介入（spec §7）。
+- **client 侧 `BuildBucket` 分流**（spec §6.4、测试用例 10）推迟到 Phase 2 —— 无 Phase 2 bucket pin 无可观察效果，且在不同模块。master 已把 `OffloadTaskItem.guaranteed` 传给 client。
+- **本机 build 环境可能坏**（缺 `libmsgpack-dev` + yalantinglibs include 未传播；`dependencies.sh` 未跑）。若 `cmake --build` 报 `ylt/util/expected.hpp`，是环境问题 —— 用户在 build 环境验证。写正确代码 + 读代码自审。

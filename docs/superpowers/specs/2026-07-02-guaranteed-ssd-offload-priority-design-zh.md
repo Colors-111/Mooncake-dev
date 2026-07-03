@@ -173,13 +173,18 @@ drain 时合并 `guaranteed_offloading_objects` 与 `offloading_objects` 返回�
 
 ### 6.4 client 端分流组桶（⏭️ Phase 2）
 
-client `BuildBucket` 按 `OffloadTaskItem.guaranteed` 分流：guaranteed task 组进 guaranteed bucket，
-normal task 组进 normal bucket。配合 Phase 2 bucket pin（guaranteed bucket 不可驱逐）。
+client `OffloadObjects`（[file_storage.cpp:361](../../../mooncake-store/src/file_storage.cpp)）按 `OffloadTaskItem.guaranteed`
+把 tasks 分成两组（guaranteed / normal），各自独立走 `AllocateOffloadingBuckets` → `BatchOffload`，产出**同质 bucket**
+（全 guaranteed 或全 normal）。`BuildBucket` 据 bucket 组别设 `BucketMetadata.guaranteed`。配合 Phase 2.B 的
+`SelectEvictionCandidate` 跳过 guaranteed bucket。
 
-**归入 Phase 2 而非 Phase 1**：在 Phase 1（无 client 侧 bucket pin）下，`BuildBucket` 分流无可观察效果
-（不影响是否写入 SSD，只影响 bucket 内 key 的同质性）。且 `BuildBucket` 在 `storage_backend.cpp`（不同
-模块），需额外探索 `AllocateOffloadingBuckets` 分配逻辑。Phase 1 已通过 `OffloadTaskItem.guaranteed`（§4.3）
-+ `OffloadObjectHeartbeat` drain（§6.3）把标记传给 client，Phase 2 直接在 `BuildBucket` 消费即可。
+**关键**：Phase 1 把 `guaranteed` 放到 `OffloadTaskItem`，但 `OffloadObjects` 当前降级成 `map<string,int64_t>` 时**丢弃了它**
+（[file_storage.cpp:373](../../../mooncake-store/src/file_storage.cpp)）。Phase 2 必须先在 `OffloadObjects` 按 guaranteed 分组，
+把标记穿到 `BuildBucket`/`BucketMetadata`。详见 §11 Phase 2.A。
+
+**归入 Phase 2 而非 Phase 1**：在 Phase 1（无 client 侧 bucket pin）下，分流无可观察效果。且 `BuildBucket` 在
+`storage_backend.cpp`（不同模块）。Phase 1 已通过 `OffloadTaskItem.guaranteed`（§4.3）+ `OffloadObjectHeartbeat` drain
+（§6.3）把标记传到 client，Phase 2 在 `OffloadObjects` 消费即可。
 
 ## 7. `NotifyOffloadSuccess`：guaranteed 失败重试
 
@@ -326,21 +331,44 @@ guaranteed 的"保证"落在 PutEnd 入队 + 失败重试，内存写完即普�
 
 **子阶段：**
 
-**2.A 标记传到 client + per-key 元数据**
-- `OffloadTaskItem` 增加 `bool guaranteed`（尾随，向后兼容），master 入队时设置。
-- client 侧 `StorageObjectMetadata`（[types.h:542-550](../../../mooncake-store/include/types.h)）增加
-  `bool guaranteed`（或 `guaranteed_until_ms`），`BuildBucket` 时从 `OffloadTaskItem` 透传，存入
-  `object_bucket_map_`（[storage_backend.h:964](../../../mooncake-store/include/storage_backend.h)）。
-- 这样 client 的驱逐路径能查到每个 key 的 guaranteed 标记。
+**2.A `guaranteed` 标记穿到 client 侧 bucket（修复断链 + 同质 bucket 分组）**
 
-**2.B client 侧 SelectEvictionCandidate 跳过 guaranteed（采用 bucket 级 pin）**
-- **难点：驱逐是 bucket 粒度的**（`SelectEvictionCandidate` 返回整个 bucket，[storage_backend.cpp:2181](../../../mooncake-store/src/storage_backend.cpp)）。一个 bucket 含多个 key，若其中一个是
-  guaranteed，跳过整个 bucket 会浪费空间，驱逐整个 bucket 会误删 guaranteed。
-- **采用方案：bucket 级 pin**：`SelectEvictionCandidate` 选候选 bucket 后，检查 bucket 内是否有
-  guaranteed key（在 `BucketMetadata` 上维护 `guaranteed_key_count`，见 §14 维护性——避免遍历）。
-  有则跳过该 bucket 选下一个。简单，代价是 guaranteed bucket 在 TTL 内完全不可驱逐（空间碎片），
-  靠 Phase 3 TTL 过期或 3.C 主动失效回收。
-- 未选 bucket 分裂方案（改 `BuildBucket`/`AllocateOffloadingBuckets` 分流逻辑，维护风险更高）。
+**关键发现（已验证）**：Phase 1 已把 `guaranteed` 放到 `OffloadTaskItem`（[types.h:267](../../../mooncake-store/include/types.h)），但
+client 侧 `FileStorage::OffloadObjects`（[file_storage.cpp:361-375](../../../mooncake-store/src/file_storage.cpp)）把它降级成
+`unordered_map<string,int64_t>`（只留 key+size）传给 `AllocateOffloadingBuckets`——**`guaranteed` 在此处断链**，到不了
+`BuildBucket`/`BucketMetadata`。Phase 2 必须修复这条链路。
+
+- `OffloadObjects` 按 `task.guaranteed` 把 tasks 分成两组（guaranteed / normal），每组独立走
+  `AllocateOffloadingBuckets` → `BatchOffload`，使**同质 bucket**（全 guaranteed 或全 normal）天然分离。这同时实现
+  §6.4 的 client 端分流组桶。
+- `BucketMetadata`（[storage_backend.h:33](../../../mooncake-store/include/storage_backend.h)）增加 `bool guaranteed{false};`。
+  `BuildBucket`（[storage_backend.cpp:1978](../../../mooncake-store/src/storage_backend.cpp)）构造时设置（整 bucket 同质，单一 bool 即可，无需 `guaranteed_key_count`）。
+- **持久化决策**：`BucketMetadata` 经 `YLT_REFL` 序列化到 `.meta` 文件，`BatchLoad` 重启恢复时读回
+  （[storage_backend.cpp:1590](../../../mooncake-store/src/storage_backend.cpp)）。若**不**加进 `YLT_REFL`，重启后 guaranteed
+  bucket 丢失标记变可驱逐——Phase 2 TTL 还没引入，丢失标记等于丢保护。故 **加进 `YLT_REFL`**（与 §14 维护性权衡：
+  这是 client 本地 `.meta` 文件格式，不跨 master，合并风险可控）。注意 `BucketMetadata` 有自定义 copy/move ctor
+  （因 atomic 成员），新增 bool 字段需在 4 个 ctor/assignment 里显式拷贝。
+
+**2.B client 侧 SelectEvictionCandidate 跳过 guaranteed bucket**
+
+**单一 chokepoint 确认**：`PrepareEviction`（[storage_backend.cpp:2227](../../../mooncake-store/src/storage_backend.cpp)）是唯一循环
+`SelectEvictionCandidate` 的地方，纯触发式（无后台驱逐线程）。eviction 只在新 offload 需要空间时于 `BatchOffload` 同步触发
+（[storage_backend.cpp:1317](../../../mooncake-store/src/storage_backend.cpp)）。故只需改 `SelectEvictionCandidate`
+（[storage_backend.cpp:2181](../../../mooncake-store/src/storage_backend.cpp)）一处。guaranteed bucket 跳过后永不进
+`PendingEviction`（既不 `FinalizeEviction` 删文件，也不 `eviction_handler` 通知 master），保护完整。
+
+**两种驱逐策略不同处理**（已验证 [storage_backend.cpp:2183-2224](../../../mooncake-store/src/storage_backend.cpp)）：
+- **FIFO**（[2187](../../../mooncake-store/src/storage_backend.cpp)）：当前 `return buckets_.begin();`。改为从 `begin()` 前向扫描，
+  返回第一个 `!guaranteed` 的 bucket（`buckets_` 是 `std::map`，迭代便宜）。
+- **LRU**（[2200-2220](../../../mooncake-store/src/storage_backend.cpp)）：遍历 `lru_index_`（`std::set<{ts, bucket_id}>`）。
+  当解析到的 bucket 是 guaranteed 时，**不能 erase**（erase 会让该项永久从 LRU 索引丢失，因读路径不重插），改为 `++top_it`
+  跳到下一项继续。非 guaranteed 项的 stale-repair 逻辑（erase+重插）保持不变。
+
+**磁盘满失败模式（接受）**：guaranteed bucket 占满空间时，`SelectEvictionCandidate` 返回 `buckets_.end()`，`PrepareEviction`
+循环 break（[2293](../../../mooncake-store/src/storage_backend.cpp)），`WriteBucket` 随后 ENOSPC 失败，offload 以失败上报。
+这是"guaranteed 不可驱逐"的代价——Phase 2 接受此硬失败（Phase 3 TTL 过期后 guaranteed bucket 变可驱逐，缓解）。
+后续可视情加 backpressure（offload 排队等空间），Phase 2 不做。
+
 - TTL 在 Phase 3 引入；Phase 2 暂为"guaranteed SSD 副本永久保护"。
 
 ### Phase 3：SSD 副本 TTL 管理（后续 slice，"生命周期在 SSD"的核心）
