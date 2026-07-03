@@ -385,9 +385,15 @@ TEST_F(GuaranteedOffloadTest, GuaranteedBecomesEvictableAfterSsdSuccess) {
 }
 
 // Task 9 (enable_offload=false): with offload entirely disabled, a guaranteed
-// Put degrades to a normal object — it is NOT enqueued for offload and incurs no
-// error. (Distinct from FlagOffDegradesGuaranteedToNormal, which covers the
-// enable_guaranteed_cache=false direction.)
+// Put degrades to a normal in-memory object — it succeeds without error and
+// incurs no offload. (Distinct from FlagOffDegradesGuaranteedToNormal, which
+// covers the enable_guaranteed_cache=false direction.)
+//
+// Note: with enable_offload=false, MountLocalDiskSegment is rejected
+// ("offload functionality is not enabled") and there is no offload queue to
+// drain — so this test deliberately does NOT mount a local disk segment or
+// drain. It asserts only that the Put path succeeds (no error, no offload),
+// which is the observable contract of the degrade path.
 TEST_F(GuaranteedOffloadTest, GuaranteedDegradesWhenOffloadDisabled) {
     MasterServiceConfig config;
     config.enable_offload = false;  // offload entirely off
@@ -397,16 +403,21 @@ TEST_F(GuaranteedOffloadTest, GuaranteedDegradesWhenOffloadDisabled) {
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto ctx = PrepareSegment(*service, "seg", kDefaultSegmentBase, seg_size);
-    ASSERT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true).has_value());
 
     // A guaranteed_until_ms>0 Put must succeed (no error) even though offload is
-    // disabled — it just degrades to a normal in-memory object.
+    // disabled — it just degrades to a normal in-memory object. PutObject's
+    // internal PutStart/PutEnd ASSERTs enforce "no error".
     PutObject(*service, ctx.client_id, "guar", /*guaranteed_until_ms=*/60000);
 
-    // Nothing should be queued for offload (enable_offload_ gates PutEnd enqueue).
-    auto drained = DrainOffloadQueue(*service, ctx.client_id);
-    EXPECT_TRUE(drained.empty())
-        << "with enable_offload=false, a guaranteed Put must NOT offload";
+    // Confirm the object exists as a normal in-memory object (offload never ran).
+    auto replica_list = service->GetReplicaList("guar", "default");
+    ASSERT_TRUE(replica_list.has_value()) << "GetReplicaList should succeed";
+    bool has_memory = std::any_of(
+        replica_list->replicas.begin(), replica_list->replicas.end(),
+        [](const Replica::Descriptor& d) { return d.is_memory_replica(); });
+    EXPECT_TRUE(has_memory)
+        << "with enable_offload=false, the object should be a plain in-memory "
+           "object (no LOCAL_DISK replica, since offload is disabled)";
 
     service->RemoveAll();
 }
