@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -331,6 +332,81 @@ TEST_F(GuaranteedOffloadTest, GuaranteedReenqueuedOnNack) {
     }
     EXPECT_TRUE(reenqueued)
         << "guaranteed object must be re-enqueued on NACK for retry";
+
+    service->RemoveAll();
+}
+
+// Task 5: after SSD write success, a guaranteed object's pin is released and a
+// LOCAL_DISK replica is recorded — it has transitioned from "guaranteed, pinned,
+// in-queue" to "offloaded, LOCAL_DISK present, no in-flight task". (Spec §10
+// case 5: guaranteed becomes normally evictable after SSD success.)
+TEST_F(GuaranteedOffloadTest, GuaranteedBecomesEvictableAfterSsdSuccess) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.enable_guaranteed_cache = true;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "seg", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true).has_value());
+
+    PutObject(*service, ctx.client_id, "guar", /*guaranteed_until_ms=*/60000);
+
+    // Drain the guaranteed queue: master hands the task to the client.
+    auto drained = DrainOffloadQueue(*service, ctx.client_id);
+    ASSERT_EQ(drained.size(), 1u);
+    ASSERT_EQ(drained[0].key, "guar");
+
+    // Simulate a successful SSD write: client reports back via
+    // NotifyOffloadSuccess with a non-negative data_size + transport_endpoint.
+    std::vector<OffloadTaskItem> tasks = drained;
+    std::vector<StorageObjectMetadata> metas(tasks.size());
+    metas[0].data_size = 1024;  // success (non-negative)
+    metas[0].transport_endpoint = "tcp://fake_endpoint:1234";
+    auto ack_res = service->NotifyOffloadSuccess(ctx.client_id, tasks, metas);
+    ASSERT_TRUE(ack_res.has_value()) << "NotifyOffloadSuccess should succeed";
+
+    // After success: a LOCAL_DISK replica must be recorded (offload completed).
+    auto replica_list = service->GetReplicaList("guar", "default");
+    ASSERT_TRUE(replica_list.has_value()) << "GetReplicaList should succeed";
+    bool has_local_disk = std::any_of(
+        replica_list->replicas.begin(), replica_list->replicas.end(),
+        [](const Replica::Descriptor& d) { return d.is_local_disk_replica(); });
+    EXPECT_TRUE(has_local_disk)
+        << "after SSD success, the object must have a LOCAL_DISK replica";
+
+    // The in-flight offloading task must be cleared (no longer pinned/queued).
+    auto second_drain = DrainOffloadQueue(*service, ctx.client_id);
+    EXPECT_TRUE(second_drain.empty())
+        << "after success, no offloading task should remain in the queue";
+
+    service->RemoveAll();
+}
+
+// Task 9 (enable_offload=false): with offload entirely disabled, a guaranteed
+// Put degrades to a normal object — it is NOT enqueued for offload and incurs no
+// error. (Distinct from FlagOffDegradesGuaranteedToNormal, which covers the
+// enable_guaranteed_cache=false direction.)
+TEST_F(GuaranteedOffloadTest, GuaranteedDegradesWhenOffloadDisabled) {
+    MasterServiceConfig config;
+    config.enable_offload = false;  // offload entirely off
+    config.enable_guaranteed_cache = true;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "seg", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true).has_value());
+
+    // A guaranteed_until_ms>0 Put must succeed (no error) even though offload is
+    // disabled — it just degrades to a normal in-memory object.
+    PutObject(*service, ctx.client_id, "guar", /*guaranteed_until_ms=*/60000);
+
+    // Nothing should be queued for offload (enable_offload_ gates PutEnd enqueue).
+    auto drained = DrainOffloadQueue(*service, ctx.client_id);
+    EXPECT_TRUE(drained.empty())
+        << "with enable_offload=false, a guaranteed Put must NOT offload";
 
     service->RemoveAll();
 }
