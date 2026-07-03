@@ -264,13 +264,14 @@ struct OffloadTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
+    bool guaranteed{false};  // set at enqueue from ObjectMetadata.guaranteed_
 
     bool operator==(const OffloadTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&
-               size == other.size;
+               size == other.size && guaranteed == other.guaranteed;
     }
 };
-YLT_REFL(OffloadTaskItem, tenant_id, key, size);
+YLT_REFL(OffloadTaskItem, tenant_id, key, size, guaranteed);
 
 struct PromotionTaskItem {
     std::string tenant_id;

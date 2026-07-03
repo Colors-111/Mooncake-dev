@@ -96,6 +96,11 @@ struct ReplicateConfig {
     // and memory eviction behavior.
     std::optional<std::vector<std::string>> group_ids{};
 
+    // Guaranteed offload: when >0, this object's SSD offload is mandatory
+    // (routed to the independent guaranteed queue, retried on failure).
+    // Phase 1 treats this as a boolean marker (>0 => guaranteed).
+    int64_t guaranteed_until_ms{0};
+
     ReplicateConfig ForSingleKey(size_t key_index) const {
         ReplicateConfig key_config = *this;
         if (group_ids.has_value()) {
@@ -138,6 +143,7 @@ struct ReplicateConfig {
             }
             os << "]";
         }
+        os << ", guaranteed_until_ms: " << config.guaranteed_until_ms;
         os << " }";
         return os;
     }

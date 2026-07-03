@@ -51,6 +51,7 @@ struct MasterConfig {
 
     bool enable_ha;
     bool enable_offload;
+    bool enable_guaranteed_cache = false;
     std::string ha_backend_type;
     std::string ha_backend_connstring;
     std::string etcd_endpoints;
@@ -205,6 +206,7 @@ class MasterServiceSupervisorConfig {
     bool enable_cxl = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool enable_guaranteed_cache = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
@@ -245,6 +247,7 @@ class MasterServiceSupervisorConfig {
         nof_heartbeat_failures_threshold =
             config.nof_heartbeat_failures_threshold;
         enable_offload = config.enable_offload;
+        enable_guaranteed_cache = config.enable_guaranteed_cache;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
@@ -395,6 +398,7 @@ class WrappedMasterServiceConfig {
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha = false;
     bool enable_offload = false;
+    bool enable_guaranteed_cache = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
@@ -468,6 +472,7 @@ class WrappedMasterServiceConfig {
             config.nof_heartbeat_failures_threshold;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        enable_guaranteed_cache = config.enable_guaranteed_cache;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
@@ -562,6 +567,7 @@ class WrappedMasterServiceConfig {
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
+        enable_guaranteed_cache = config.enable_guaranteed_cache;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
@@ -634,6 +640,7 @@ class MasterServiceConfigBuilder {
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha_ = false;
     bool enable_offload_ = false;
+    bool enable_guaranteed_cache_ = false;
     std::string ha_backend_type_ = "etcd";
     std::string ha_backend_connstring_;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
@@ -745,6 +752,11 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_offload(bool enable) {
         enable_offload_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_guaranteed_cache(bool enable) {
+        enable_guaranteed_cache_ = enable;
         return *this;
     }
 
@@ -972,6 +984,7 @@ class MasterServiceConfig {
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha = false;
     bool enable_offload = false;
+    bool enable_guaranteed_cache = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
@@ -1041,6 +1054,7 @@ class MasterServiceConfig {
             config.nof_heartbeat_failures_threshold;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        enable_guaranteed_cache = config.enable_guaranteed_cache;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
@@ -1114,6 +1128,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;
     config.enable_ha = enable_ha_;
     config.enable_offload = enable_offload_;
+    config.enable_guaranteed_cache = enable_guaranteed_cache_;
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
     config.cluster_id = cluster_id_;
@@ -1167,6 +1182,7 @@ struct InProcMasterConfig {
     std::optional<int> http_metadata_port;
     std::optional<uint64_t> default_kv_lease_ttl;
     std::optional<bool> enable_offload;
+    std::optional<bool> enable_guaranteed_cache;
     std::optional<bool> enable_cxl;
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
@@ -1184,6 +1200,7 @@ class InProcMasterConfigBuilder {
     std::optional<int> http_metadata_port_ = std::nullopt;
     std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
     std::optional<bool> enable_offload_ = std::nullopt;
+    std::optional<bool> enable_guaranteed_cache_ = std::nullopt;
     std::optional<bool> enable_cxl_ = std::nullopt;
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
@@ -1217,6 +1234,11 @@ class InProcMasterConfigBuilder {
 
     InProcMasterConfigBuilder& set_enable_offload(bool enable) {
         enable_offload_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_enable_guaranteed_cache(bool enable) {
+        enable_guaranteed_cache_ = enable;
         return *this;
     }
 
@@ -1270,6 +1292,7 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.http_metadata_port = http_metadata_port_;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
     config.enable_offload = enable_offload_;
+    config.enable_guaranteed_cache = enable_guaranteed_cache_;
     config.enable_cxl = enable_cxl_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;

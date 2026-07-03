@@ -203,6 +203,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.nof_heartbeat_failures_threshold),
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
+      enable_guaranteed_cache_(config.enable_guaranteed_cache),
       ha_backend_type_(config.ha_backend_type),
       ha_backend_connstring_(config.ha_backend_connstring),
       cluster_id_(config.cluster_id),
@@ -2817,7 +2818,9 @@ auto MasterService::AllocateAndInsertMetadata(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
                               config.with_soft_pin, config.with_hard_pin,
-                              config.data_type, group_id, tenant_id, key));
+                              config.data_type, group_id, tenant_id, key,
+                              enable_guaranteed_cache_ &&
+                                  config.guaranteed_until_ms > 0));
     if (!inserted) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
         abort_reserved_quota();
@@ -3061,15 +3064,17 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         metadata.pending_replaced_quota_charge_bytes = 0;
     }
 
-    if (enable_offload_ && !offload_on_evict_) {
+    if (enable_offload_ && (!offload_on_evict_ || metadata.guaranteed_)) {
         auto& tenant_state = accessor.GetTenantState();
         bool task_created = false;
         metadata.VisitReplicas(
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &tenant_state, &task_created](Replica& replica) {
-                auto result = PushOffloadingQueue(object_id, replica);
+            [this, &object_id, &tenant_state, &task_created,
+             guaranteed = metadata.guaranteed_](Replica& replica) {
+                auto result =
+                    PushOffloadingQueue(object_id, replica, guaranteed);
                 if (result) {
                     if (!task_created) {
                         replica.inc_refcnt();
@@ -4702,18 +4707,26 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
     std::unordered_map<std::string, OffloadTaskItem> offloading_objects_copy;
+    std::unordered_map<std::string, OffloadTaskItem> guaranteed_objects_copy;
     {
         MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
         local_disk_segment_it->second->enable_offloading = enable_offloading;
         if (enable_offloading) {
             std::vector<OffloadTaskItem> result;
             result.reserve(
-                local_disk_segment_it->second->offloading_objects.size());
+                local_disk_segment_it->second->offloading_objects.size() +
+                local_disk_segment_it->second->guaranteed_offloading_objects
+                    .size());
             for (const auto& [_, task] :
                  local_disk_segment_it->second->offloading_objects) {
                 result.push_back(task);
             }
+            for (const auto& [_, task] :
+                 local_disk_segment_it->second->guaranteed_offloading_objects) {
+                result.push_back(task);
+            }
             local_disk_segment_it->second->offloading_objects.clear();
+            local_disk_segment_it->second->guaranteed_offloading_objects.clear();
             return result;
         }
         // Offloading is disabled: clear the pending queue to prevent
@@ -4727,25 +4740,33 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         // MetadataAccessorRW.
         offloading_objects_copy =
             std::move(local_disk_segment_it->second->offloading_objects);
+        guaranteed_objects_copy =
+            std::move(local_disk_segment_it->second->guaranteed_offloading_objects);
     }
 
-    for (auto& [_, task] : offloading_objects_copy) {
-        const auto object_id = MakeObjectIdentity(task.key, task.tenant_id);
-        MetadataAccessorRW accessor(this, object_id);
-        if (accessor.Exists()) {
-            auto& tenant_state = accessor.GetTenantState();
-            auto task_it =
-                tenant_state.offloading_tasks.find(object_id.user_key);
-            if (task_it != tenant_state.offloading_tasks.end()) {
-                auto source =
-                    accessor.Get().GetReplicaByID(task_it->second.source_id);
-                if (source) {
-                    source->dec_refcnt();
+    auto cleanup_copied =
+        [this](std::unordered_map<std::string, OffloadTaskItem>& copy) {
+            for (auto& [_, task] : copy) {
+                const auto object_id =
+                    MakeObjectIdentity(task.key, task.tenant_id);
+                MetadataAccessorRW accessor(this, object_id);
+                if (accessor.Exists()) {
+                    auto& tenant_state = accessor.GetTenantState();
+                    auto task_it = tenant_state.offloading_tasks.find(
+                        object_id.user_key);
+                    if (task_it != tenant_state.offloading_tasks.end()) {
+                        auto source = accessor.Get().GetReplicaByID(
+                            task_it->second.source_id);
+                        if (source) {
+                            source->dec_refcnt();
+                        }
+                        tenant_state.offloading_tasks.erase(task_it);
+                    }
                 }
-                tenant_state.offloading_tasks.erase(task_it);
             }
-        }
-    }
+        };
+    cleanup_copied(offloading_objects_copy);
+    cleanup_copied(guaranteed_objects_copy);
     return {};
 }
 
@@ -4808,18 +4829,38 @@ auto MasterService::NotifyOffloadSuccess(
         const auto request_object_id =
             MakeObjectIdentityForRequest(task.key, task.tenant_id);
 
-        // NACK sentinel: offload failed on worker. Clean up the
-        // offloading_task + dec_refcnt but skip AddReplica.
+        // NACK sentinel: offload failed on worker. Guaranteed objects are
+        // re-enqueued for retry (pin retained); others clean up + dec_refcnt.
         if (metadata.data_size < 0) {
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
+                auto& obj_metadata = accessor.Get();
                 auto& tenant_state = accessor.GetTenantState();
                 auto task_it = tenant_state.offloading_tasks.find(
                     request_object_id.user_key);
                 if (task_it != tenant_state.offloading_tasks.end()) {
                     auto source = accessor.Get().GetReplicaByID(
                         task_it->second.source_id);
+                    if (source != nullptr && obj_metadata.guaranteed_ &&
+                        enable_guaranteed_cache_) {
+                        // Guaranteed: re-enqueue for the next drain and retain
+                        // the pin (no dec_refcnt). The PutEnd inc_refcnt stays
+                        // until SSD write eventually succeeds.
+                        auto result = PushOffloadingQueue(
+                            request_object_id, *source, /*guaranteed=*/true);
+                        if (result || result.error() ==
+                                          ErrorCode::OBJECT_ALREADY_EXISTS) {
+                            // Refresh start_time to reset the offload-task TTL,
+                            // preventing the reaper from erasing the task.
+                            task_it->second = OffloadingTask{
+                                task_it->second.source_id,
+                                std::chrono::system_clock::now()};
+                            continue;  // pin retained; skip dec/erase
+                        }
+                        // Re-enqueue failed (e.g. UNABLE_OFFLOADING) -> degrade.
+                    }
+                    // Non-guaranteed or degraded: existing behavior.
                     if (source != nullptr) {
                         source->dec_refcnt();
                     }
@@ -4930,7 +4971,7 @@ auto MasterService::NotifyOffloadSuccess(
 }
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
-    const ObjectIdentity& object_id, Replica& replica) {
+    const ObjectIdentity& object_id, Replica& replica, bool guaranteed) {
     const auto& segment_names = replica.get_segment_names();
     if (segment_names.empty()) {
         return {};
@@ -4958,18 +4999,24 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         if (!local_disk_segment_it->second->enable_offloading) {
             return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
         }
-        if (local_disk_segment_it->second->offloading_objects.size() >=
-            offloading_queue_limit_) {
+        // Select the queue. Guaranteed objects use a separate per-client map
+        // with NO size limit — they must reach SSD. Normal objects keep the
+        // existing offloading_queue_limit_ enforcement.
+        auto& queue = guaranteed
+                          ? local_disk_segment_it->second->guaranteed_offloading_objects
+                          : local_disk_segment_it->second->offloading_objects;
+        if (!guaranteed && queue.size() >= offloading_queue_limit_) {
             return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
         }
         const int64_t size = replica.get_descriptor()
                                  .get_memory_descriptor()
                                  .buffer_descriptor.size_;
-        auto res = local_disk_segment_it->second->offloading_objects.emplace(
+        auto res = queue.emplace(
             MakeTenantScopedStorageKey(object_id.tenant_id, object_id.user_key),
             OffloadTaskItem{.tenant_id = object_id.tenant_id,
                             .key = object_id.user_key,
-                            .size = size});
+                            .size = size,
+                            .guaranteed = guaranteed});
         if (!res.second) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }

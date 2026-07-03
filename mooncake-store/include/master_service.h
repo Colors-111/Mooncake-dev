@@ -866,7 +866,8 @@ class MasterService {
             bool enable_soft_pin, bool enable_hard_pin = false,
             ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
             std::string group_id_ = "", std::string tenant_id_ = "default",
-            std::string user_key_ = {})
+            std::string user_key_ = {},
+            bool enable_guaranteed = false)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
@@ -877,6 +878,7 @@ class MasterService {
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
+              guaranteed_(enable_guaranteed),
               replicas_(std::move(reps)) {
             MasterMetricManager::instance().inc_key_count(1);
             if (enable_soft_pin) {
@@ -910,6 +912,9 @@ class MasterService {
             soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
                                                 // set for vip objects
         const bool hard_pinned{false};          // immutable, set at creation
+        const bool guaranteed_{false};        // immutable, set at creation
+                                          // (Phase 1: boolean marker; Phase 3
+                                          // upgrades to guaranteed_until TTL)
         bool memory_cache_total_accounted{false};
         bool disk_cache_total_accounted{false};
         uint64_t reserved_quota_charge_bytes{0};
@@ -1484,7 +1489,8 @@ class MasterService {
                          std::string* error_reason);
 
     tl::expected<void, ErrorCode> PushOffloadingQueue(
-        const ObjectIdentity& object_id, Replica& replica);
+        const ObjectIdentity& object_id, Replica& replica,
+        bool guaranteed = false);
 
     struct GracefulUnmountDeadlineRecord {
         UUID segment_id;
@@ -1900,6 +1906,7 @@ class MasterService {
     const bool enable_ha_;
 
     const bool enable_offload_;
+    const bool enable_guaranteed_cache_{false};
 
     // Offload-on-evict: defer disk offload to eviction time
     // (config: offload_on_evict)

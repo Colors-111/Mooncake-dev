@@ -173,6 +173,10 @@ DEFINE_validator(nof_eviction_ratio, [](const char* flagname, double value) {
 DEFINE_bool(enable_ha, false,
             "Enable high availability using the configured HA backend");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
+DEFINE_bool(enable_guaranteed_cache, false,
+            "Enable guaranteed offload: objects put with guaranteed_until_ms>0 "
+            "are always written to SSD (independent queue, retried on failure). "
+            "Defaults off for zero behavior change.");
 DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
@@ -455,6 +459,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_ha);
     default_config.GetBool("enable_offload", &master_config.enable_offload,
                            FLAGS_enable_offload);
+    default_config.GetBool("enable_guaranteed_cache",
+                           &master_config.enable_guaranteed_cache,
+                           FLAGS_enable_guaranteed_cache);
     default_config.GetBool("offload_on_evict", &master_config.offload_on_evict,
                            FLAGS_offload_on_evict);
     default_config.GetBool("offload_force_evict",
@@ -750,6 +757,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_offload = FLAGS_enable_offload;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_guaranteed_cache", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_guaranteed_cache = FLAGS_enable_guaranteed_cache;
     }
     if ((google::GetCommandLineFlagInfo("offload_on_evict", &info) &&
          !info.is_default) ||
@@ -1254,6 +1266,8 @@ int main(int argc, char* argv[]) {
         << master_config.eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_offload=" << master_config.enable_offload
+        << ", enable_guaranteed_cache="
+        << master_config.enable_guaranteed_cache
         << ", offload_on_evict=" << master_config.offload_on_evict
         << ", offload_force_evict=" << master_config.offload_force_evict
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit

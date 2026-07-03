@@ -89,6 +89,12 @@ struct LocalDiskSegment {
     std::atomic<int64_t> ssd_used_bytes{0};
     std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(
         offloading_mutex_) offloading_objects;
+    // Guaranteed offload queue (parallel to offloading_objects). Populated by
+    // PushOffloadingQueue when guaranteed=true. No size limit — guaranteed
+    // objects must reach SSD. Drained by OffloadObjectHeartbeat alongside
+    // offloading_objects. Same locking (offloading_mutex_).
+    std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(
+        offloading_mutex_) guaranteed_offloading_objects;
     // Promotion-on-hit pending work for this client. Populated by master's
     // TryPushPromotionQueue when a Get hits a LOCAL_DISK-only key on this
     // client. Drained by PromotionObjectHeartbeat. Same locking as
