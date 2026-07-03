@@ -35,13 +35,14 @@ class GuaranteedEvictionTest : public ::testing::Test {
     }
 
     std::string data_path_;
-
-    // A complete_handler that just accepts the write (records nothing).
-    static ErrorCode NoopComplete(const std::vector<std::string>&,
-                                  std::vector<StorageObjectMetadata>&) {
-        return ErrorCode::OK;
-    }
 };
+
+// A complete_handler that just accepts the write (records nothing). Free
+// function (not a fixture member) so OffloadBatch can call it.
+ErrorCode NoopComplete(const std::vector<std::string>&,
+                      std::vector<StorageObjectMetadata>&) {
+    return ErrorCode::OK;
+}
 
 // Task 1: BucketMetadata defaults to non-guaranteed.
 TEST_F(GuaranteedEvictionTest, BucketMetadataDefaultsNonGuaranteed) {
@@ -68,7 +69,7 @@ tl::expected<int64_t, ErrorCode> OffloadBatch(
         batch.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
         pool.push_back(std::move(buf));
     }
-    return backend.BatchOffload(batch, GuaranteedEvictionTest::NoopComplete,
+    return backend.BatchOffload(batch, NoopComplete,
                                 /*eviction_handler=*/nullptr, guaranteed);
 }
 
