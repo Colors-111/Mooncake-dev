@@ -416,12 +416,12 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
     if (!guaranteed_sizes.empty()) {
         auto res = allocate_group(guaranteed_sizes, /*guaranteed=*/true);
-        if (!res) return res.error();
+        if (!res) return tl::make_unexpected(res.error());
         groups.push_back(std::move(res.value()));
     }
     if (!normal_sizes.empty()) {
         auto res = allocate_group(normal_sizes, /*guaranteed=*/false);
-        if (!res) return res.error();
+        if (!res) return tl::make_unexpected(res.error());
         groups.push_back(std::move(res.value()));
     }
 
