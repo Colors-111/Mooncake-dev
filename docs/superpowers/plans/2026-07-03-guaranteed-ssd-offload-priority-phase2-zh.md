@@ -1,5 +1,7 @@
 # Guaranteed SSD Offload 优先级 — Phase 2 实施计划（中文）
 
+> **状态：✅ 已实现并验证（2026-07-06）。** 4 个任务全部完成，4 个测试通过。仅 client 侧：`BucketMetadata.guaranteed` + `YLT_REFL`（重启不丢）+ `OffloadObjects` 分同质 bucket + `SelectEvictionCandidate` 跳过 guaranteed bucket（FIFO 前向扫描；LRU 前向扫描不 erase）。已应用编译 bug 修复（漏改 DistributedStorageBackend override；`return res.error()`→`tl::make_unexpected`；NoopComplete 改自由函数）。参考 spec §6.4、§11 Phase 2。
+
 > **给执行 agent：** 必用子技能：superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans，逐任务执行。步骤用 checkbox（`- [ ]`）跟踪。
 
 **目标：** 保护 guaranteed 对象的 SSD 副本不被 client 侧 fifo/lru 驱逐 —— 一旦写入 SSD（Phase 1），guaranteed bucket 永不被选为驱逐候选。这是 SSD 管理生命周期设计的第二个 slice（spec §11 Phase 2）。

@@ -1,5 +1,7 @@
 # Guaranteed SSD Offload Priority — Phase 2 Implementation Plan
 
+> **Status: ✅ IMPLEMENTED & VERIFIED (2026-07-06).** All 4 tasks done, 4 tests pass. Client-side only: `BucketMetadata.guaranteed` + `YLT_REFL` (survives restart) + `OffloadObjects` splits into homogeneous buckets + `SelectEvictionCandidate` skips guaranteed buckets (FIFO forward-scan; LRU forward-scan-no-erase). Compile bug fixes applied (DistributedStorageBackend override missed; `return res.error()`→`tl::make_unexpected`; NoopComplete free function). Reference: spec §6.4, §11 Phase 2.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Protect guaranteed objects' SSD replicas from client-side fifo/lru eviction — once written to SSD (Phase 1), a guaranteed bucket is never selected for eviction. This is the second slice of the SSD-managed-lifecycle design (spec §11 Phase 2).

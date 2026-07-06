@@ -1,5 +1,18 @@
 # Guaranteed SSD Offload 优先级 — Phase 3 设计计划（中文）
 
+> ⚠️ **本文档已废弃（2026-07-06）。** 它提出的 client-side TTL 方案（TTL 落 client `StorageObjectMetadata`
+> + 跨节点 heartbeat 同步 TTL + `SelectEvictionCandidate` 热路径 TTL 判断）被**推翻**，改用
+> **master-driven downgrade** 方案（见 [2026-07-06-guaranteed-ssd-master-driven-downgrade-zh.md](2026-07-06-guaranteed-ssd-master-driven-downgrade-zh.md)）。
+>
+> 推翻原因（探索验证）：client 读路径不自然刷新 `object_bucket_map_` TTL（reader≠holder），跨节点 TTL
+> 同步只能靠 heartbeat——复杂且需改热路径。master-driven 方案把 TTL 只放 master（object 级，类似
+> lease），到期时下发一次性降级列表，worker 翻转 bucket 的 `guaranteed` bool 后由**现成 LRU 驱逐路径**
+> 自动回收——消除跨节点 TTL 同步与热路径改动。
+>
+> **本文档保留仅作对比/历史**，不代表当前设计。当前 Phase 3 实施以 master-driven-downgrade plan 为准。
+
+---
+
 > **本文档是设计计划，不含实现代码。** 用户要求先完善设计，重点分析 3.C 实现方式，再决定写代码。
 
 ## 目标

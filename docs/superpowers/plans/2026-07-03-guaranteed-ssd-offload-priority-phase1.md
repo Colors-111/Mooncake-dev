@@ -1,5 +1,7 @@
 # Guaranteed SSD Offload Priority — Phase 1 Implementation Plan
 
+> **Status: ✅ IMPLEMENTED & VERIFIED (2026-07-06).** All 9 tasks + supplemental cases 5&9 done, 12 tests pass. Master-side only: independent guaranteed offload queue (no limit) + PutEnd always-offload + NACK retry, behind `enable_guaranteed_cache` flag (default off). Compile bug fixes applied (const-OffloadingTask → erase+emplace). Reference: spec §4–§10.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ensure a `guaranteed` object is always written to SSD — never rejected for a full offload queue (independent per-client queue, no limit), never abandoned on SSD write failure (retry) — behind an `enable_guaranteed_cache` flag that defaults off.

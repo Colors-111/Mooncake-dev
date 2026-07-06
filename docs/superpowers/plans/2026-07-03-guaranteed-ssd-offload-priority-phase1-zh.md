@@ -1,5 +1,7 @@
 # Guaranteed SSD Offload 优先级 — Phase 1 实施计划（中文）
 
+> **状态：✅ 已实现并验证（2026-07-06）。** 9 个任务 + 补充用例 5&9 全部完成，12 个测试通过。仅 master 侧：独立 guaranteed offload 队列（无 limit）+ PutEnd 总 offload + NACK 重试，由 `enable_guaranteed_cache` flag（默认关）门控。已应用编译 bug 修复（const-OffloadingTask → erase+emplace）。参考 spec §4–§10。
+
 > **给执行 agent：** 必用子技能：superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans，逐任务执行。步骤用 checkbox（`- [ ]`）跟踪。
 
 **目标：** 确保 `guaranteed` 对象一定写入 SSD —— 不因 offload 队列满被拒（独立 per-client 队列、无 limit），不因 SSD 写失败被放弃（重试）—— 全程由 `enable_guaranteed_cache` flag 门控（默认 false）。
