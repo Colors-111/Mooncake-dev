@@ -99,6 +99,10 @@ class MasterService {
         const UUID& segment_id);
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshotForTesting(
         const std::string& tenant_id) const;
+    // Test-only: returns guaranteed_until_ for an object, or nullopt if absent.
+    std::optional<std::chrono::system_clock::time_point>
+    GetGuaranteedUntilForTesting(const std::string& key,
+                                 const std::string& tenant_id) const;
     bool IsTenantQuotaEnabled() const;
     std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(
@@ -867,7 +871,7 @@ class MasterService {
             ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
             std::string group_id_ = "", std::string tenant_id_ = "default",
             std::string user_key_ = {},
-            bool enable_guaranteed = false)
+            int64_t guaranteed_until_ms = 0)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
@@ -878,7 +882,10 @@ class MasterService {
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
-              guaranteed_(enable_guaranteed),
+              guaranteed_until_(guaranteed_until_ms > 0
+                  ? std::chrono::system_clock::now()
+                        + std::chrono::milliseconds(guaranteed_until_ms)
+                  : std::chrono::system_clock::time_point{}),
               replicas_(std::move(reps)) {
             MasterMetricManager::instance().inc_key_count(1);
             if (enable_soft_pin) {
@@ -912,9 +919,15 @@ class MasterService {
             soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
                                                 // set for vip objects
         const bool hard_pinned{false};          // immutable, set at creation
-        const bool guaranteed_{false};        // immutable, set at creation
-                                          // (Phase 1: boolean marker; Phase 3
-                                          // upgrades to guaranteed_until TTL)
+        // Guaranteed SSD pin TTL (master-only runtime state, NOT in HA
+        // snapshot/wire). Epoch (default-constructed) = not guaranteed; a real
+        // future timestamp = guaranteed until that instant. Non-const so Task 3
+        // (dispatch) and Task 6 (read-time renewal) can mutate it. Behavior
+        // while the TTL is active is equivalent to Phase 1's bool marker.
+        std::chrono::system_clock::time_point guaranteed_until_{};
+        // Runtime only, NOT in HA: set true once a downgrade for this object
+        // has been dispatched (Task 3). Idempotency guard against re-dispatch.
+        bool downgrade_dispatched_{false};
         bool memory_cache_total_accounted{false};
         bool disk_cache_total_accounted{false};
         uint64_t reserved_quota_charge_bytes{0};
@@ -1907,6 +1920,11 @@ class MasterService {
 
     const bool enable_offload_;
     const bool enable_guaranteed_cache_{false};
+    // Master-level guaranteed TTL (ms) and renewal TTL (ms), read from config.
+    // Stored here for Task 3 (dispatch) / Task 6 (read-time renewal); Task 1
+    // stores them but does not yet use guaranteed_renewal_ttl_ms_.
+    const int64_t guaranteed_until_ms_{0};
+    const int64_t guaranteed_renewal_ttl_ms_{0};
 
     // Offload-on-evict: defer disk offload to eviction time
     // (config: offload_on_evict)

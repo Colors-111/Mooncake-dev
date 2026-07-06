@@ -204,6 +204,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
       enable_guaranteed_cache_(config.enable_guaranteed_cache),
+      guaranteed_until_ms_(config.guaranteed_until_ms),
+      guaranteed_renewal_ttl_ms_(config.guaranteed_renewal_ttl_ms),
       ha_backend_type_(config.ha_backend_type),
       ha_backend_connstring_(config.ha_backend_connstring),
       cluster_id_(config.cluster_id),
@@ -599,6 +601,16 @@ MasterService::GetTenantQuotaSnapshotForTesting(
         return std::nullopt;
     }
     return MakeTenantQuotaSnapshot(normalized_tenant, it->second);
+}
+
+std::optional<std::chrono::system_clock::time_point>
+MasterService::GetGuaranteedUntilForTesting(
+    const std::string& key, const std::string& tenant_id) const {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    MetadataAccessorRO accessor(this, object_id);
+    if (!accessor.Exists()) return std::nullopt;
+    return accessor.Get().guaranteed_until_;
 }
 
 bool MasterService::IsTenantQuotaEnabled() const {
@@ -2814,13 +2826,17 @@ auto MasterService::AllocateAndInsertMetadata(
         }
     }
 
+    // Gate the per-request guaranteed TTL on the master feature flag: if the
+    // flag is off, the object is created non-guaranteed (epoch) regardless of
+    // the request's guaranteed_until_ms.
+    const int64_t effective_guaranteed_ms =
+        enable_guaranteed_cache_ ? config.guaranteed_until_ms : 0;
     auto [it, inserted] = tenant_state.metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
                               config.with_soft_pin, config.with_hard_pin,
                               config.data_type, group_id, tenant_id, key,
-                              enable_guaranteed_cache_ &&
-                                  config.guaranteed_until_ms > 0));
+                              effective_guaranteed_ms));
     if (!inserted) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
         abort_reserved_quota();
@@ -3064,7 +3080,9 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         metadata.pending_replaced_quota_charge_bytes = 0;
     }
 
-    if (enable_offload_ && (!offload_on_evict_ || metadata.guaranteed_)) {
+    const auto now_pe = std::chrono::system_clock::now();
+    if (enable_offload_ &&
+        (!offload_on_evict_ || metadata.guaranteed_until_ > now_pe)) {
         auto& tenant_state = accessor.GetTenantState();
         bool task_created = false;
         metadata.VisitReplicas(
@@ -3072,7 +3090,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                 return replica.is_completed() && replica.is_memory_replica();
             },
             [this, &object_id, &tenant_state, &task_created,
-             guaranteed = metadata.guaranteed_](Replica& replica) {
+             guaranteed = (metadata.guaranteed_until_ > now_pe)](Replica& replica) {
                 auto result =
                     PushOffloadingQueue(object_id, replica, guaranteed);
                 if (result) {
@@ -4842,7 +4860,9 @@ auto MasterService::NotifyOffloadSuccess(
                 if (task_it != tenant_state.offloading_tasks.end()) {
                     auto source = accessor.Get().GetReplicaByID(
                         task_it->second.source_id);
-                    if (source != nullptr && obj_metadata.guaranteed_ &&
+                    const auto now_nack = std::chrono::system_clock::now();
+                    if (source != nullptr &&
+                        obj_metadata.guaranteed_until_ > now_nack &&
                         enable_guaranteed_cache_) {
                         // Guaranteed: re-enqueue for the next drain and retain
                         // the pin (no dec_refcnt). The PutEnd inc_refcnt stays

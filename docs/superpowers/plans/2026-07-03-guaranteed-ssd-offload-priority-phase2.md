@@ -99,28 +99,16 @@ class GuaranteedEvictionTest : public ::testing::Test {
     }
 
     std::string data_path_;
-
-    // Build a batch_object for BatchOffload from (key -> value) pairs.
-    // Returns the backing buffers (must outlive the BatchOffload call).
-    std::vector<std::unique_ptr<char[]>> MakeBatch(
-        const std::vector<std::pair<std::string, std::string>>& kv,
-        std::unordered_map<std::string, std::vector<Slice>>& batch) {
-        std::vector<std::unique_ptr<char[]>> buffers;
-        for (const auto& [key, value] : kv) {
-            auto buf = std::make_unique<char[]>(value.size());
-            std::memcpy(buf.get(), value.data(), value.size());
-            batch.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
-            buffers.push_back(std::move(buf));
-        }
-        return buffers;
-    }
-
-    // A complete_handler that just accepts the write (records nothing).
-    static ErrorCode NoopComplete(const std::vector<std::string>&,
-                                  std::vector<StorageObjectMetadata>&) {
-        return ErrorCode::OK;
-    }
 };
+
+// A complete_handler that just accepts the write (records nothing). Free
+// function (not a fixture member) so the OffloadBatch helper (also a free
+// function, Task 4) can call it — a protected static member would be
+// inaccessible from a free function.
+ErrorCode NoopComplete(const std::vector<std::string>&,
+                      std::vector<StorageObjectMetadata>&) {
+    return ErrorCode::OK;
+}
 
 // Task 1: BucketMetadata defaults to non-guaranteed.
 TEST_F(GuaranteedEvictionTest, BucketMetadataDefaultsNonGuaranteed) {
@@ -308,12 +296,12 @@ In `mooncake-store/src/file_storage.cpp`, replace the section from line 366 (`st
 
     if (!guaranteed_sizes.empty()) {
         auto res = allocate_group(guaranteed_sizes, /*guaranteed=*/true);
-        if (!res) return res.error();
+        if (!res) return tl::make_unexpected(res.error());
         groups.push_back(std::move(res.value()));
     }
     if (!normal_sizes.empty()) {
         auto res = allocate_group(normal_sizes, /*guaranteed=*/false);
-        if (!res) return res.error();
+        if (!res) return tl::make_unexpected(res.error());
         groups.push_back(std::move(res.value()));
     }
 ```
@@ -485,7 +473,7 @@ tl::expected<int64_t, ErrorCode> OffloadBatch(
         batch.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
         pool.push_back(std::move(buf));
     }
-    return backend.BatchOffload(batch, GuaranteedEvictionTest::NoopComplete,
+    return backend.BatchOffload(batch, NoopComplete,
                                 /*eviction_handler=*/nullptr, guaranteed);
 }
 

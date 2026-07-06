@@ -52,6 +52,11 @@ struct MasterConfig {
     bool enable_ha;
     bool enable_offload;
     bool enable_guaranteed_cache = false;
+    // Guaranteed SSD pin TTL (ms). 0 = not guaranteed. Flows to MasterService.
+    int64_t guaranteed_until_ms = 0;
+    // Read-time renewal TTL (ms). 0 = strict TTL (no renewal). >0 = renew on
+    // read while still guaranteed (Task 6). Stored now; unused in Task 1.
+    int64_t guaranteed_renewal_ttl_ms = 0;
     std::string ha_backend_type;
     std::string ha_backend_connstring;
     std::string etcd_endpoints;
@@ -207,6 +212,8 @@ class MasterServiceSupervisorConfig {
     bool offload_on_evict = false;
     bool offload_force_evict = false;
     bool enable_guaranteed_cache = false;
+    int64_t guaranteed_until_ms = 0;
+    int64_t guaranteed_renewal_ttl_ms = 0;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
@@ -248,6 +255,8 @@ class MasterServiceSupervisorConfig {
             config.nof_heartbeat_failures_threshold;
         enable_offload = config.enable_offload;
         enable_guaranteed_cache = config.enable_guaranteed_cache;
+        guaranteed_until_ms = config.guaranteed_until_ms;
+        guaranteed_renewal_ttl_ms = config.guaranteed_renewal_ttl_ms;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
@@ -399,6 +408,8 @@ class WrappedMasterServiceConfig {
     bool enable_ha = false;
     bool enable_offload = false;
     bool enable_guaranteed_cache = false;
+    int64_t guaranteed_until_ms = 0;
+    int64_t guaranteed_renewal_ttl_ms = 0;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
@@ -473,6 +484,8 @@ class WrappedMasterServiceConfig {
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
         enable_guaranteed_cache = config.enable_guaranteed_cache;
+        guaranteed_until_ms = config.guaranteed_until_ms;
+        guaranteed_renewal_ttl_ms = config.guaranteed_renewal_ttl_ms;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
@@ -568,6 +581,8 @@ class WrappedMasterServiceConfig {
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
         enable_guaranteed_cache = config.enable_guaranteed_cache;
+        guaranteed_until_ms = config.guaranteed_until_ms;
+        guaranteed_renewal_ttl_ms = config.guaranteed_renewal_ttl_ms;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
@@ -641,6 +656,8 @@ class MasterServiceConfigBuilder {
     bool enable_ha_ = false;
     bool enable_offload_ = false;
     bool enable_guaranteed_cache_ = false;
+    int64_t guaranteed_until_ms_ = 0;
+    int64_t guaranteed_renewal_ttl_ms_ = 0;
     std::string ha_backend_type_ = "etcd";
     std::string ha_backend_connstring_;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
@@ -757,6 +774,16 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_guaranteed_cache(bool enable) {
         enable_guaranteed_cache_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_guaranteed_until_ms(int64_t ms) {
+        guaranteed_until_ms_ = ms;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_guaranteed_renewal_ttl_ms(int64_t ms) {
+        guaranteed_renewal_ttl_ms_ = ms;
         return *this;
     }
 
@@ -985,6 +1012,8 @@ class MasterServiceConfig {
     bool enable_ha = false;
     bool enable_offload = false;
     bool enable_guaranteed_cache = false;
+    int64_t guaranteed_until_ms = 0;
+    int64_t guaranteed_renewal_ttl_ms = 0;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
@@ -1055,6 +1084,8 @@ class MasterServiceConfig {
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
         enable_guaranteed_cache = config.enable_guaranteed_cache;
+        guaranteed_until_ms = config.guaranteed_until_ms;
+        guaranteed_renewal_ttl_ms = config.guaranteed_renewal_ttl_ms;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
@@ -1129,6 +1160,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_ha = enable_ha_;
     config.enable_offload = enable_offload_;
     config.enable_guaranteed_cache = enable_guaranteed_cache_;
+    config.guaranteed_until_ms = guaranteed_until_ms_;
+    config.guaranteed_renewal_ttl_ms = guaranteed_renewal_ttl_ms_;
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
     config.cluster_id = cluster_id_;
@@ -1183,6 +1216,8 @@ struct InProcMasterConfig {
     std::optional<uint64_t> default_kv_lease_ttl;
     std::optional<bool> enable_offload;
     std::optional<bool> enable_guaranteed_cache;
+    std::optional<int64_t> guaranteed_until_ms;
+    std::optional<int64_t> guaranteed_renewal_ttl_ms;
     std::optional<bool> enable_cxl;
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
@@ -1201,6 +1236,8 @@ class InProcMasterConfigBuilder {
     std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
     std::optional<bool> enable_offload_ = std::nullopt;
     std::optional<bool> enable_guaranteed_cache_ = std::nullopt;
+    std::optional<int64_t> guaranteed_until_ms_ = std::nullopt;
+    std::optional<int64_t> guaranteed_renewal_ttl_ms_ = std::nullopt;
     std::optional<bool> enable_cxl_ = std::nullopt;
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
@@ -1239,6 +1276,16 @@ class InProcMasterConfigBuilder {
 
     InProcMasterConfigBuilder& set_enable_guaranteed_cache(bool enable) {
         enable_guaranteed_cache_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_guaranteed_until_ms(int64_t ms) {
+        guaranteed_until_ms_ = ms;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_guaranteed_renewal_ttl_ms(int64_t ms) {
+        guaranteed_renewal_ttl_ms_ = ms;
         return *this;
     }
 
@@ -1293,6 +1340,8 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
     config.enable_offload = enable_offload_;
     config.enable_guaranteed_cache = enable_guaranteed_cache_;
+    config.guaranteed_until_ms = guaranteed_until_ms_;
+    config.guaranteed_renewal_ttl_ms = guaranteed_renewal_ttl_ms_;
     config.enable_cxl = enable_cxl_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;

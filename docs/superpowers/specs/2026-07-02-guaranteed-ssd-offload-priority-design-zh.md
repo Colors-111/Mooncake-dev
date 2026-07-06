@@ -373,41 +373,63 @@ client 侧 `FileStorage::OffloadObjects`（[file_storage.cpp:361-375](../../../m
 
 ### Phase 3：SSD 副本 TTL 管理（后续 slice，"生命周期在 SSD"的核心）
 
-**问题**：Phase 2 的 guaranteed SSD 副本永久保护，需要 TTL 才能自动回收。TTL 作用在 SSD 副本上，但续期
-在 master、驱逐决策在 client —— 跨节点状态同步是难点。
+**问题**：Phase 2 的 guaranteed SSD 副本永久保护，需要 TTL 才能自动回收。
+
+**探索验证的关键事实**（推翻了 spec 早期假设）：
+- **无 master→client push RPC**：所有 48 个 RPC handler 都在 master 侧，client 只 `Connect(master)`。无 push 机制。
+- **client 读路径不刷新 `object_bucket_map_` TTL**：`BatchQuery`/`BatchLoad` 只接 keys，拿不到 TTL；holder client 的 `object_bucket_map_` 只在 `BatchOffload` 填充。reader 与 holder 常是不同 client，读路径刷新不可行。**跨节点 TTL 同步只能靠 `OffloadObjectHeartbeat` 捎带**。
+- **`prefix_hash` 不是 blake3、不是 key 前缀**：是 HA OpLog 里整个 key 的 XXH32 哈希（[oplog_manager.cpp:155](../../../mooncake-store/src/ha/oplog/oplog_manager.cpp)）。store key 无前缀哈希结构，`key.starts_with(prefix_hash)` 无意义。`BatchExpireGuaranteed` 必须按 exact `(tenant_id, user_key)` 匹配，线性扫描 `tenant_state.metadata`。
+- **`ObjectMetadata.guaranteed_` 是 `const bool`**（Phase 1），HA 快照不含它（运行时态，重启重置，[master_service.cpp:8455-8478](../../../mooncake-store/src/master_service.cpp)）。升级为 `time_point guaranteed_until_` 需去 const + 改类型，HA 仍不含（符合父设计 7.10）。
+- **续期点是 `GetReplicaList` 的 `GrantLeaseForGroup`**（[master_service.cpp:2501](../../../mooncake-store/src/master_service.cpp)，对象级）。需加并行的 `guaranteed_until_` 续期。`GetReplicaListResponse` 可加尾随 `guaranteed_until_ms`（YLT_REFL 兼容）。
 
 **子阶段：**
 
-**3.A guaranteed_until 落到 client 侧元数据 + 续期**
-- **TTL 存放位置（维护性关键决策）**：`guaranteed_until` 存在 **client 侧 `StorageObjectMetadata`**
-  （`object_bucket_map_`，[storage_backend.h:964](../../../mooncake-store/include/storage_backend.h)），**不**放进
-  `LocalDiskReplicaData`/`LocalDiskDescriptor`。原因：后者参与 HA 快照序列化
-  （`Serializer<Replica>` 对 LOCAL_DISK 是硬编码 3 元素数组，[serializer.cpp:709](../../../mooncake-store/src/serializer.cpp)，
-  版本锁定），改它是**最高合并风险点**。`StorageObjectMetadata` 是 client 本地状态、不参与 HA 序列化，加字段
-  零序列化风险。master 侧 `guaranteed_until_` 仍存 `ObjectMetadata`（运行时状态，HA 重启后重置为无保证，
-  符合父设计 7.10），仅用于续期决策。
-- `NotifyOffloadSuccess` 成功分支（[master_service.cpp:4832](../../../mooncake-store/src/master_service.cpp)）：对象
-  的 `guaranteed_until_` 透传给 client——通过 `OffloadTaskItem` 带 `guaranteed_until_ms`（Phase 2.A 的 `bool guaranteed`
-  升级为时间戳），client `BuildBucket` 写入 `object_bucket_map_` 的 `StorageObjectMetadata`。
-- **续期点**：`GetReplicaList`（[master_service.cpp:2496-2504](../../../mooncake-store/src/master_service.cpp)）读到
-  LOCAL_DISK 副本时延长 master 侧 `guaranteed_until_`。
-- **跨节点同步（已确认方案）**：client 在 `GetReplicaList`/读路径拿到刷新后的 `guaranteed_until`，更新本地
-  `object_bucket_map_`。`SelectEvictionCandidate` 比较本地 `guaranteed_until > now` 决定是否跳过（持 storage
-  mutex，不查 master，符合已选方案）。
+**3.A guaranteed_until 时间戳升级 + 续期**
+- **master 侧 `ObjectMetadata.guaranteed_`（bool）→ `guaranteed_until_`（`system_clock::time_point`，默认 epoch）**。去 const。3 个用点改 `> now` 判断：
+  - `AllocateAndInsertMetadata`（[2822](../../../mooncake-store/src/master_service.cpp)）：`guaranteed_until_ = now + config.guaranteed_until_ms`（替代 `enable_guaranteed_cache_ && config.guaranteed_until_ms > 0` 的 bool 归约）。
+  - PutEnd 条件（[3067](../../../mooncake-store/src/master_service.cpp)）：`!offload_on_evict_ || metadata.guaranteed_until_ > now`。
+  - NACK 重试（[4845](../../../mooncake-store/src/master_service.cpp)）：`obj_metadata.guaranteed_until_ > now && enable_guaranteed_cache_`。
+- **`OffloadTaskItem.guaranteed`（bool）→ 保留 bool + 加尾随 `int64_t guaranteed_until_ms`**（YLT_REFL 兼容，比替换类型安全）。`PushOffloadingQueue` 签名 + emplace 透传。
+- **client 侧 `StorageObjectMetadata` 加尾随 `int64_t guaranteed_until_ms`**（YLT_REFL，wire 兼容）。`BuildBucket` 写入 `object_bucket_map_`。
+- **`BucketMetadata` 加 `guaranteed_until_ns_`（runtime atomic，非 `YLT_REFL`）**：`SelectEvictionCandidate` 检查 `now < guaranteed_until_ns_` 才保护，过期则当普通可驱逐。保留 Phase 2 的 `guaranteed` bool（用于"是否曾 guaranteed"，但驱逐判断改用时间戳）。
+- **续期**：`GetReplicaList` 读到 LOCAL_DISK 副本时，若 `guaranteed_until_` 未过期，续期 `guaranteed_until_ = max(当前, now + renewal_ttl)`。response 带刷新后的 `guaranteed_until_ms`。
+- **跨节点同步（heartbeat 捎带，非读路径）**：client 在 `OffloadObjectHeartbeat` 响应里拿刷新后的 `guaranteed_until_ms`，写回 `object_bucket_map_` + `BucketMetadata.guaranteed_until_ns_`。**因无 push，client 只在 heartbeat 时拿到 master 侧续期**（延迟 ≤ heartbeat 间隔）。
 
 **3.B 过期降级**
-- guaranteed SSD 副本 `guaranteed_until` 过期后，当普通可驱逐副本。
-- client 侧 `SelectEvictionCandidate` 检查 `guaranteed_until > now` 才保护，过期则正常驱逐。
-- master 侧 `guaranteed_until_` 过期后，`IsHardPinned`（若未来引入）或驱逐候选判断相应放开。
-- **需考虑 TTL 时钟漂移**：master 和 client 的 `system_clock` 可能不一致；用宽松比较（client 侧加 grace
-  period）避免 master 续期后 client 因时钟差误驱逐。
+- client `SelectEvictionCandidate` 检查 `guaranteed_until_ns_ > now`（带 grace period 缓解时钟漂移），过期则正常驱逐。
+- master `guaranteed_until_` 过期后，PutEnd/NACK 判断自然降级（不再 guaranteed offload）。
+- **时钟漂移**：master 与 client `system_clock` 可能不一致；client 侧比较加 grace period（如 30s），避免 master 刚续期 client 因时钟差误驱逐。
 
-**3.C BatchExpireGuaranteed 主动失效 RPC**（父设计 7.9）
-- ops 场景（更新 system prompt、RAG doc 错误、调试）需立即失效，不等 TTL。
-- master 端点遍历 shard，按 `prefix_hash` 匹配 key，把 SSD 副本的 `guaranteed_until` 置 epoch。
-- **跨节点**：master 置过期后，需通知 client 解除保护（client 本地 `object_bucket_map_` 的 guaranteed 标记
-  清除），否则 client 仍按未过期保护。可用一个新 RPC 或借现有心跳下发失效 key 列表。
-- 端点：`POST /v1/cache/evict` Body `{"prefix_hash": "<blake3_hex>"}` → `{"expired_count": N}`。
+**3.C BatchExpireGuaranteed 主动失效（设计待定，见下方方案分析）**
+
+ops 场景（更新 system prompt、RAG doc 错误、调试）需立即失效。难点：**无 master→client push，client 侧 `object_bucket_map_` 的 TTL 怎么清？**
+
+#### 3.C 方案分析
+
+**方案 1：heartbeat 捎带失效列表（推荐）**
+- master 新增 per-client `expired_guaranteed_keys` 队列（client_id → set<key>）。`BatchExpireGuaranteed` 置 master 侧 `guaranteed_until_ = epoch` 同时，把 key 加入该 client 的待通知队列。
+- `OffloadObjectHeartbeat` 返回类型从 `vector<OffloadTaskItem>` 改为 struct `OffloadHeartbeatResponse { vector<OffloadTaskItem> tasks; vector<string> expired_guaranteed_keys; }`（YLT_REFL 兼容，尾随字段）。
+- client 收到 `expired_guaranteed_keys` 后，清 `object_bucket_map_` 对应项的 `guaranteed_until_ms` + `BucketMetadata.guaranteed_until_ns_`，`SelectEvictionCandidate` 即可驱逐。
+- **延迟**：≤ heartbeat 间隔（默认秒级）。**满足"近实时"失效**。
+- **代价**：改 heartbeat 返回类型（wire 兼容）；master 维护 per-client 待通知队列（内存，client heartbeat 后清）。
+- **难点**：master 怎么知道 key 属于哪个 holder client？`guaranteed_offloading_objects` map 按 client_id 组织（Phase 1），可反查。但 BatchExpireGuaranteed 按 key 匹配，需查 key→client_id 映射。
+
+**方案 2：client 主动查询（heartbeat 时批量查）**
+- client 在 heartbeat 时，把本地所有 guaranteed key 的版本/列表发给 master，master 返回哪些已失效。
+- **代价**：每次 heartbeat 多一轮 key 列表传输；client 维护本地 guaranteed key 集合。
+- **延迟**：≤ heartbeat 间隔。**比方案 1 多传数据**。
+
+**方案 3：TTL 自然到期（最简，非立即）**
+- `BatchExpireGuaranteed` 只置 master 侧 `guaranteed_until_ = epoch`。client 侧 TTL 不清，等自然到期。
+- **延迟**：≤ client 本地 TTL 剩余（可能几分钟）。**不满足"立即失效"**。
+- **优点**：零跨节点通知改动。**适合"容忍几分钟延迟"的场景**。
+
+**方案 4：新 client RPC server（不推荐）**
+- 给 client 加 RPC server，master 主动 push。架构改动大，违背 client 无 server 的设计。
+
+**推荐**：方案 1（heartbeat 捎带）满足近实时 + 复用 pull 架构。若可容忍延迟，方案 3 最简。方案 2 介于两者。
+
+**`BatchExpireGuaranteed` 匹配方式**（所有方案通用）：按 exact `(tenant_id, user_key)` 或 `user_key` 子串线性扫描 `tenant_state.metadata`（**非 prefix_hash**，因 store 无前缀哈希结构）。O(N) 全量扫描，N = tenant 对象数。
 
 ### Phase 4：SGLang HiCache 集成（端到端）
 - HiCache Controller 写回路径判断 cache_control token 范围 → write_through + `guaranteed_until_ms`。

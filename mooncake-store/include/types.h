@@ -264,7 +264,7 @@ struct OffloadTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
-    bool guaranteed{false};  // set at enqueue from ObjectMetadata.guaranteed_
+    bool guaranteed{false};  // set at enqueue from (ObjectMetadata.guaranteed_until_ > now)
 
     bool operator==(const OffloadTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&
