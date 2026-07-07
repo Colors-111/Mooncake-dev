@@ -323,7 +323,8 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
      * ready
      */
-    auto GetReplicaList(const std::string& key, const std::string& tenant_id)
+    auto GetReplicaList(const std::string& key, const std::string& tenant_id,
+                        uint64_t renew_guaranteed_ttl_ms = 0)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**

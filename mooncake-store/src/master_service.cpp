@@ -2465,7 +2465,8 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
 }
 
 auto MasterService::GetReplicaList(const std::string& key,
-                                   const std::string& tenant_id)
+                                   const std::string& tenant_id,
+                                   uint64_t renew_guaranteed_ttl_ms)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -2534,6 +2535,23 @@ auto MasterService::GetReplicaList(const std::string& key,
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
         TryPushPromotionQueue(object_id);
+    }
+    // Request-level guaranteed renewal: only when the caller explicitly passed
+    // renew_guaranteed_ttl_ms > 0 (corresponds to a cache_control-bearing
+    // request in the parent design). "Only renew, never create": an expired
+    // (<=now) or non-guaranteed (epoch) object is left untouched.
+    if (enable_guaranteed_cache_ && renew_guaranteed_ttl_ms > 0) {
+        const auto now_renew = std::chrono::system_clock::now();
+        MetadataAccessorRW renew_accessor(this, object_id);
+        if (renew_accessor.Exists()) {
+            auto& metadata = renew_accessor.Get();
+            if (metadata.guaranteed_until_ > now_renew) {
+                metadata.guaranteed_until_ = std::max(
+                    metadata.guaranteed_until_,
+                    now_renew +
+                        std::chrono::milliseconds(renew_guaranteed_ttl_ms));
+            }
+        }
     }
     return resp;
 }

@@ -715,63 +715,149 @@ git commit -m "feat(store): BatchExpireGuaranteed explicit ops invalidation (HTT
 
 ---
 
-## Task 6:（可选）读时续期 `guaranteed_until_`（config 门控，默认关）
+## Task 6: 读时续期 `guaranteed_until_`（request 级参数，非全局自动续期）
 
-> 仅当需要"活跃读取的 guaranteed 对象不被降级"时启用。默认 `guaranteed_renewal_ttl_ms=0` = 严格 TTL，本 Task 行为不生效。
+> **设计修正（review 2026-07-07）**：早期 Task 6 用全局 config `guaranteed_renewal_ttl_ms_` 在**所有**
+> `GetReplicaList` 自动续期——这会把"不带 cache_control 但读到 guaranteed 块"的请求也续期，偏离父设计
+> "只有带 cache_control 的请求才续期"（[explicit_context_cache_design.md §5.3](../../explicit_context_cache_design.md)）。
+> 改为 **request 级参数**：只有显式传 `renew_guaranteed_ttl_ms > 0` 的 `GetReplicaList` 调用才续期
+> （对应父设计的 `GetReplicaList(guaranteed_ttl_ms=300000)`）。Phase 4 SGLang 在请求带 cache_control 时传该参数。
+
+> **本 Task 含 master.cpp gflag 接线**（顺带补 Task 1 遗留的 Minor）：`DEFINE_int64(guaranteed_until_ms)` +
+> `DEFINE_int64(guaranteed_renewal_ttl_ms)` + config 文件 `GetInt64` 读取。否则生产 gflag 启动时这些值恒 0。
 
 **Files:**
-- Modify: `mooncake-store/src/master_service.cpp:2497-2505`（`GetReplicaList` 续期点）
+- Modify: `mooncake-store/include/rpc_types.h`（`GetReplicaListRequest` 加 `uint64_t renew_guaranteed_ttl_ms{0}`，YLT_REFL 尾随）
+- Modify: `mooncake-store/include/master_service.h`（`GetReplicaList` 签名 + `BatchGetReplicaList`）
+- Modify: `mooncake-store/src/master_service.cpp:2455-2525`（`GetReplicaList` 续期点，读 request 参数）
+- Modify: `mooncake-store/src/master.cpp:176/462`（gflag `DEFINE_int64` + `GetInt64` 接线，补 Task 1 Minor）
 - Test: `mooncake-store/tests/guaranteed_downgrade_test.cpp`
 
-- [ ] **Step 1: 写失败测试 —— 读时续期（config 开启时）**
+- [ ] **Step 1: 写失败测试 —— request 级续期（传参才续，不传不续）**
 
 ```cpp
-TEST_F(GuaranteedDowngradeTest, ReadRenewsGuaranteedUntilWhenEnabled) {
-    SetConfigGuaranteedRenewalTtlMs(30000);  // 开启续期
-    auto* master = GetMasterService();
-    PutEndGuaranteed("k1", /*guaranteed_until_ms=*/10000);  // 10s TTL
-    auto before = master->InspectObjectMetadata("k1", "tenant")->guaranteed_until;
-    GetReplicaList("k1");  // 读
-    auto after = master->InspectObjectMetadata("k1", "tenant")->guaranteed_until;
-    EXPECT_GT(after, before);  // 被续期（向后推）
+TEST_F(GuaranteedDowngradeTest, RenewOnlyWhenRequestParamSet) {
+    auto master = MakeMaster(/*guaranteed_until_ms=*/10000);  // 10s TTL
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*master, "seg", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(master->MountLocalDiskSegment(ctx.client_id, true).has_value());
+    PutObject(*master, ctx.client_id, "k1", /*guaranteed_until_ms=*/10000);
+    auto before = master->GetGuaranteedUntilForTesting("k1", "default").value();
+
+    // 不传 renew_guaranteed_ttl_ms → 不续期
+    auto r1 = master->GetReplicaList("k1", "default");
+    ASSERT_TRUE(r1.has_value());
+    auto after_plain = master->GetGuaranteedUntilForTesting("k1", "default").value();
+    EXPECT_EQ(after_plain, before);  // 未变
+
+    // 传 renew_guaranteed_ttl_ms=30000 → 续期（向后推到 now+30s，且不缩短）
+    auto r2 = master->GetReplicaList("k1", "default", /*renew_guaranteed_ttl_ms=*/30000);
+    ASSERT_TRUE(r2.has_value());
+    auto after_renew = master->GetGuaranteedUntilForTesting("k1", "default").value();
+    EXPECT_GE(after_renew, before);  // 不缩短
+    auto now = std::chrono::system_clock::now();
+    EXPECT_GT(after_renew, now + std::chrono::seconds(25));  // 至少 now+~30s
+}
+
+TEST_F(GuaranteedDowngradeTest, RenewNoOpOnNonGuaranteed) {
+    auto master = MakeMaster();
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*master, "seg", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(master->MountLocalDiskSegment(ctx.client_id, true).has_value());
+    PutObject(*master, ctx.client_id, "normal");  // 非 guaranteed (epoch)
+    auto r = master->GetReplicaList("normal", "default", /*renew_guaranteed_ttl_ms=*/30000);
+    ASSERT_TRUE(r.has_value());
+    auto after = master->GetGuaranteedUntilForTesting("normal", "default").value();
+    EXPECT_EQ(after, std::chrono::system_clock::time_point{});  // 仍 epoch，未复活
 }
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd mooncake-store && cmake --build build --target mooncake_store_tests && ./build/tests/guaranteed_downgrade_test --gtest_filter=GuaranteedDowngradeTest.ReadRenewsGuaranteedUntilWhenEnabled`
-Expected: FAIL
+```bash
+cd mooncake-store && cmake --build build --target guaranteed_downgrade_test && \
+./tests/guaranteed_downgrade_test --gtest_filter='GuaranteedDowngradeTest.RenewOnlyWhenRequestParamSet:GuaranteedDowngradeTest.RenewNoOpOnNonGuaranteed'
+```
+Expected: 编译失败 —— `GetReplicaList` 无 `renew_guaranteed_ttl_ms` 参数。
 
-- [ ] **Step 3: 在 `GetReplicaList` 续期（紧邻现有 `GrantLease`，master_service.cpp:2501 之后）**
+- [ ] **Step 3: `GetReplicaListRequest` 加 request 级字段（rpc_types.h，尾随 YLT_REFL 兼容）**
 
 ```cpp
-        if (ts) {
-            GrantLeaseForGroup(*ts, key, metadata);
-        } else {
-            metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
-        }
-        // 可选：guaranteed 读时续期（config 门控）
-        if (enable_guaranteed_cache_ && guaranteed_renewal_ttl_ms_ > 0) {
+struct GetReplicaListRequest {
+    std::string key;
+    std::string tenant_id;
+    uint64_t renew_guaranteed_ttl_ms{0};  // >0: 读时续期 guaranteed_until_（仅对 guaranteed 对象，且仅续不创建）
+    YLT_REFL(GetReplicaListRequest, key, tenant_id, renew_guaranteed_ttl_ms);
+};
+```
+> 确认 `GetReplicaListRequest` 当前结构（grep）；若 `GetReplicaList` 当前用 `(key, tenant_id)` 而非 request struct，
+> 则给 `GetReplicaList` 加尾随参数 `uint64_t renew_guaranteed_ttl_ms = 0`（函数重载或默认参数，向后兼容）。
+> 优先用 request struct 尾随字段（wire 兼容更好）；若现有 API 用裸参数，加默认参数 `= 0` 保持既有调用不变。
+
+- [ ] **Step 4: `GetReplicaList` 续期（master_service.cpp，仅当 request 传参）**
+
+紧邻现有 `GrantLease` 之后：
+```cpp
+        // request 级 guaranteed 续期：仅当调用方显式传 renew_guaranteed_ttl_ms > 0。
+        // 只续不创建：guaranteed_until_ 已过期(<=now)不复活；非 guaranteed(epoch)不动。
+        if (enable_guaranteed_cache_ && renew_guaranteed_ttl_ms > 0) {
             const auto now_renew = std::chrono::system_clock::now();
             if (metadata.guaranteed_until_ > now_renew) {  // 仍是 guaranteed 才续
                 metadata.guaranteed_until_ = std::max(
                     metadata.guaranteed_until_,
-                    now_renew + std::chrono::milliseconds(guaranteed_renewal_ttl_ms_));
+                    now_renew + std::chrono::milliseconds(renew_guaranteed_ttl_ms));
             }
         }
 ```
-> `guaranteed_renewal_ttl_ms_` 在 `MasterService` 构造时从 config 读（参照 `default_kv_lease_ttl_` 的读法 [master_service.cpp:188](../../../mooncake-store/src/master_service.cpp#L188)）。
+**关键语义**（区别于早期全局自动续期）：续期由 **request 参数**驱动，不依赖全局 config。不带 cache_control 的请求
+不传该参数 → guaranteed 块自然 TTL 倒计时（符合父设计"不带 cache_control 读取不续期"）。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [ ] **Step 5: gflag 接线（master.cpp，补 Task 1 Minor + 续期 TTL 默认值）**
 
-Run: `cd mooncake-store && cmake --build build --target mooncake_store_tests && ./build/tests/guaranteed_downgrade_test --gtest_filter=GuaranteedDowngradeTest.ReadRenewsGuaranteedUntilWhenEnabled`
-Expected: PASS
+```cpp
+DEFINE_int64(guaranteed_until_ms, 0,
+             "Default guaranteed TTL (ms) when ReplicateConfig.guaranteed_until_ms is 0 "
+             "but enable_guaranteed_cache=true. 0 = rely on per-request ReplicateConfig value.");
+DEFINE_int64(guaranteed_renewal_ttl_ms, 0,
+             "Default renewal TTL (ms) for GetReplicaList renew_guaranteed_ttl_ms when "
+             "request omits it but renewal is desired. 0 = strict TTL (no auto renewal). "
+             "Per-request value takes precedence.");
+```
+并在 `master.cpp:462` 附近 `default_config.GetBool("enable_guaranteed_cache", ...)` 之后加：
+```cpp
+default_config.GetInt64("guaranteed_until_ms",
+                        &master_config.guaranteed_until_ms,
+                        FLAGS_guaranteed_until_ms);
+default_config.GetInt64("guaranteed_renewal_ttl_ms",
+                        &master_config.guaranteed_renewal_ttl_ms,
+                        FLAGS_guaranteed_renewal_ttl_ms);
+```
+> 注：`guaranteed_renewal_ttl_ms` 作为**默认值**（request 可覆盖），不是"自动对所有 GetReplicaList 续期"。
+> 若 request 不传 `renew_guaranteed_ttl_ms`，是否用此默认值续期由 Phase 4 SGLang 集成决定（SGLang 带 cache_control
+> 时传参）。Store 侧 Task 6 不做"自动对所有读续期"。
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: 跑测试确认通过**
 
 ```bash
-git add mooncake-store/src/master_service.cpp mooncake-store/tests/guaranteed_downgrade_test.cpp
-git commit -m "feat(store): optional read-time guaranteed_until_ renewal (config-gated, default off)"
+cd mooncake-store && cmake --build build --target guaranteed_downgrade_test && \
+./tests/guaranteed_downgrade_test
+```
+Expected: 含新测试在内全 PASS。
+
+- [ ] **Step 7: 回归 + master 编译**
+
+```bash
+cmake --build build --target mooncake_master -j$(nproc) 2>&1 | tail -10
+./tests/guaranteed_offload_test && ./tests/guaranteed_eviction_test
+```
+Expected: PASS（既有 `GetReplicaList(key, tenant)` 调用省略新参数 → 默认 0 → 不续期，零回归）。
+
+- [ ] **Step 8: 暂存（不 commit）**
+
+```bash
+git add mooncake-store/include/rpc_types.h mooncake-store/include/master_service.h \
+        mooncake-store/src/master_service.cpp mooncake-store/src/master.cpp \
+        mooncake-store/tests/guaranteed_downgrade_test.cpp
 ```
 
 ---

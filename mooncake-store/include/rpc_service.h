@@ -59,7 +59,8 @@ class WrappedMasterService {
                           const std::string& tenant_id = "default");
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
-        const std::string& key, const std::string& tenant_id = "default");
+        const std::string& key, const std::string& tenant_id = "default",
+        uint64_t renew_guaranteed_ttl_ms = 0);
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,

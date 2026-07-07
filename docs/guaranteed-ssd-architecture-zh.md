@@ -101,6 +101,12 @@ L1/L2 不参与保证（请求可能路由到任何引擎）。L3 是所有引�
   版本锁定。→ TTL 放 `ObjectMetadata`（非 Replica，非 HA），client 侧用 `BucketMetadata`（本地 `YLT_REFL`，非 HA Replica）。
 - **LRU `SelectEvictionCandidate` 的 `while` 每次重置 `top_it=begin()`**：朴素 `++top_it; continue` 死循环。
   → guaranteed 跳过用前向扫描找首个非 guaranteed 候选（Phase 2 已实现）。
+- **时间源取舍（`system_clock` vs `SteadyClock`）**：父设计建议 `SteadyClock`（[explicit_context_cache_design.md:341](../explicit_context_cache_design.md)）
+  避免系统时间回拨，但 Task 1 实现用 `std::chrono::system_clock` 存 `guaranteed_until_`（[master_service.h:885](../../mooncake-store/include/master_service.h)）。
+  **取舍**：`system_clock` 可被 NTP 跳变影响（回拨→TTL 异常延长，前跳→提前过期）；但 `guaranteed_until_` 是 master
+  单机内比较（不跨节点，无时钟漂移同步问题），且与既有 `lease_timeout`（`system_clock`）一致。当前接受 `system_clock`
+  的跳变风险（master 单点，回拨罕见且影响有限）。若需严格单调，可改 `steady_clock`，但与 `lease_timeout` 不一致、
+  且 `steady_clock` 不能跨进程比较（HA 不持久化所以无碍）。**当前取舍：`system_clock`，文档承认此风险**。
 
 ## 4. 4-Phase 路线图
 
@@ -128,6 +134,11 @@ L1/L2 不参与保证（请求可能路由到任何引擎）。L3 是所有引�
 2. **Phase 3 = master-driven downgrade**（非 client-side TTL）：TTL 只在 master（object 级，类似 lease，不进 HA），
    到期下发一次性降级列表，worker 翻转 bucket bool 后由**现成 LRU 路径**回收。消除跨节点 TTL 同步与
    `SelectEvictionCandidate` 热路径改动。
+   - **bucket 粒度 TTL 放大（已知取舍）**：降级是 **bucket 级延迟翻转**——仅当降级集覆盖 bucket 全部 key 才翻
+     `guaranteed=false`。Phase 2 把 guaranteed 对象混入同质 bucket，故同 bucket 内**已过期对象会被未过期对象"续命"**，
+     实际 SSD 回收晚于对象 TTL。这是 **bucket-level TTL upper-bound**（回收 ≤ bucket 内最晚过期对象的 TTL），
+     非对象级精确 TTL。代价是空间回收延迟，收益是简单（无需 bucket 分裂）。若放大不可接受，Phase 3 后可按过期
+     时间分桶或 guaranteed 单独小桶，但当前接受此放大。
 3. **`IsHardPinned()` 不改**：闸的是内存驱逐，不是 offload。SSD 写入保证来自 `PushOffloadingQueue` 优先级，
    与 `IsHardPinned` 正交。（曾误判"IsHardPinned=true 会让 guaranteed 永不 offload"——错，PutEnd offload 不查 IsHardPinned。）
 4. **弱语义**：写完 SSD 即普通内存对象（可驱逐释放），不做容量限制（靠 TTL 回收，不主动拒绝）。
@@ -151,8 +162,22 @@ L1/L2 不参与保证（请求可能路由到任何引擎）。L3 是所有引�
 - 父 §11 "guaranteed_memory_used_/limit 容量检查" → **不要容量限制**（弱语义，决策 4）。
 - 父 §11 Phase 划分（1 基础设施/2 HiCache/3 端点） → 本架构 4-Phase（1 写入/2 驱逐/3 TTL/4 HiCache）。
 
-**父文档仍有效部分**：§1 目标、§2 与阿里百炼定位、§3 分层职责、§4 cache_control 解析、§5 请求处理流程
-（SGLang 侧重，Phase 4 集成时用）。SGLang 侧零新增状态、radix tree 节点无新增字段——这些设计原则保留。
+**父文档仍有效部分**：§1 目标、§2 与阿里百炼定位、§3 分层职责、§4 cache_control 解析（解析伪代码的理想化
+见下方注）、§5 请求处理流程的 **SGLang 写入路径大意有效**。SGLang 侧零新增状态、radix tree 节点无新增字段——
+这些设计原则保留。
+
+**父文档 §5 已过时部分（以本架构 + master-driven-downgrade plan 为准）**：§5.3 读取续期流程（`GrantLease`
+自动续期、`guaranteed_ttl_ms` 参数）—— 实际是 **request 级续期**（Phase 3 Task 6：只有带 cache_control 的请求传
+`renew_guaranteed_ttl_ms` 才续，非全局自动续）；§5.4 过期降级（`IsHardPinned` 过期降级、`BatchEvict` 回收）——
+实际是 **master-driven downgrade**（决策 2：master 到期下发降级列表，worker 翻转 bucket bool 后现成 LRU 回收，
+不改 `IsHardPinned`、不靠 `BatchEvict`）。
+
+**Phase 4 注意（cache_control 解析）**：父文档 §4 按字符偏移提取断点（[explicit_context_cache_design.md:92](../explicit_context_cache_design.md)），
+但真实 chat prompt 经 chat template 含 role/special tokens/工具/图片块，字符偏移**不能直接映射到最终 prompt
+token**。Phase 4 集成时需在 SGLang **最终 prompt 构造后**用 tokenizer offset mapping 解析，或把断点绑定到构造
+prompt 的同一阶段。另：父文档"不做窗口限制"（§1）与"保留最后 4 个断点"（§4.2 `len > 4` 截断）语义冲突，Phase 4
+需统一（建议遵循 OpenAI 语义保留 4 个断点，文档"不做窗口限制"改为"radix tree 前缀匹配无窗口限制"——匹配无窗口，
+断点数有上限）。
 
 ## 7. 文档导航
 

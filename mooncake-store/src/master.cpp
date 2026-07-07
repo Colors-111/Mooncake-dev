@@ -177,6 +177,15 @@ DEFINE_bool(enable_guaranteed_cache, false,
             "Enable guaranteed offload: objects put with guaranteed_until_ms>0 "
             "are always written to SSD (independent queue, retried on failure). "
             "Defaults off for zero behavior change.");
+DEFINE_int64(guaranteed_until_ms, 0,
+             "Default guaranteed TTL (ms) when ReplicateConfig."
+             "guaranteed_until_ms is 0 but enable_guaranteed_cache=true. "
+             "0 = rely on the per-request ReplicateConfig value.");
+DEFINE_int64(guaranteed_renewal_ttl_ms, 0,
+             "Default renewal TTL (ms) for GetReplicaList "
+             "renew_guaranteed_ttl_ms when the request omits it but renewal is "
+             "desired. 0 = strict TTL (no auto renewal). Per-request value "
+             "takes precedence.");
 DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
@@ -462,6 +471,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("enable_guaranteed_cache",
                            &master_config.enable_guaranteed_cache,
                            FLAGS_enable_guaranteed_cache);
+    default_config.GetInt64("guaranteed_until_ms",
+                             &master_config.guaranteed_until_ms,
+                             FLAGS_guaranteed_until_ms);
+    default_config.GetInt64("guaranteed_renewal_ttl_ms",
+                             &master_config.guaranteed_renewal_ttl_ms,
+                             FLAGS_guaranteed_renewal_ttl_ms);
     default_config.GetBool("offload_on_evict", &master_config.offload_on_evict,
                            FLAGS_offload_on_evict);
     default_config.GetBool("offload_force_evict",
@@ -762,6 +777,17 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_guaranteed_cache = FLAGS_enable_guaranteed_cache;
+    }
+    if ((google::GetCommandLineFlagInfo("guaranteed_until_ms", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.guaranteed_until_ms = FLAGS_guaranteed_until_ms;
+    }
+    if ((google::GetCommandLineFlagInfo("guaranteed_renewal_ttl_ms", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.guaranteed_renewal_ttl_ms =
+            FLAGS_guaranteed_renewal_ttl_ms;
     }
     if ((google::GetCommandLineFlagInfo("offload_on_evict", &info) &&
          !info.is_default) ||
@@ -1268,6 +1294,9 @@ int main(int argc, char* argv[]) {
         << ", enable_offload=" << master_config.enable_offload
         << ", enable_guaranteed_cache="
         << master_config.enable_guaranteed_cache
+        << ", guaranteed_until_ms=" << master_config.guaranteed_until_ms
+        << ", guaranteed_renewal_ttl_ms="
+        << master_config.guaranteed_renewal_ttl_ms
         << ", offload_on_evict=" << master_config.offload_on_evict
         << ", offload_force_evict=" << master_config.offload_force_evict
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit

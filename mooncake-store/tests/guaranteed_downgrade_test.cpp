@@ -140,4 +140,50 @@ TEST_F(GuaranteedDowngradeTest, MissingKeyReturnsNullopt) {
     EXPECT_FALSE(gu.has_value());
 }
 
+// Task 6: request-level renewal. Only GetReplicaList calls that explicitly pass
+// renew_guaranteed_ttl_ms > 0 renew guaranteed_until_; plain calls leave it
+// unchanged.
+TEST_F(GuaranteedDowngradeTest, RenewOnlyWhenRequestParamSet) {
+    auto master = MakeMaster(/*guaranteed_until_ms=*/10000);  // 10s TTL
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*master, "seg", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(master->MountLocalDiskSegment(ctx.client_id, true).has_value());
+    PutObject(*master, ctx.client_id, "k1", /*guaranteed_until_ms=*/10000);
+    auto before = master->GetGuaranteedUntilForTesting("k1", "default").value();
+
+    // No renew_guaranteed_ttl_ms -> no renewal.
+    auto r1 = master->GetReplicaList("k1", "default");
+    ASSERT_TRUE(r1.has_value());
+    auto after_plain = master->GetGuaranteedUntilForTesting("k1", "default").value();
+    EXPECT_EQ(after_plain, before);  // unchanged
+
+    // renew_guaranteed_ttl_ms=30000 -> push to now+30s, never shrink.
+    auto r2 = master->GetReplicaList("k1", "default",
+                                     /*renew_guaranteed_ttl_ms=*/30000);
+    ASSERT_TRUE(r2.has_value());
+    auto after_renew = master->GetGuaranteedUntilForTesting("k1", "default").value();
+    EXPECT_GE(after_renew, before);  // never shrink
+    auto now = std::chrono::system_clock::now();
+    EXPECT_GT(after_renew, now + std::chrono::seconds(25));  // ~now+30s
+
+    master->RemoveAll();
+}
+
+// Task 6: renewal is a no-op on non-guaranteed (epoch) objects ("only renew,
+// never create").
+TEST_F(GuaranteedDowngradeTest, RenewNoOpOnNonGuaranteed) {
+    auto master = MakeMaster();
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*master, "seg", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(master->MountLocalDiskSegment(ctx.client_id, true).has_value());
+    PutObject(*master, ctx.client_id, "normal");  // non-guaranteed (epoch)
+    auto r = master->GetReplicaList("normal", "default",
+                                    /*renew_guaranteed_ttl_ms=*/30000);
+    ASSERT_TRUE(r.has_value());
+    auto after = master->GetGuaranteedUntilForTesting("normal", "default").value();
+    EXPECT_EQ(after, std::chrono::system_clock::time_point{});  // still epoch
+
+    master->RemoveAll();
+}
+
 }  // namespace mooncake::test

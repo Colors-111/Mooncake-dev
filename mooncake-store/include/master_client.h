@@ -164,7 +164,8 @@ class MasterClient {
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key);
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
-    GetReplicaList(const std::string& object_key, const std::string& tenant_id);
+    GetReplicaList(const std::string& object_key, const std::string& tenant_id,
+                   uint64_t renew_guaranteed_ttl_ms = 0);
 
     /**
      * @brief Retrieves replica lists for object keys that match a regex

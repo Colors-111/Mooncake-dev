@@ -523,16 +523,18 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
 
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     const std::string& object_key) {
-    return GetReplicaList(object_key, tenant_id_);
+    return GetReplicaList(object_key, tenant_id_, /*renew_guaranteed_ttl_ms=*/0);
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
-    const std::string& object_key, const std::string& tenant_id) {
+    const std::string& object_key, const std::string& tenant_id,
+    uint64_t renew_guaranteed_ttl_ms) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id);
 
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(object_key, tenant_id);
+                             GetReplicaListResponse>(object_key, tenant_id,
+                                                     renew_guaranteed_ttl_ms);
     timer.LogResponseExpected(result);
     return result;
 }

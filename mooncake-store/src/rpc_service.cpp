@@ -175,10 +175,14 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
 
 tl::expected<GetReplicaListResponse, ErrorCode>
 WrappedMasterService::GetReplicaList(const std::string& key,
-                                     const std::string& tenant_id) {
+                                     const std::string& tenant_id,
+                                     uint64_t renew_guaranteed_ttl_ms) {
     return execute_rpc(
         "GetReplicaList",
-        [&] { return master_service_.GetReplicaList(key, tenant_id); },
+        [&] {
+            return master_service_.GetReplicaList(key, tenant_id,
+                                                  renew_guaranteed_ttl_ms);
+        },
         [&](auto& timer) { timer.LogRequest("key=", key); },
         [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
         [] {
