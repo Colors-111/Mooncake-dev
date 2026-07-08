@@ -25,6 +25,26 @@ SSD 副本在 TTL 内**不被驱逐**，TTL 到期或显式失效后**自动降�
 - **维护性硬约束**：整个特性无法合入社区 main，需长期分支定期 `git merge main`。加法优于侵入、新字段尾随+默认、
   逻辑提取命名 helper、**避开 `Serializer<Replica>` 格式 bump**（最高合并风险点）。
 
+### 1.1 特性总览
+
+> 显式缓存特性（无法合入社区 main，需易维护设计：加法优于侵入、尾随+默认、避开 `Serializer<Replica>` bump、
+> `enable_guaranteed_cache` flag 门控）。详见 §4 路线图 + §5 各 Phase 任务详解。
+
+**已实现：**
+- **a. 全链路 `guaranteed_ttl` + 优先级队列**（独立无 limit 队列）—— Phase 1
+- **b. guaranteed 强制写入 SSD + 写失败重试**（`PutEnd` 总 offload + NACK 重试）—— Phase 1
+- **c. SSD 副本驱逐保护**（bucket 级 pin，FIFO/LRU 跳过 guaranteed bucket）—— Phase 2
+- **d. `guaranteed_until_` 时间戳 + 读时续期**（request 级 `renew_guaranteed_ttl_ms`，只续不创建）—— Phase 3 Task 1/6
+
+**计划中（阻塞 PR #2676 / Phase 4）：**
+- **e. TTL 到期降级回收**（master-driven downgrade：TTL 只在 master，到期下发一次性降级列表，worker 翻 bucket bool 后**现成 LRU 路径**回收）—— Phase 3 Task 2-5（阻塞 #2676）
+- **f. 主动失效 `BatchExpireGuaranteed`**（HTTP+RPC，exact `(tenant_id, user_key)` 线性扫描，**非 prefix_hash**）—— Phase 3 Task 5（阻塞 #2676）
+- **g. 新增 `PollDowngradeKeys` RPC + 与 SGLang 集成**（cache_control 解析 → `write_through` + `guaranteed_until_ms`；读 L3 时带 `renew_guaranteed_ttl_ms` 续期；Router 解析 token 断点）—— Phase 3 Task 2 + Phase 4
+
+**不做（已决策）：**
+- **容量限制**——弱语义：写完 SSD 即普通内存对象（可驱逐释放），靠 TTL 回收，不主动拒绝新 guaranteed。
+- **改 `IsHardPinned()`**——它闸的是内存驱逐，与 SSD 写入保证（`PushOffloadingQueue` 优先级）正交，不改。
+
 ## 2. 设计定位：与早期父设计的演进
 
 | 维度 | 父设计（explicit_context_cache_design.md） | 本架构（演进后） |
