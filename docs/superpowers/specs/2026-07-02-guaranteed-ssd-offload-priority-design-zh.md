@@ -414,9 +414,10 @@ bool 翻转（冷路径）。**无 `Serializer<Replica>` bump 风险**（TTL 在
 - Task 5：`BatchExpireGuaranteed` 显式 ops 失效（HTTP + RPC，exact key 线性扫描，非 prefix_hash）。
 - **阻塞 PR #2676**：`PollDowngradeKeys` 复用 `PollRemoveAll` 通道模式，#2676 合入后做 follow-up。
 
-**3.C（待做 Task 6）读时续期**
-- `GetReplicaList` 读 LOCAL_DISK 副本时，若 `guaranteed_until_` 未过期，续期 `= max(当前, now + renewal_ttl)`。
-- 纯 master 侧，无 #2676 依赖，config 门控（`guaranteed_renewal_ttl_ms`，默认 0 = 严格 TTL）。
+**3.C（已实现 Task 6）读时续期**
+- `GetReplicaList` 加 **request 级** `renew_guaranteed_ttl_ms` 参数（非全局自动续期）：只有显式传 `> 0` 的调用才续期（对应 SGLang 带 cache_control 的请求，符合父设计 §5.3）。
+- **只续不创建**：`guaranteed_until_ > now` 才续（过期/非 guaranteed 不复活）；`std::max` 不缩短。RO 释放后 RW accessor 续期。
+- 纯 master 侧，无 #2676 依赖，已实现并验证（2 单测通过）。`master.cpp` gflag 接线已补（Task 6 顺带完成 Task 1 Minor）。
 
 **完整 Phase 3 实施计划**：[plans/2026-07-06-guaranteed-ssd-master-driven-downgrade-zh.md](../plans/2026-07-06-guaranteed-ssd-master-driven-downgrade-zh.md)。
 **已废弃的 client-side TTL 设计**：[plans/2026-07-06-guaranteed-ssd-offload-priority-phase3-design-zh.md](../plans/2026-07-06-guaranteed-ssd-offload-priority-phase3-design-zh.md)（⚠️ 仅留作对比）。

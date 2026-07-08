@@ -1,10 +1,11 @@
 # Guaranteed SSD Master-Driven Downgrade 实施计划（中文）
 
-> **状态：进行中（2026-07-06）。**
+> **状态：进行中（2026-07-07）。**
 > - ✅ **Task 1 已实现并验证**（`ObjectMetadata.guaranteed_` bool→`guaranteed_until_` time_point + 3 用点改 `>now` + config 全层 + `GetGuaranteedUntilForTesting` + 4 单测通过）。无 #2676 依赖。
 > - ⏳ **Task 2-5 阻塞于 PR #2676**（`PollRemoveAll` 通道未合入 main；`PollDowngradeKeys`/`DispatchGuaranteedExpiry`/worker 翻转/`BatchExpireGuaranteed` 依赖该模式）。#2676 合入后作 follow-up。
-> - ⏳ **Task 6 待做**（读时续期 `GetReplicaList`，纯 master 侧，无 #2676 依赖，可现在做）。
-> - 📌 **Minor 待补**：`master.cpp` gflag 接线（`DEFINE_int64(guaranteed_until_ms)` + config 文件 `GetInt64`），生产部署前补（Task 1 只改 struct 层，测试直接构造 config 不受影响）。
+> - ✅ **Task 6 已实现并验证**（读时续期 `GetReplicaList` 加 request 级 `renew_guaranteed_ttl_ms` 参数，"只续不创建" + `std::max` 不缩短；RO 释放后 RW accessor 续期；2 单测通过）。纯 master 侧，无 #2676 依赖。
+> - ✅ **Minor 已补**：`master.cpp` gflag 接线（`DEFINE_int64(guaranteed_until_ms/renewal_ttl_ms)` + `GetInt64` + CLI override + 日志，Task 6 Step 5 顺带完成）。
+> - **review 修正（2026-07-07）**：Task 6 从"全局 config 自动续期"改为 **request 级续期**（只有带 cache_control 的请求传参才续，避免续错对象）；总领架构补 bucket 粒度 TTL 放大说明、父文档 §5 收窄、system_clock 取舍、Phase 4 cache_control 解析注。
 >
 > **取代了**过时的 client-side TTL 方案（[2026-07-06-guaranteed-ssd-offload-priority-phase3-design-zh.md](2026-07-06-guaranteed-ssd-offload-priority-phase3-design-zh.md)，已废弃）。
 

@@ -8,7 +8,7 @@
 > 关键设计决策、与父文档 explicit_context_cache_design.md 的差异、关键架构约束）。先读它，再深入本目录的 spec/plans。
 
 
-## 当前状态总览（2026-07-06）
+## 当前状态总览（2026-07-07）
 
 | Phase | 状态 | 说明 |
 |------|------|------|
@@ -16,7 +16,7 @@
 | Phase 2：SSD 副本驱逐保护 | ✅ 已实现并验证 | client 侧，4 测试通过 |
 | Phase 3 Task 1：`guaranteed_until_` 时间戳 | ✅ 已实现并验证 | 4 单测通过，无 #2676 依赖 |
 | Phase 3 Task 2-5：降级派发链路 | ⏳ 阻塞于 PR #2676 | `PollDowngradeKeys` 通道依赖 #2676 合入 |
-| Phase 3 Task 6：读时续期 | ⏳ 待做 | 纯 master 侧，无 #2676 依赖 |
+| Phase 3 Task 6：读时续期（request 级） | ✅ 已实现并验证 | request 级 `renew_guaranteed_ttl_ms` + gflag 接线，2 单测通过，无 #2676 依赖 |
 | Phase 4：SGLang HiCache 集成 | ⏳ 未开始 | 端到端 |
 
 ## 设计 spec（根设计文档）
@@ -53,7 +53,7 @@ client 侧：`BucketMetadata.guaranteed`（`YLT_REFL` 持久化）+ `OffloadObje
 
 | 文件 | 语言 | 状态 |
 |------|------|------|
-| [plans/2026-07-06-guaranteed-ssd-master-driven-downgrade-zh.md](plans/2026-07-06-guaranteed-ssd-master-driven-downgrade-zh.md) | 中文 | ✅ Task 1 完成；Task 2-5 阻塞 #2676；Task 6 待做 |
+| [plans/2026-07-06-guaranteed-ssd-master-driven-downgrade-zh.md](plans/2026-07-06-guaranteed-ssd-master-driven-downgrade-zh.md) | 中文 | ✅ Task 1/6 完成；Task 2-5 阻塞 #2676；Minor gflag 已补 |
 | [plans/2026-07-06-guaranteed-ssd-offload-priority-phase3-design-zh.md](plans/2026-07-06-guaranteed-ssd-offload-priority-phase3-design-zh.md) | 中文 | ⚠️ **已废弃**（client-side TTL 方案，被 master-driven-downgrade 推翻，仅留作对比） |
 
 ### Phase 4 — SGLang HiCache 集成（未开始）
@@ -84,7 +84,7 @@ HiCache Controller 写回路径判断 cache_control token 范围 → write_throu
 |------------|------|------|
 | `guaranteed_offload_test` | 1 | 12 测试（含补充用例 5&9） |
 | `guaranteed_eviction_test` | 2 | 4 测试（字段 + FIFO/LRU 跳过） |
-| `guaranteed_downgrade_test` | 3 Task 1 | 4 单测（`guaranteed_until_` 设置/降级/flag off/missing key） |
+| `guaranteed_downgrade_test` | 3 Task 1 + Task 6 | 6 单测（Task1：`guaranteed_until_` 设置/降级/flag off/missing key；Task6：request 级续期/只续不创建） |
 
 ## memory
 

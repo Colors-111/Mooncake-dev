@@ -67,7 +67,7 @@ L1/L2 不参与保证（请求可能路由到任何引擎）。L3 是所有引�
   │  │  - PutEnd: TTL>now → 总走 offload (Phase 1)            │    │
   │  │  - NACK: TTL>now → 重试 (Phase 1)                      │    │
   │  │  - 到期/失效: 反查 holder client_id → pending_downgrade │    │
-  │  │  - GetReplicaList: 读时续期 (Phase 3 Task 6, 待做)      │    │
+  │  │  - GetReplicaList: 读时续期 (Phase 3 Task 6 ✅)        │    │
   │  │  - BatchExpireGuaranteed RPC (Phase 3 Task 5, #2676)   │    │
   │  └───────────────┬─────────────────────────────────────┘    │
   │     offload       │           PollDowngradeKeys (#2676)      │
@@ -114,7 +114,7 @@ L1/L2 不参与保证（请求可能路由到任何引擎）。L3 是所有引�
 |------|------|------|---------|
 | 1 | 确保写入 SSD | ✅ 已实现验证 | 独立 guaranteed offload 队列（无 limit）+ PutEnd 总 offload + NACK 重试，`enable_guaranteed_cache` 门控 |
 | 2 | SSD 副本驱逐保护 | ✅ 已实现验证 | `BucketMetadata.guaranteed`（`YLT_REFL` 持久）+ `OffloadObjects` 分同质 bucket + `SelectEvictionCandidate` 跳过（FIFO/LRU） |
-| 3 | SSD 副本 TTL 管理 | 进行中 | master-driven downgrade：TTL 在 master，到期下发降级列表，worker 翻转 bool 后现成 LRU 回收 |
+| 3 | SSD 副本 TTL 管理 | 进行中（Task 1/6 ✅，Task 2-5 阻塞 #2676） | master-driven downgrade：TTL 在 master，到期下发降级列表，worker 翻转 bool 后现成 LRU 回收 |
 | 4 | SGLang HiCache 集成 | 未开始 | HiCache 写回判断 cache_control → write_through + `guaranteed_until_ms`；读取续期；Router 解析 |
 
 ### Phase 3 细分（master-driven downgrade）
@@ -126,9 +126,61 @@ L1/L2 不参与保证（请求可能路由到任何引擎）。L3 是所有引�
 | Task 3：周期到期扫描 `DispatchGuaranteedExpiry` | ⏳ 阻塞 #2676 | Task 1+2 |
 | Task 4：worker `DowngradeKeys` 延迟桶级翻转 → 现成 LRU 回收 | ⏳ 阻塞 #2676 | Task 2 |
 | Task 5：`BatchExpireGuaranteed` 显式 ops 失效（HTTP+RPC） | ⏳ 阻塞 #2676 | Task 1+2 |
-| Task 6：读时续期 `GetReplicaList`（config 门控，默认关） | ⏳ 待做 | 无（纯 master） |
+| Task 6：读时续期 `GetReplicaList`（request 级 `renew_guaranteed_ttl_ms`） | ✅ 已实现验证（2 单测） | 无（纯 master） |
 
-## 5. 关键设计决策
+## 5. 各 Phase 任务详解
+
+> 每个 Phase 拆成 task，说明"干啥的"。详细实现代码见各 Phase plan（[plans/](superpowers/plans/)）。
+
+### Phase 1：确保写入 SSD（✅ 9 task + 补充用例，已实现验证）
+
+master 侧：guaranteed 对象一定进 offload 队列、SSD 写失败重试、写完内存即普通。`enable_guaranteed_cache` 门控。
+
+| Task | 干啥 | 状态 |
+|------|------|------|
+| 1 | `OffloadTaskItem` 加 `guaranteed` 布尔（master→client 线上标记，YLT_REFL） | ✅ |
+| 2 | `ReplicateConfig` 加 `guaranteed_until_ms`（请求级标记，Phase 1 仅判 >0） | ✅ |
+| 3 | `enable_guaranteed_cache` config flag 贯穿全 7 层（默认 false）+ gflag | ✅ |
+| 4 | `ObjectMetadata` 加 `guaranteed_` 布尔（Phase 1），`AllocateAndInsertMetadata` 标记 | ✅ |
+| 5 | `LocalDiskSegment` 加 `guaranteed_offloading_objects` 独立队列（per-client） | ✅ |
+| 6 | `PushOffloadingQueue` 路由：guaranteed 进独立队列（无 limit），normal 限 limit | ✅ |
+| 7 | `PutEnd` 总 offload guaranteed（无视 `offload_on_evict_`）—— 核心保证 | ✅ |
+| 8 | `OffloadObjectHeartbeat` drain 两个 map + disable 时清理两个（refcount + task） | ✅ |
+| 9 | SSD 写 NACK 时重新入队 guaranteed（pin 保持、刷 start_time、等下一批） | ✅ |
+| 补充 | 用例 5（写成功后变可驱逐）+ 用例 9（`enable_offload=false` 降级） | ✅ |
+
+### Phase 2：SSD 副本驱逐保护（✅ 4 task，已实现验证）
+
+client 侧：guaranteed bucket 不被 fifo/lru 驱逐。
+
+| Task | 干啥 | 状态 |
+|------|------|------|
+| 1 | `BucketMetadata` 加 `guaranteed` 布尔（`YLT_REFL` 持久化，重启不丢）+ 4 ctor/assign | ✅ |
+| 2 | `OffloadObjects` 按 `guaranteed` 分两组 → **同质 bucket**（全 guaranteed 或全 normal） | ✅ |
+| 3 | `BatchOffload` + `BuildBucket` 把 `guaranteed` 穿到 `BucketMetadata`（base + 全部 4 子类 override） | ✅ |
+| 4 | `SelectEvictionCandidate` 跳过 guaranteed bucket（FIFO 前向扫描；LRU 前向扫描**不 erase**——防死循环+保 Phase 3 可驱逐） | ✅ |
+
+### Phase 3：SSD 副本 TTL 管理（master-driven downgrade，进行中）
+
+TTL 只在 master（object 级，类似 lease），到期下发一次性降级列表，worker 翻转 bucket bool 后由**现成 LRU 路径**回收。
+
+| Task | 干啥 | 状态 | 依赖 |
+|------|------|------|------|
+| 1 | `ObjectMetadata.guaranteed_`(bool)→`guaranteed_until_`(time_point)，3 用点改 `>now`，config 全层 | ✅ 已验证 | 无 |
+| 2 | per-client `pending_downgrade_keys` + `PollDowngradeKeys` RPC（泛化 #2676 `PollRemoveAll`：bool 全清→key 列表） | ⏳ | #2676 |
+| 3 | 周期到期扫描 `DispatchGuaranteedExpiry`（挂 `TaskCleanupThreadFunc`）→ 反查 holder `client_id` → 入 pending | ⏳ | Task 1+2 |
+| 4 | worker `DowngradeKeys`：聚合 key→bucket，**仅当降级集覆盖 bucket 全部 key** 才翻 `guaranteed=false` → 现成 LRU 回收 | ⏳ | Task 2 |
+| 5 | `BatchExpireGuaranteed` 显式 ops 失效（HTTP + RPC，exact key 线性扫描，**非 prefix_hash**） | ⏳ | Task 1+2 |
+| 6 | 读时续期：`GetReplicaList` 加 request 级 `renew_guaranteed_ttl_ms`（只续不创建、`std::max` 不缩短） | ✅ 已验证 | 无 |
+| 7 | 回归保护 + feature flag 门控 + E2E（全链路降级回收测试） | ⏳ | Task 1-5 |
+| Minor | `master.cpp` gflag 接线（`guaranteed_until_ms`/`renewal_ttl_ms`） | ✅（Task 6 顺带） | — |
+
+### Phase 4：SGLang HiCache 集成（未开始，无 task 分解）
+
+端到端：HiCache 写回判断 cache_control token 范围 → write_through + `guaranteed_until_ms`；读取 L3 时带 cache_control 传 `renew_guaranteed_ttl_ms` 续期；Router 解析 `cache_control` → token 断点。
+**注意**：cache_control 字符偏移需在 SGLang 最终 prompt 构造后用 tokenizer offset mapping 解析（非字符直映）；"radix tree 前缀匹配无窗口限制"但断点数有上限（遵循 OpenAI 4 个）。task 待 Phase 3 完成后分解。
+
+## 6. 关键设计决策
 
 1. **guaranteed 生命周期由 SSD 管**（非内存）：写入 SSD（P1）→ 保护 SSD 副本（P2）→ TTL 回收（P3）。内存副本写完即普通。
 2. **Phase 3 = master-driven downgrade**（非 client-side TTL）：TTL 只在 master（object 级，类似 lease，不进 HA），
@@ -152,7 +204,7 @@ L1/L2 不参与保证（请求可能路由到任何引擎）。L3 是所有引�
    `serializer.cpp` 是上游高频改动文件，改动越深越痛——尤其避开 `Serializer<Replica>` 格式 bump（决策 6）。
    详见 [spec §14 维护性](superpowers/specs/2026-07-02-guaranteed-ssd-offload-priority-design-zh.md#14-维护性便于定期合并社区-main-分支)。
 
-## 6. 与父文档（explicit_context_cache_design.md）的差异
+## 7. 与父文档（explicit_context_cache_design.md）的差异
 
 父文档是设计**起点**（2026-07-02），其 §7（Mooncake Store 修改）/§11（实施分阶段）描述的是早期父设计，**已过时**：
 
@@ -179,17 +231,17 @@ prompt 的同一阶段。另：父文档"不做窗口限制"（§1）与"保留�
 需统一（建议遵循 OpenAI 语义保留 4 个断点，文档"不做窗口限制"改为"radix tree 前缀匹配无窗口限制"——匹配无窗口，
 断点数有上限）。
 
-## 7. 文档导航
+## 8. 文档导航
 
 | 文档 | 用途 |
 |------|------|
-| 本文档 | 总领架构（4-Phase 路线、关键决策、与父文档差异） |
+| 本文档 | 总领架构（4-Phase 路线、§5 各 Phase 任务详解、关键决策、与父文档差异） |
 | [superpowers/README.md](superpowers/README.md) | 实施文档索引 + 状态总览 |
 | [superpowers/specs/2026-07-02-guaranteed-ssd-offload-priority-design-zh.md](superpowers/specs/2026-07-02-guaranteed-ssd-offload-priority-design-zh.md) | Phase 1 详细设计（数据模型、PutEnd、PushOffloadingQueue、测试计划、§14 维护性） |
 | [superpowers/plans/](superpowers/plans/) | 各 Phase 实施计划（Phase 1/2 ✅，Phase 3 master-driven-downgrade 进行中） |
 | [explicit_context_cache_design.md](../explicit_context_cache_design.md) | 显式上下文缓存总设计（SGLang + Mooncake，早期版本，§1-§5 仍有效） |
 
-## 8. 测试
+## 9. 测试
 
 | 测试 target | Phase | 内容 |
 |------------|------|------|
