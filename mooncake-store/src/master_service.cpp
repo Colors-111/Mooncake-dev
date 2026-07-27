@@ -2886,7 +2886,13 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                             OffloadingTask{replica.id(),
                                            std::chrono::system_clock::now()});
                         task_created = true;
+                        VLOG(1) << "[HC-EVT] kind=+queued key=" << object_id.user_key
+                                << " tenant=" << object_id.tenant_id;
                     }
+                } else {
+                    VLOG(1) << "[HC-EVT] kind=-queued key=" << object_id.user_key
+                            << " tenant=" << object_id.tenant_id
+                            << " reason=enqueue_fail:" << result.error();
                 }
             });
     }
@@ -2904,6 +2910,8 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
     PublishKvStored(key, replica_type, metadata, metadata.tenant_id);
+    VLOG(1) << "[HC-EVT] kind=+mem key=" << key
+            << " tenant=" << metadata.tenant_id << " size=" << metadata.size;
     return {};
 }
 
@@ -3491,6 +3499,9 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
         if (had_completed_disk) {
             auto& shard = accessor.GetShard();
             shard.OnDiskReplicaRemoved(had_completed_disk, metadata);
+            VLOG(1) << "[HC-EVT] kind=-disk key=" << key
+                    << " tenant=" << object_id.tenant_id
+                    << " size=" << metadata.size << " reason=evict";
         }
     } else {
         LOG(ERROR) << "key=" << key
@@ -4757,6 +4768,9 @@ auto MasterService::NotifyOffloadSuccess(
                         obj_metadata.AddReplicas(std::move(replicas));
                         auto& shard = accessor.GetShard();
                         shard.OnDiskReplicaAdded(obj_metadata);
+                        VLOG(1) << "[HC-EVT] kind=+disk key=" << request_object_id.user_key
+                                << " tenant=" << request_object_id.tenant_id
+                                << " size=" << obj_metadata.size;
                         SyncCacheTotalAccounting(obj_metadata);
                         added_new_local_disk_replica = true;
                     } else {
@@ -6473,6 +6487,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     tenant_state.offloading_tasks.emplace(
                         key, OffloadingTask{replica.id(), now});
                     queued = true;
+                    VLOG(1) << "[HC-EVT] kind=+queued key=" << key
+                            << " tenant=" << tenant_id;
+                } else {
+                    VLOG(1) << "[HC-EVT] kind=-queued key=" << key
+                            << " tenant=" << tenant_id
+                            << " reason=enqueue_fail:" << result.error();
                 }
             });
 
@@ -6552,6 +6572,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 result.evicted_objects++;
                 PublishKvRemovedAfterEvict(member_key, freed, "cpu",
                                            member_metadata, tenant_id);
+                VLOG(1) << "[HC-EVT] kind=-mem key=" << member_key
+                        << " tenant=" << tenant_id << " size=" << freed
+                        << " reason=evict";
             }
             if (member_key != key && !member_metadata.IsValid()) {
                 EraseMetadata(tenant_state, member_it, tenant_id,
@@ -6712,6 +6735,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 if (!it->second.IsGrouped()) {
                     PublishKvRemovedAfterEvict(c.key, evict_result.freed_bytes,
                                                "cpu", it->second, c.tenant_id);
+                    VLOG(1) << "[HC-EVT] kind=-mem key=" << c.key
+                            << " tenant=" << c.tenant_id
+                            << " size=" << evict_result.freed_bytes
+                            << " reason=evict";
                 }
                 if (!it->second.IsValid()) {
                     EraseMetadata(tenant_state, it, c.tenant_id,
@@ -6777,6 +6804,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     PublishKvRemovedAfterEvict(
                                         it->first, evict_result.freed_bytes,
                                         "cpu", it->second, tenant_it->first);
+                                    VLOG(1) << "[HC-EVT] kind=-mem key=" << it->first
+                                            << " tenant=" << tenant_it->first
+                                            << " size=" << evict_result.freed_bytes
+                                            << " reason=evict";
                                 }
                                 if (!it->second.IsValid()) {
                                     it = EraseMetadata(
@@ -6842,6 +6873,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     PublishKvRemovedAfterEvict(
                                         it->first, evict_result.freed_bytes,
                                         "cpu", it->second, tenant_it->first);
+                                    VLOG(1) << "[HC-EVT] kind=-mem key=" << it->first
+                                            << " tenant=" << tenant_it->first
+                                            << " size=" << evict_result.freed_bytes
+                                            << " reason=evict";
                                 }
                                 if (!it->second.IsValid()) {
                                     it = EraseMetadata(
@@ -7004,6 +7039,10 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 shard_evicted_count++;
                 PublishKvRemovedAfterEvict(it->first, metadata.size * erased,
                                            "disk", metadata, tenant_it->first);
+                VLOG(1) << "[HC-EVT] kind=-mem key=" << it->first
+                        << " tenant=" << tenant_it->first
+                        << " size=" << (metadata.size * erased)
+                        << " reason=evict";
                 if (!metadata.IsValid()) {
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
                                        QuotaEraseMode::kFull, &shard);

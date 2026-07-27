@@ -540,6 +540,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                     batch_object.emplace(storage_key, std::move(it->second));
                 } else {
                     failed_tasks.push_back(task);
+                    VLOG(1) << "[HC-EVT] kind=nack key=" << task.key
+                            << " tenant=" << task.tenant_id
+                            << " reason=not_in_memory";
                 }
             }
         }
@@ -570,7 +573,11 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                         LOG(ERROR) << "D2H staging failed for key: " << obj_key;
                         pinned_buffer_pool_->Release(std::move(buf));
                         obj_success = false;
-                        failed_tasks.push_back(task_by_storage_key.at(obj_key));
+                        const auto& failed_task = task_by_storage_key.at(obj_key);
+                        failed_tasks.push_back(failed_task);
+                        VLOG(1) << "[HC-EVT] kind=nack key=" << failed_task.key
+                                << " tenant=" << failed_task.tenant_id
+                                << " reason=d2h_fail";
                         break;
                     }
                     host_slices.emplace_back(Slice{buf.data, slice.size});
@@ -626,13 +633,29 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
                 MutexLocker locker(&offloading_mutex_);
                 enable_offloading_ = false;
+                for (const auto& [storage_key, _] : host_batch_object) {
+                    const auto& task = task_by_storage_key.at(storage_key);
+                    VLOG(1) << "[HC-EVT] kind=drop key=" << task.key
+                            << " tenant=" << task.tenant_id
+                            << " reason=keys_ultra_limit";
+                }
                 return tl::make_unexpected(offload_res.error());
             }
             if (offload_res.error() == ErrorCode::INVALID_READ) {
                 for (const auto& [key, _] : host_batch_object) {
-                    failed_tasks.push_back(task_by_storage_key.at(key));
+                    const auto& task = task_by_storage_key.at(key);
+                    failed_tasks.push_back(task);
+                    VLOG(1) << "[HC-EVT] kind=nack key=" << task.key
+                            << " tenant=" << task.tenant_id
+                            << " reason=invalid_read";
                 }
             } else {
+                for (const auto& [storage_key, _] : host_batch_object) {
+                    const auto& task = task_by_storage_key.at(storage_key);
+                    VLOG(1) << "[HC-EVT] kind=drop key=" << task.key
+                            << " tenant=" << task.tenant_id
+                            << " reason=" << offload_res.error();
+                }
                 return tl::make_unexpected(offload_res.error());
             }
         }
@@ -643,6 +666,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     for (const auto& [storage_key, task] : task_by_storage_key) {
         if (all_bucket_keys.find(storage_key) == all_bucket_keys.end()) {
             failed_tasks.push_back(task);
+            VLOG(1) << "[HC-EVT] kind=nack key=" << task.key
+                    << " tenant=" << task.tenant_id
+                    << " reason=bucket_skip";
         }
     }
 
