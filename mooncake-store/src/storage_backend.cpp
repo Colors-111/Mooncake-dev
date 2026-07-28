@@ -2400,6 +2400,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                         << "key=" << it->first << ", object_size=" << it->second
                         << ", limit="
                         << bucket_backend_config_.bucket_size_limit;
+                VLOG(1) << "[HC-EVT] kind=skip key=" << it->first
+                        << " reason=oversize size=" << it->second
+                        << " limit=" << bucket_backend_config_.bucket_size_limit;
                 ++it;
                 continue;
             }
@@ -2413,6 +2416,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
             if (is_exist_result && is_exist_result.value()) {
                 VLOG(1) << "Key already exists in storage backend, skipping: "
                         << "key=" << it->first;
+                VLOG(1) << "[HC-EVT] kind=skip key=" << it->first
+                        << " reason=already_on_disk";
                 ++it;
                 continue;
             }
