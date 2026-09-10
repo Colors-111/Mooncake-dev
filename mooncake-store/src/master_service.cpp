@@ -2822,6 +2822,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
         // hold is capped by kStaleHandleCleanupBatchSize instead of by the
         // size of the shard. The shard may have changed while the lock was
         // released, so every key is looked up and re-classified here.
+        bool erased_in_shard = false;
         for (size_t begin = 0; begin < stale_keys.size();
              begin += kStaleHandleCleanupBatchSize) {
             const size_t end = std::min(begin + kStaleHandleCleanupBatchSize,
@@ -2859,6 +2860,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                                             &shard)) {
                         EraseMetadata(tenant_state, it, tenant_it->first,
                                       QuotaEraseMode::kFull, &shard);
+                        erased_in_shard = true;
                     } else {
                         continue;
                     }
@@ -2891,6 +2893,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                     }
                     EraseMetadata(tenant_state, it, tenant_it->first,
                                   QuotaEraseMode::kFull, &shard);
+                    erased_in_shard = true;
                 } else {
                     continue;
                 }
@@ -2908,6 +2911,13 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                     tenant_it->second.Empty()) {
                     shard->tenants.erase(tenant_it);
                 }
+            }
+        }
+
+        if (erased_in_shard) {
+            MetadataShardAccessorRW shard(this, i);
+            for (auto& tenant : shard->tenants) {
+                ShrinkBucketsIfSparse(tenant.second.metadata);
             }
         }
     }
