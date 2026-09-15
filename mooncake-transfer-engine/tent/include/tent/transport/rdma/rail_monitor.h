@@ -121,14 +121,16 @@ class RailMonitor {
         std::chrono::seconds cooldown{0};
         std::chrono::steady_clock::time_point last_error{};
         std::chrono::steady_clock::time_point resume_time{};
-        // Last time admit() armed a probe/trial. Throttles the probe rate during
-        // Open and defers the first probe by one probe_interval_ after a pause.
+        // Last time admit() armed a probe/trial. Throttles the probe rate
+        // during Open and defers the first probe by one probe_interval_ after a
+        // pause.
         std::chrono::steady_clock::time_point last_probe_time{};
-        // Half-Open: the cooldown expired but recovery is not yet proven. admit()
-        // arms exactly one trial; a trial success closes the rail (markRecovered),
-        // a trial failure escalates the cooldown and re-arms (markFailed). This
-        // replaces the old "expiry fully reopens" path, which slammed a still-dead
-        // peer with every slice and re-triggered the storm at 30s/60s/120s.
+        // Half-Open: the cooldown expired but recovery is not yet proven.
+        // admit() arms exactly one trial; a trial success closes the rail
+        // (markRecovered), a trial failure escalates the cooldown and re-arms
+        // (markFailed). This replaces the old "expiry fully reopens" path,
+        // which slammed a still-dead peer with every slice and re-triggered the
+        // storm at 30s/60s/120s.
         bool half_open = false;
         // A probe/trial slice is selected/posted and its completion has not yet
         // resolved the rail. admit() refuses to arm a second while this is set,
@@ -139,7 +141,8 @@ class RailMonitor {
         bool probe_in_flight = false;
 
         // Derived: a rail is paused iff a resume_time has been armed. The
-        // Half-Open sub-state also has resume_time armed so paused() stays true.
+        // Half-Open sub-state also has resume_time armed so paused() stays
+        // true.
         bool paused() const {
             return resume_time != std::chrono::steady_clock::time_point{};
         }

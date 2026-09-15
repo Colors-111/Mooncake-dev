@@ -100,12 +100,12 @@ Status RailMonitor::load(std::shared_ptr<const Topology> local,
 bool RailMonitor::isAvailable(int local_nic, int remote_nic) const {
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return false;
-    // True only for Closed/healthy rails. Open (cooldown running), expired-Open,
-    // and Half-Open all have resume_time armed -> paused() -> false. They must
-    // go through admit() (which may arm a probe/trial), not be used directly.
-    // This is a pure predicate: it mutates nothing and never calls
-    // updateBestMapping, so it is safe to call from updateBestMapping without
-    // the recursion the old available() had.
+    // True only for Closed/healthy rails. Open (cooldown running),
+    // expired-Open, and Half-Open all have resume_time armed -> paused() ->
+    // false. They must go through admit() (which may arm a probe/trial), not be
+    // used directly. This is a pure predicate: it mutates nothing and never
+    // calls updateBestMapping, so it is safe to call from updateBestMapping
+    // without the recursion the old available() had.
     return !it->second.paused();
 }
 
@@ -263,8 +263,7 @@ void RailMonitor::markRecovered(int local_nic, int remote_nic) {
         st.cooldown = std::chrono::seconds(0);
         st.last_probe_time = {};
         LOG(INFO) << "Rail recovered: local_nic=" << local_nic
-                  << " remote_nic=" << remote_nic
-                  << " (probe/trial succeeded)";
+                  << " remote_nic=" << remote_nic << " (probe/trial succeeded)";
         updateBestMapping();
         return;
     }
