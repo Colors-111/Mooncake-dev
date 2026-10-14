@@ -9961,6 +9961,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     }
 
     auto now = std::chrono::system_clock::now();
+    const auto cycle_start = std::chrono::steady_clock::now();
 
     auto is_evictable_memory_replica = [this](const Replica& replica) {
         return IsEvictableMemoryReplica(replica);
@@ -10236,6 +10237,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
             if (freed > 0) {
                 result.evicted_objects++;
                 if (!enable_oplog_) {
+                    MasterMetricManager::instance()
+                        .observe_evicted_key_age_seconds(
+                            std::chrono::duration<double>(
+                                now - member_metadata.put_start_time)
+                                .count());
                     PublishKvRemovedAfterEvict(member_key, freed, "cpu",
                                                member_metadata, tenant_id);
                 }
@@ -10541,7 +10547,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
                     total_freed_size += evict_result.freed_bytes;
 
-                    if (!enable_oplog_ && !it->second.IsGrouped()) {
+                    if (!enable_oplog_ && !it->second.IsGrouped() &&
+                        evict_result.freed_bytes > 0) {
+                        MasterMetricManager::instance()
+                            .observe_evicted_key_age_seconds(
+                                std::chrono::duration<double>(
+                                    now - it->second.put_start_time)
+                                    .count());
                         PublishKvRemovedAfterEvict(
                             c.key, evict_result.freed_bytes, "cpu", it->second,
                             c.tenant_id);
@@ -10627,7 +10639,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     shard, tenant_state, deferred_replicas,
                                     /*allow_soft_pinned=*/false);
                                 total_freed_size += evict_result.freed_bytes;
-                                if (!enable_oplog_ && !it->second.IsGrouped()) {
+                                if (!enable_oplog_ &&
+                                    !it->second.IsGrouped() &&
+                                    evict_result.freed_bytes > 0) {
+                                    MasterMetricManager::instance()
+                                        .observe_evicted_key_age_seconds(
+                                            std::chrono::duration<double>(
+                                                now - it->second.put_start_time)
+                                                .count());
                                     PublishKvRemovedAfterEvict(
                                         it->first, evict_result.freed_bytes,
                                         "cpu", it->second, tenant_it->first);
@@ -10695,7 +10714,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     shard, tenant_state, deferred_replicas,
                                     /*allow_soft_pinned=*/true);
                                 total_freed_size += evict_result.freed_bytes;
-                                if (!enable_oplog_ && !it->second.IsGrouped()) {
+                                if (!enable_oplog_ &&
+                                    !it->second.IsGrouped() &&
+                                    evict_result.freed_bytes > 0) {
+                                    MasterMetricManager::instance()
+                                        .observe_evicted_key_age_seconds(
+                                            std::chrono::duration<double>(
+                                                now - it->second.put_start_time)
+                                                .count());
                                     PublishKvRemovedAfterEvict(
                                         it->first, evict_result.freed_bytes,
                                         "cpu", it->second, tenant_it->first);
@@ -10751,6 +10777,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
             ShrinkBucketsIfSparse(tenant.second.metadata);
         }
     }
+
+    MasterMetricManager::instance().observe_eviction_duration_ms(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - cycle_start)
+            .count());
 
     if (evicted_count > 0 || released_discarded_cnt > 0) {
         need_mem_eviction_ = false;

@@ -129,6 +129,8 @@ class MasterMetricManager {
     void inc_soft_pin_key_count(int64_t val = 1);
     void dec_soft_pin_key_count(int64_t val = 1);
     void observe_value_size(int64_t size);
+    void observe_evicted_key_age_seconds(double seconds);
+    void observe_eviction_duration_ms(int64_t duration_ms);
     int64_t get_key_count();
     int64_t get_soft_pin_key_count();
 
@@ -575,6 +577,12 @@ class MasterMetricManager {
     ylt::metric::gauge_t key_count_;
     ylt::metric::gauge_t soft_pin_key_count_;
     ylt::metric::histogram_t value_size_distribution_;
+    // Eviction distributions: key age at eviction, per-cycle duration.
+    // Age uses the double specialization for sub-second bucket placement;
+    // note ylt's histogram _sum is int64-truncated for both specializations,
+    // and a batch with all observations < 1s is omitted while sum == 0.
+    ylt::metric::basic_static_histogram<double> evicted_key_age_seconds_;
+    ylt::metric::histogram_t eviction_duration_ms_;
 
     // Cluster Metrics
     ylt::metric::gauge_t active_clients_;

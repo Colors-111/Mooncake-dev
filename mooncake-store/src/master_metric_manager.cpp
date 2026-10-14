@@ -1,6 +1,7 @@
 #include "master_metric_manager.h"
 
 #include <glog/logging.h>
+#include <algorithm>
 #include <iomanip>  // For std::fixed, std::setprecision
 #include <limits>   // For std::numeric_limits
 #include <sstream>  // For string building during serialization
@@ -59,6 +60,15 @@ MasterMetricManager::MasterMetricManager()
       value_size_distribution_(
           "master_value_size_bytes", "Distribution of object value sizes",
           {4096, 65536, 262144, 1048576, 4194304, 16777216, 67108864}),
+      evicted_key_age_seconds_(
+          "master_evicted_key_age_seconds",
+          "Age of evicted keys at eviction time (seconds since latest put "
+          "start)",
+          {1, 10, 60, 300, 900, 3600, 21600, 86400}),
+      eviction_duration_ms_(
+          "master_eviction_duration_ms",
+          "Wall-clock duration of one BatchEvict cycle in milliseconds",
+          {1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 30000}),
       // Initialize cluster metrics
       active_clients_("master_active_clients",
                       "Total number of active clients"),
@@ -635,6 +645,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     // Update Histogram (use observe(0) to mark as changed)
     value_size_distribution_.observe(0);
     nof_heartbeat_probe_latency_ms_.observe(0);
+    evicted_key_age_seconds_.observe(0);
+    eviction_duration_ms_.observe(0);
 
     // Note: dynamic_gauge_1t (mem_allocated_size_per_segment_ and
     // mem_total_capacity_per_segment_) are not initialized here because they
@@ -864,6 +876,14 @@ void MasterMetricManager::dec_soft_pin_key_count(int64_t val) {
 
 void MasterMetricManager::observe_value_size(int64_t size) {
     value_size_distribution_.observe(size);
+}
+
+void MasterMetricManager::observe_evicted_key_age_seconds(double seconds) {
+    evicted_key_age_seconds_.observe(std::max(0.0, seconds));
+}
+
+void MasterMetricManager::observe_eviction_duration_ms(int64_t duration_ms) {
+    eviction_duration_ms_.observe(duration_ms);
 }
 
 int64_t MasterMetricManager::get_key_count() { return key_count_.value(); }
@@ -1830,6 +1850,8 @@ std::string MasterMetricManager::serialize_metrics() {
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
+    serialize_metric(evicted_key_age_seconds_);
+    serialize_metric(eviction_duration_ms_);
 
     // Serialize Request Counters
     serialize_metric(exist_key_requests_);

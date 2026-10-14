@@ -20,11 +20,27 @@
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_batch_types.h"
+#include "master_metric_manager.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
 namespace {
+
+// Histogram series are omitted entirely while sum == 0 (ylt serialize
+// behavior), so absence means count 0.
+int64_t ParseHistogramCount(const std::string& serialized,
+                            const std::string& metric_name) {
+    const std::string marker = metric_name + "_count ";
+    const auto pos = serialized.find(marker);
+    if (pos == std::string::npos) {
+        return 0;
+    }
+    const auto value_begin = pos + marker.size();
+    const auto value_end = serialized.find('\n', value_begin);
+    return std::stoll(
+        serialized.substr(value_begin, value_end - value_begin));
+}
 
 class EvictFakeBatchHaKvBackend : public HaKvBackend {
    public:
@@ -592,6 +608,44 @@ TEST_F(MasterServiceEvictScenarioTest,
         .When(PutStart("tenant-b-overflow", 1)
                   .ForTenant("tenant-b")
                   .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED));
+}
+
+TEST_F(MasterServiceEvictScenarioTest, EvictionMetricsRecordAgeAndDuration) {
+    constexpr size_t kObjectCount = 100;
+    constexpr size_t kExpectedEvicted = 10;
+
+    auto& metrics = MasterMetricManager::instance();
+    const auto serialized_before = metrics.serialize_metrics();
+    const int64_t age_count_before = ParseHistogramCount(
+        serialized_before, "master_evicted_key_age_seconds");
+    const int64_t duration_count_before = ParseHistogramCount(
+        serialized_before, "master_eviction_duration_ms");
+
+    MasterScenario scenario("eviction records age and duration",
+                            EvictConfig());
+    scenario.Given(MemoryNode("memory").Capacity(256 * 1024 * 1024))
+        .Given(IndexedObjects(0, kObjectCount)
+                   .Size(kObjectSize)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase()))
+        // Scenario objects get put_start_time = now (the ExpiredFrom fixture
+        // only backdates the lease), and ylt's int64-truncated histogram sum
+        // stays 0 for sub-second observations, which would omit the whole
+        // series from serialization. Wait past 1s so evicted keys carry a
+        // non-truncating age; the second eviction cycle hedges the duration
+        // histogram against a sub-millisecond first cycle.
+        .When(WaitFor(std::chrono::milliseconds(1100)))
+        .When(EvictMemory(0.10))
+        .When(EvictMemory(0.10));
+
+    const auto serialized_after = metrics.serialize_metrics();
+    const int64_t age_count_after = ParseHistogramCount(
+        serialized_after, "master_evicted_key_age_seconds");
+    const int64_t duration_count_after = ParseHistogramCount(
+        serialized_after, "master_eviction_duration_ms");
+
+    EXPECT_GE(age_count_after - age_count_before, kExpectedEvicted);
+    EXPECT_GE(duration_count_after - duration_count_before, 1);
 }
 
 }  // namespace
