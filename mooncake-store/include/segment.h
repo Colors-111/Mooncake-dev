@@ -185,6 +185,22 @@ class ScopedSegmentAccess {
                             size_t& capacity);
 
     /**
+     * @brief Query the largest contiguous free region across the allocators
+     * backing the named segment.
+     *
+     * Allocation succeeds only when a single allocator has one contiguous
+     * block large enough for the request, so this is the metric that explains
+     * "insufficient space" failures while aggregate usage is still below the
+     * eviction high watermark. Allocators that do not track free regions
+     * precisely (e.g. CacheLib) report kAllocatorUnknownFreeSpace and are
+     * skipped; a segment whose allocators all report unknown yields 0.
+     *
+     * @return ErrorCode::OK if the segment exists, SEGMENT_NOT_FOUND otherwise
+     */
+    ErrorCode QueryLargestFreeRegion(const std::string& segment,
+                                     size_t& largest_free_region);
+
+    /**
      * @brief Get all segments that are not ready (not in OK status)
      * @param[out] unready_segments Vector to store the unready segments
      * pair<segment, client_id>

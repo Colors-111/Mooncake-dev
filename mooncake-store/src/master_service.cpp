@@ -2948,10 +2948,50 @@ auto MasterService::GetSegmentsDetail()
         info.allocator_used_bytes = used;
         info.allocator_capacity_bytes = capacity;
 
+        // Query the largest contiguous block the allocator can still hand
+        // out. This is 0 when the allocator type does not track free regions.
+        size_t largest_free = 0;
+        if (segment_access.QueryLargestFreeRegion(segment.name, largest_free) ==
+            ErrorCode::OK) {
+            info.largest_free_region_bytes = largest_free;
+        }
+
         result.push_back(std::move(info));
     }
 
     return result;
+}
+
+MasterService::MemoryFreeSpaceSummary
+MasterService::GetMemoryFreeSpaceSummary() {
+    MemoryFreeSpaceSummary summary;
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+
+    std::vector<std::pair<Segment, UUID>> all_segments;
+    if (segment_access.GetAllSegments(all_segments) != ErrorCode::OK) {
+        return summary;
+    }
+    summary.segment_count = all_segments.size();
+
+    for (const auto& [segment, client_id] : all_segments) {
+        (void)client_id;
+        size_t used = 0, capacity = 0;
+        if (segment_access.QuerySegments(segment.name, used, capacity) ==
+            ErrorCode::OK) {
+            summary.used_bytes += used;
+            summary.capacity_bytes += capacity;
+        }
+        size_t largest_free = 0;
+        if (segment_access.QueryLargestFreeRegion(segment.name,
+                                                  largest_free) ==
+                ErrorCode::OK &&
+            largest_free > summary.largest_free_bytes) {
+            summary.largest_free_bytes = largest_free;
+            summary.largest_free_segment = segment.name;
+        }
+    }
+
+    return summary;
 }
 
 auto MasterService::QuerySegments(const std::string& segment)

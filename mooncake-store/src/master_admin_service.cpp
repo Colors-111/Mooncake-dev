@@ -698,11 +698,14 @@ struct HttpSegmentDetailItem {
     uint64_t allocator_used_bytes{0};
     uint64_t allocator_capacity_bytes{0};
     double allocator_usage_percent{0.0};
+    // Largest contiguous free block; 0 when the allocator type (e.g. CacheLib)
+    // does not track free regions.
+    uint64_t largest_free_region_bytes{0};
 };
 YLT_REFL(HttpSegmentDetailItem, segment_name, segment_id, client_id,
          base_address, size_bytes, size_human, te_endpoint, protocol, status,
          allocator_used_bytes, allocator_capacity_bytes,
-         allocator_usage_percent);
+         allocator_usage_percent, largest_free_region_bytes);
 
 struct HttpSegmentsDetailResponse {
     uint64_t total_segments{0};
@@ -748,6 +751,7 @@ void MasterAdminServer::HandleGetSegmentsDetail(
                     ? (static_cast<double>(info.allocator_used_bytes) /
                        info.allocator_capacity_bytes * 100.0)
                     : 0.0;
+            item.largest_free_region_bytes = info.largest_free_region_bytes;
             payload.segments.push_back(std::move(item));
         }
         WriteJsonResponse(resp, coro_http::status_type::ok, payload);

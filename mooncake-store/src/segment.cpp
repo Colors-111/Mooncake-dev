@@ -4,6 +4,7 @@
 #include "master_metric_manager.h"
 #include "utils/zstd_util.h"
 
+#include <algorithm>
 #include <functional>
 #include <unordered_set>
 
@@ -605,6 +606,33 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
 
     used = total_used;
     capacity = total_capacity;
+
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::QueryLargestFreeRegion(
+    const std::string& segment, size_t& largest_free_region) {
+    largest_free_region = 0;
+
+    const auto& allocator_manager = segment_manager_->allocator_manager_;
+    const auto& allocators = allocator_manager.getAllocators(segment);
+    if (allocators == nullptr || allocators->empty()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+
+    for (const auto& allocator : *allocators) {
+        if (!allocator) {
+            continue;
+        }
+        const size_t region = allocator->getLargestFreeRegion();
+        // Allocators that do not track free regions precisely (e.g. CacheLib)
+        // report kAllocatorUnknownFreeSpace. Skipping them keeps the sentinel
+        // out of the maximum instead of turning it into a bogus huge value.
+        if (region == kAllocatorUnknownFreeSpace) {
+            continue;
+        }
+        largest_free_region = std::max(largest_free_region, region);
+    }
 
     return ErrorCode::OK;
 }

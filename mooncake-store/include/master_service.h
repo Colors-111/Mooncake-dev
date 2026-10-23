@@ -342,6 +342,12 @@ class MasterService {
         SegmentStatus status{SegmentStatus::UNDEFINED};
         uint64_t allocator_used_bytes{0};
         uint64_t allocator_capacity_bytes{0};
+        // Largest contiguous free block the segment's allocator can hand out.
+        // Aggregate usage can stay below the eviction high watermark while a
+        // Put still fails because no single block is large enough; this field
+        // is what makes that case visible. 0 means unknown (allocator type
+        // does not track free regions, e.g. CacheLib).
+        uint64_t largest_free_region_bytes{0};
     };
 
     /**
@@ -352,6 +358,26 @@ class MasterService {
      */
     auto GetSegmentsDetail()
         -> tl::expected<std::vector<SegmentDetailInfo>, ErrorCode>;
+
+    /**
+     * @brief Best-effort memory free-space snapshot used to diagnose PutStart
+     * allocation failures.
+     *
+     * PutStart succeeds only when one allocator owns a contiguous block large
+     * enough for the value, so aggregate usage alone cannot explain a
+     * NO_AVAILABLE_HANDLE below the eviction high watermark. This reports the
+     * aggregate used/capacity plus the largest contiguous free block across
+     * all segments and the segment that owns it.
+     */
+    struct MemoryFreeSpaceSummary {
+        size_t segment_count{0};
+        size_t used_bytes{0};
+        size_t capacity_bytes{0};
+        std::string largest_free_segment;
+        size_t largest_free_bytes{0};
+    };
+
+    MemoryFreeSpaceSummary GetMemoryFreeSpaceSummary();
 
     /**
      * @brief Query a segment's capacity and used size in bytes.

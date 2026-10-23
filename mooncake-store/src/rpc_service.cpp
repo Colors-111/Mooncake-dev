@@ -1,5 +1,8 @@
 #include "rpc_service.h"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <string_view>
@@ -72,6 +75,56 @@ auto WithWriteTenant(std::string_view raw, bool enable_multi_tenants, Fn&& fn) {
         return Result(tl::make_unexpected(tenant_id.error()));
     }
     return std::invoke(std::forward<Fn>(fn), tenant_id.value());
+}
+
+// A NO_AVAILABLE_HANDLE failure means the allocator could not find one
+// contiguous block for the value, which is not explained by aggregate usage
+// alone: a store can sit below the eviction high watermark, keep several GiB
+// free per segment, and still reject writes because the free space is
+// fragmented. Log the failed slice size next to the largest contiguous free
+// block so the two can be compared directly.
+constexpr int64_t kPutNoSpaceDiagIntervalMs = 5000;
+
+void LogPutNoSpaceDiagnostics(
+    MasterService& master_service,
+    const std::vector<
+        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>& results,
+    const std::vector<uint64_t>& slice_lengths) {
+    const int64_t now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    static std::atomic<int64_t> last_log_ms{0};
+    int64_t previous = last_log_ms.load(std::memory_order_relaxed);
+    if (now_ms - previous < kPutNoSpaceDiagIntervalMs ||
+        !last_log_ms.compare_exchange_strong(previous, now_ms,
+                                             std::memory_order_relaxed)) {
+        return;
+    }
+
+    size_t failed = 0;
+    uint64_t max_slice = 0;
+    const size_t n = std::min(results.size(), slice_lengths.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (!results[i].has_value() &&
+            results[i].error() == ErrorCode::NO_AVAILABLE_HANDLE) {
+            ++failed;
+            max_slice = std::max(max_slice, slice_lengths[i]);
+        }
+    }
+    if (failed == 0) {
+        return;
+    }
+
+    const MasterService::MemoryFreeSpaceSummary summary =
+        master_service.GetMemoryFreeSpaceSummary();
+    LOG(WARNING) << "[PUT-NOSPACE-DIAG] failed_keys=" << failed
+                 << ", max_slice_bytes=" << max_slice
+                 << ", segments=" << summary.segment_count
+                 << ", used_bytes=" << summary.used_bytes
+                 << ", capacity_bytes=" << summary.capacity_bytes
+                 << ", largest_free_segment=" << summary.largest_free_segment
+                 << ", largest_free_bytes=" << summary.largest_free_bytes;
 }
 
 }  // namespace
@@ -517,6 +570,7 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     if (no_available_handle_count > 0) {
         LOG(WARNING) << "BatchPutStart failed for " << no_available_handle_count
                      << " keys" << PUT_NO_SPACE_HELPER_STR;
+        LogPutNoSpaceDiagnostics(master_service_, results, slice_lengths);
     }
 
     if (failure_count == total_keys) {
