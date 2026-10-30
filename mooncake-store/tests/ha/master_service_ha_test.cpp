@@ -2400,14 +2400,14 @@ TEST_F(MasterServiceHATest,
     EXPECT_FALSE(service.QuerySegmentStatusById(segment.id).has_value());
     EXPECT_EQ(metrics.get_total_mem_capacity(), baseline_capacity);
 
-    // The name is retained because the unmount is not durable yet, and the
-    // endpoint stays closed behind the cleanup barrier: the mount waits out
-    // its budget and is refused rather than opening the endpoint early.
+    // The refused unmount entry is retried in the background. While the
+    // endpoint is still closed the mount waits; once the retry lands the name,
+    // which the offboarding retained, is what refuses it.
     auto replacement = MakeSegment(segment.name, /*base=*/0x400000000);
     const UUID replacement_client = generate_uuid();
     auto blocked_mount = service.MountSegment(replacement, replacement_client);
     ASSERT_FALSE(blocked_mount.has_value());
-    EXPECT_EQ(blocked_mount.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(blocked_mount.error(), ErrorCode::INVALID_PARAMS);
 
     ASSERT_TRUE(ProcessClientOffboardingForTesting(service, job));
     EXPECT_EQ(metrics.get_total_mem_capacity(), baseline_capacity);
@@ -7931,8 +7931,9 @@ TEST_F(MasterServiceHATest, MountWaitsForTheSweepOfAReusedEndpoint) {
 
 // An unmount whose SEGMENT_UNMOUNT entry the writer refused cannot be ordered
 // against a later mount, so the endpoint stays closed and the mount fails
-// instead of waiting out the budget.
-TEST_F(MasterServiceHATest, MountFailsWhenTheUnmountEntryWasRejected) {
+// instead of waiting out the budget. The refused entry is remembered, so once
+// the writer accepts it the endpoint opens without another unmount RPC.
+TEST_F(MasterServiceHATest, RejectedUnmountEntryRecoversWithoutAnotherUnmount) {
     auto config = MasterServiceConfig::builder()
                       .set_enable_ha(true)
                       .set_enable_oplog(true)
@@ -7955,11 +7956,67 @@ TEST_F(MasterServiceHATest, MountFailsWhenTheUnmountEntryWasRejected) {
 
     auto new_segment = MakeSegment("rejected_new_segment");
     new_segment.te_endpoint = old_segment.te_endpoint;
-    const auto result = service.MountSegment(new_segment, generate_uuid());
+    const auto started = std::chrono::steady_clock::now();
+    const auto blocked = service.MountSegment(new_segment, generate_uuid());
+    const auto waited = std::chrono::steady_clock::now() - started;
+    ASSERT_FALSE(blocked.has_value());
+    EXPECT_EQ(blocked.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    // One budget for the whole call, not one per wait.
+    EXPECT_GE(waited, std::chrono::seconds(2));
+    EXPECT_LT(waited, std::chrono::seconds(6));
+
+    // The worker retries the remembered entry and sweeps; no second unmount
+    // is needed for the endpoint to open.
+    worker.Start();
+    worker.Schedule();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    auto recovered = service.MountSegment(new_segment, generate_uuid());
+    EXPECT_TRUE(recovered.has_value()) << toString(recovered.error());
+}
+
+// A writer that reached its terminal state (or a stopping service) must wake
+// the mounts waiting on the barrier instead of letting them wait out the
+// budget.
+TEST_F(MasterServiceHATest, StoppingTheWriterWakesMountWaiters) {
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id("mount_cleanup_stop")
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallRejectOnceWriter(
+        service, std::make_shared<FakeBatchHaKvBackend>());
+    ASSERT_NE(writer, nullptr);
+
+    auto old_segment = MakeSegment("stop_old_segment");
+    const UUID old_client = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(old_segment, old_client).has_value());
+    PutObjectOnSegment(service, old_client, "stop_key", old_segment.name);
+
+    auto& worker = MasterServiceTestPeer::ReplicaCleanupWorker(service);
+    worker.Stop();
+    ASSERT_TRUE(service.UnmountSegment(old_segment.id, old_client).has_value());
+
+    auto new_segment = MakeSegment("stop_new_segment");
+    new_segment.te_endpoint = old_segment.te_endpoint;
+    std::promise<tl::expected<void, ErrorCode>> mounted;
+    auto mount_result = mounted.get_future();
+    std::thread mount_thread([&] {
+        mounted.set_value(service.MountSegment(new_segment, generate_uuid()));
+    });
+    EXPECT_EQ(mount_result.wait_for(std::chrono::milliseconds(300)),
+              std::future_status::timeout);
+
+    const auto stopped_at = std::chrono::steady_clock::now();
+    service.StopBatchOpLogWriter();
+    const auto after_stop = mount_result.wait_for(std::chrono::seconds(2));
+    const auto woke_after = std::chrono::steady_clock::now() - stopped_at;
+    mount_thread.join();
+    ASSERT_EQ(after_stop, std::future_status::ready);
+    auto result = mount_result.get();
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-
-    worker.Start();
+    EXPECT_LT(woke_after, std::chrono::seconds(2));
 }
 
 // One endpoint can carry several segments. Reusing it needs every one of
@@ -8008,6 +8065,249 @@ TEST_F(MasterServiceHATest, OneEndpointWaitsForEveryUnmountedSegment) {
     ASSERT_EQ(after_sweep, std::future_status::ready);
     auto result = mount_result.get();
     EXPECT_TRUE(result.has_value()) << toString(result.error());
+}
+
+// Every SEGMENT_UNMOUNT submission goes through a per-token claim. A late
+// offboarding retry must not append a second unmount after a new segment has
+// taken the endpoint: the standby would apply it and drop that segment.
+TEST_F(MasterServiceHATest,
+       LateOffboardingRetryDoesNotDuplicateTheUnmountEntry) {
+    const std::string cluster_id = "unmount_claim_retry";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallRejectOnceWriter(service, backend);
+    ASSERT_NE(writer, nullptr);
+
+    auto old_segment = MakeSegment("claim_old_segment");
+    const UUID old_client = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(old_segment, old_client).has_value());
+    PutObjectOnSegment(service, old_client, "claim_key", old_segment.name);
+
+    const auto liveness = ClientRecordForTesting(service, old_client);
+    ASSERT_TRUE(liveness);
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    MasterMetricManager::instance().client_liveness_became_suspected();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    MasterMetricManager::instance().client_liveness_became_offline();
+
+    ClientOffboardingJob job;
+    job.client_id = old_client;
+    job.liveness = liveness;
+    job.pending_prepare_segments.push_back(
+        {.segment_id = old_segment.id,
+         .segment_name = old_segment.name,
+         .transport_endpoint = old_segment.te_endpoint});
+
+    auto& worker = MasterServiceTestPeer::ReplicaCleanupWorker(service);
+    worker.Stop();
+    writer->RejectNextSegmentUnmount();
+    ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));
+
+    // The background flush retries the refused entry; without it the endpoint
+    // would never open.
+    MasterServiceTestPeer(service).FlushPendingSegmentUnmounts();
+
+    auto new_segment = MakeSegment("claim_new_segment");
+    new_segment.te_endpoint = old_segment.te_endpoint;
+    ASSERT_TRUE(service.MountSegment(new_segment, generate_uuid()).has_value());
+
+    // The job retries now; it must not append the old unmount again.
+    ASSERT_TRUE(ProcessClientOffboardingForTesting(service, job));
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    const auto collect = [&]() {
+        std::vector<std::pair<uint64_t, OpType>> entries;
+        for (uint64_t batch_id = 1;; ++batch_id) {
+            OpLogBatchRecord batch;
+            if (storage.ReadBatch(batch_id, batch) != ErrorCode::OK) {
+                break;
+            }
+            for (const auto& entry : batch.entries) {
+                if (entry.object_key == old_segment.te_endpoint) {
+                    entries.emplace_back(entry.sequence_id, entry.op_type);
+                }
+            }
+        }
+        return entries;
+    };
+    std::vector<std::pair<uint64_t, OpType>> entries;
+    for (int i = 0; i < 100; ++i) {
+        entries = collect();
+        if (!entries.empty() &&
+            entries.back().second == OpType::SEGMENT_MOUNT) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    entries = collect();
+
+    size_t unmounts = 0;
+    uint64_t unmount_seq = 0;
+    uint64_t mount_seq = 0;
+    for (const auto& [seq, type] : entries) {
+        if (type == OpType::SEGMENT_UNMOUNT) {
+            ++unmounts;
+            unmount_seq = seq;
+        } else if (type == OpType::SEGMENT_MOUNT) {
+            mount_seq = seq;
+        }
+    }
+    EXPECT_EQ(1u, unmounts);
+    // And the single unmount still precedes the mount that reused the
+    // endpoint, so the standby never drops the new segment.
+    EXPECT_NE(0u, mount_seq);
+    EXPECT_LT(unmount_seq, mount_seq);
+}
+
+// The background worker and an RPC can flush the same token at once; the
+// claim keeps them from appending two entries.
+TEST_F(MasterServiceHATest, ConcurrentFlushesSubmitOneUnmountEntry) {
+    const std::string cluster_id = "unmount_claim_concurrent";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallRejectOnceWriter(service, backend);
+    ASSERT_NE(writer, nullptr);
+
+    auto segment = MakeSegment("concurrent_flush_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    PutObjectOnSegment(service, client_id, "concurrent_flush_key",
+                       segment.name);
+
+    auto& worker = MasterServiceTestPeer::ReplicaCleanupWorker(service);
+    worker.Stop();
+    writer->RejectNextSegmentUnmount();
+    ASSERT_TRUE(service.UnmountSegment(segment.id, client_id).has_value());
+
+    std::vector<std::thread> flushers;
+    flushers.reserve(8);
+    for (int i = 0; i < 8; ++i) {
+        flushers.emplace_back([&service] {
+            MasterServiceTestPeer(service).FlushPendingSegmentUnmounts();
+        });
+    }
+    for (auto& thread : flushers) {
+        thread.join();
+    }
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    size_t unmounts = 0;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        unmounts = 0;
+        for (uint64_t batch_id = 1;; ++batch_id) {
+            OpLogBatchRecord batch;
+            if (storage.ReadBatch(batch_id, batch) != ErrorCode::OK) {
+                break;
+            }
+            for (const auto& entry : batch.entries) {
+                if (entry.op_type == OpType::SEGMENT_UNMOUNT &&
+                    entry.object_key == segment.te_endpoint) {
+                    ++unmounts;
+                }
+            }
+        }
+        if (unmounts > 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    size_t final_unmounts = 0;
+    for (uint64_t batch_id = 1;; ++batch_id) {
+        OpLogBatchRecord batch;
+        if (storage.ReadBatch(batch_id, batch) != ErrorCode::OK) {
+            break;
+        }
+        for (const auto& entry : batch.entries) {
+            if (entry.op_type == OpType::SEGMENT_UNMOUNT &&
+                entry.object_key == segment.te_endpoint) {
+                ++final_unmounts;
+            }
+        }
+    }
+    EXPECT_EQ(1u, final_unmounts);
+}
+
+// The supervisor installs its own terminal callback through
+// SetBatchOpLogTerminalCallback; the internal wake-up must still run, so a
+// waiting mount fails instead of waiting out the budget.
+TEST_F(MasterServiceHATest, ExternalTerminalCallbackKeepsTheInternalWakeup) {
+    constexpr ViewVersionId kProducerView = 7;
+    const std::string cluster_id = "unmount_terminal_callback";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK, backend->Put(BuildProducerViewKey(cluster_id),
+                                          std::to_string(kProducerView)));
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_view_version(kProducerView)
+                      .set_cluster_id(cluster_id)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    std::atomic<bool> external_called{false};
+    service.SetBatchOpLogTerminalCallback(
+        [&external_called](const OrderedOpLogWriterTerminalState&) {
+            external_called.store(true);
+        });
+
+    auto old_segment = MakeSegment("terminal_old_segment");
+    const UUID old_client = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(old_segment, old_client).has_value());
+    PutObjectOnSegment(service, old_client, "terminal_key", old_segment.name);
+
+    auto& worker = MasterServiceTestPeer::ReplicaCleanupWorker(service);
+    worker.Stop();
+    ASSERT_TRUE(service.UnmountSegment(old_segment.id, old_client).has_value());
+
+    auto new_segment = MakeSegment("terminal_new_segment");
+    new_segment.te_endpoint = old_segment.te_endpoint;
+    std::promise<tl::expected<void, ErrorCode>> mounted;
+    auto mount_result = mounted.get_future();
+    std::thread mount_thread([&] {
+        mounted.set_value(service.MountSegment(new_segment, generate_uuid()));
+    });
+    EXPECT_EQ(mount_result.wait_for(std::chrono::milliseconds(300)),
+              std::future_status::timeout);
+
+    // Fence the writer: a later producer view makes its next append terminal.
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildProducerViewKey(cluster_id), "8"));
+    ASSERT_TRUE(AppendVisibleForTesting(service, OpType::PUT_END, "default",
+                                        "terminal_trigger", {})
+                    .has_value());
+
+    for (int i = 0; i < 200 && !external_called.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const auto after_terminal = mount_result.wait_for(std::chrono::seconds(2));
+    mount_thread.join();
+    EXPECT_TRUE(external_called.load());
+    ASSERT_EQ(after_terminal, std::future_status::ready);
+    auto result = mount_result.get();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
 }  // namespace mooncake::test

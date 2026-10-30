@@ -158,6 +158,8 @@ class MasterService {
     WeightMetadataStore::Result<ListWeightRevisionsResponse>
     ListWeightRevisions(const ListWeightRevisionsRequest& request) const;
 
+    // The writer holds one terminal callback and the supervisor installs its
+    // own; the internal wake-up is composed with it so both always run.
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
     void StopBatchOpLogWriter();
@@ -1244,6 +1246,20 @@ class MasterService {
     void PublishSegmentCleanup(const UUID& segment_id,
                                const std::string& endpoint);
     void MarkSegmentCleanupLogged(const UUID& segment_id, bool logged);
+    // Every SEGMENT_UNMOUNT submission goes through a claim, so one token has
+    // exactly one submitter: the unmount RPC, the offboarding retry and the
+    // background flush cannot append the same entry twice, which would let a
+    // late duplicate delete a segment that reused the endpoint.
+    // Returns true when the caller owns the submission; false when the token
+    // is already logged or another thread holds the claim.
+    bool TryClaimSegmentUnmount(const UUID& segment_id,
+                                const std::string& endpoint,
+                                const std::string& payload);
+    void CompleteSegmentUnmountLog(const UUID& segment_id);
+    void ReleaseSegmentUnmountClaim(const UUID& segment_id);
+    // Retries every claimed-and-failed SEGMENT_UNMOUNT entry; reschedules
+    // itself while one is still refused.
+    void FlushPendingSegmentUnmounts();
     void MarkCleanupSwept(
         uint64_t sweep_seq,
         const std::unordered_set<UUID, boost::hash<UUID>>* tokens);
@@ -1251,8 +1267,10 @@ class MasterService {
     bool EndpointCleanupPendingLocked(const std::string& endpoint) const;
     void MaybeClearCleanupLocked();
     // True when the endpoint is clear, false when the wait gave up (a sweep
-    // that cannot run, or the budget exhausted).
-    bool WaitForEndpointCleanup(const std::string& endpoint);
+    // that cannot run, or `deadline` passed). The deadline belongs to the
+    // whole mount, so a mount that waits twice still spends one budget.
+    bool WaitForEndpointCleanup(const std::string& endpoint,
+                                std::chrono::steady_clock::time_point deadline);
     void RunReplicaCleanupSweep();
     void StallCleanupWaiters();
 
@@ -1649,9 +1667,32 @@ class MasterService {
     std::unordered_map<UUID, EndpointCleanup, boost::hash<UUID>>
         pending_cleanup_;
     std::unordered_map<std::string, EndpointCleanupState> pending_by_endpoint_;
-    // Set while the sweep cannot run (stopping or the lifecycle gate is
-    // closed), so mount waiters fail instead of waiting out the budget.
-    bool cleanup_stalled_{false};
+    OrderedOpLogWriter::TerminalCallback MakeComposedTerminalCallback();
+    std::mutex terminal_callback_mutex_;
+    OrderedOpLogWriter::TerminalCallback external_terminal_callback_;
+
+    // Two reasons a sweep may not run, kept apart because only one is final:
+    // gate_closed tracks the restore lifecycle and clears itself, while
+    // unrecoverable covers shutdown and a writer that passed its terminal
+    // state and never clears.
+    bool cleanup_gate_closed_{false};
+    bool cleanup_unrecoverable_{false};
+    // SEGMENT_UNMOUNT entries the writer refused, retried in the background.
+    // `in_flight` is the single-submitter claim.
+    struct PendingSegmentUnmount {
+        std::string endpoint;
+        std::string payload;
+        bool in_flight{false};
+    };
+    std::unordered_map<UUID, PendingSegmentUnmount, boost::hash<UUID>>
+        pending_unmount_ops_;
+    // Tokens whose SEGMENT_UNMOUNT already reached the writer. Kept after the
+    // barrier clears so a late offboarding retry cannot append a second
+    // unmount for an endpoint that was already reused. Bounded; the oldest
+    // token is forgotten first, long after any retry of its job ended.
+    static constexpr size_t kLoggedUnmountTokenCap{8192};
+    std::unordered_set<UUID, boost::hash<UUID>> logged_unmount_tokens_;
+    std::deque<UUID> logged_unmount_order_;
 
     /**
      * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an

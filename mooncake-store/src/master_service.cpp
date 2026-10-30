@@ -891,14 +891,41 @@ MasterService::~MasterService() {
     client_liveness_records_.clear();
 }
 
+OrderedOpLogWriter::TerminalCallback
+MasterService::MakeComposedTerminalCallback() {
+    return [this](const OrderedOpLogWriterTerminalState& state) {
+        // Wake the barrier waiters first: a mount must not keep waiting for an
+        // entry this writer can no longer accept.
+        StallCleanupWaiters();
+        OrderedOpLogWriter::TerminalCallback external;
+        {
+            std::lock_guard<std::mutex> lock(terminal_callback_mutex_);
+            external = external_terminal_callback_;
+        }
+        if (external) {
+            external(state);
+        }
+    };
+}
+
 void MasterService::SetBatchOpLogTerminalCallback(
     OrderedOpLogWriter::TerminalCallback callback) {
+    {
+        std::lock_guard<std::mutex> lock(terminal_callback_mutex_);
+        external_terminal_callback_ = std::move(callback);
+    }
+    // The writer keeps a single callback, so reinstall the composition rather
+    // than replacing the internal wake-up with the supervisor's.
     if (ordered_oplog_writer_) {
-        ordered_oplog_writer_->SetTerminalCallback(std::move(callback));
+        ordered_oplog_writer_->SetTerminalCallback(
+            MakeComposedTerminalCallback());
     }
 }
 
 void MasterService::StopBatchOpLogWriter() {
+    // Stop() may block on background I/O; wake the waiters before it so a
+    // mount does not keep waiting for an entry this writer will never take.
+    StallCleanupWaiters();
     if (ordered_oplog_writer_) ordered_oplog_writer_->Stop();
 }
 
@@ -925,7 +952,10 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     // cleanup waits here, outside every lock the sweep needs, and retries the
     // admission once the endpoint is clear. The check and the mount share one
     // ScopedSegmentAccess, so a publication cannot slip between them; if one
-    // does, the loop simply waits again.
+    // does, the loop simply waits again. The deadline covers the whole call:
+    // a repeated wait does not buy a fresh budget.
+    const auto deadline =
+        std::chrono::steady_clock::now() + kMountCleanupWaitBudget;
     for (;;) {
         bool cleanup_pending = false;
         bool cleanup_blocked = false;
@@ -945,10 +975,17 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
                         master_state_mutex_);
                     ScopedSegmentAccess segment_access =
                         segment_manager_.getSegmentAccess();
+                    // Re-checked after every re-acquisition, before any
+                    // mount: a wait that ran out its budget must not mount
+                    // just because the endpoint cleared while it waited.
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        cleanup_blocked = true;
+                        return true;
+                    }
                     {
                         std::lock_guard<std::mutex> barrier_lock(
                             barrier_mutex_);
-                        if (cleanup_stalled_) {
+                        if (cleanup_gate_closed_ || cleanup_unrecoverable_) {
                             cleanup_blocked = true;
                             return true;
                         }
@@ -994,7 +1031,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
                 break;
             }
         }
-        if (!WaitForEndpointCleanup(segment.te_endpoint)) {
+        if (!WaitForEndpointCleanup(segment.te_endpoint, deadline)) {
             LOG(WARNING)
                 << "client_id=" << client_id
                 << ", action=mount_segment_cleanup_pending, segment_name="
@@ -2463,10 +2500,9 @@ void MasterService::MarkSegmentCleanupLogged(const UUID& segment_id,
         return;
     }
     if (!logged) {
-        // The unmount entry was not accepted, so the standby cannot be
-        // brought back in step yet. Keep the responsibility (a sweep must not
-        // clear it) without closing the endpoint forever: the unmount RPC or
-        // the offboarding job retries, and that retry publishes the entry.
+        // The unmount entry was not accepted. The caller released the claim
+        // so the background flush can retry it; the responsibility stays open
+        // until that retry lands, and a sweep must not clear it.
         LOG(WARNING) << "segment_id=" << segment_id
                      << ", endpoint=" << it->second.endpoint
                      << ", error=segment_unmount_log_rejected";
@@ -2495,6 +2531,90 @@ void MasterService::MarkCleanupSwept(
     barrier_cv_.notify_all();
 }
 
+bool MasterService::TryClaimSegmentUnmount(const UUID& segment_id,
+                                           const std::string& endpoint,
+                                           const std::string& payload) {
+    std::lock_guard<std::mutex> lock(barrier_mutex_);
+    if (logged_unmount_tokens_.contains(segment_id)) {
+        // Already in the log. Appending again would put a second unmount for
+        // this endpoint after a later mount, which the standby would apply in
+        // that order.
+        return false;
+    }
+    auto [it, inserted] = pending_unmount_ops_.try_emplace(segment_id);
+    if (!inserted) {
+        if (it->second.in_flight) {
+            // Another submitter owns this token; its outcome decides.
+            return false;
+        }
+        // A previous attempt failed and released the claim.
+        it->second.in_flight = true;
+        return true;
+    }
+    it->second = PendingSegmentUnmount{endpoint, payload, true};
+    return true;
+}
+
+void MasterService::CompleteSegmentUnmountLog(const UUID& segment_id) {
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex_);
+        pending_unmount_ops_.erase(segment_id);
+        if (logged_unmount_tokens_.insert(segment_id).second) {
+            logged_unmount_order_.push_back(segment_id);
+            while (logged_unmount_order_.size() > kLoggedUnmountTokenCap) {
+                logged_unmount_tokens_.erase(logged_unmount_order_.front());
+                logged_unmount_order_.pop_front();
+            }
+        }
+    }
+    MarkSegmentCleanupLogged(segment_id, true);
+}
+
+void MasterService::ReleaseSegmentUnmountClaim(const UUID& segment_id) {
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex_);
+        auto it = pending_unmount_ops_.find(segment_id);
+        if (it != pending_unmount_ops_.end()) {
+            it->second.in_flight = false;
+        }
+    }
+    // The endpoint stays closed until this entry lands; retry in the
+    // background rather than making the unmount RPC fail after its commit.
+    replica_cleanup_worker_.ScheduleAfter(kReplicaCleanupRetryDelay);
+}
+
+void MasterService::FlushPendingSegmentUnmounts() {
+    if (!CleanupBarrierEnabled()) {
+        return;
+    }
+    std::vector<std::tuple<UUID, std::string, std::string>> batch;
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex_);
+        if (cleanup_unrecoverable_) {
+            return;
+        }
+        batch.reserve(pending_unmount_ops_.size());
+        for (auto& [segment_id, op] : pending_unmount_ops_) {
+            if (op.in_flight) {
+                // The unmount RPC or the offboarding job owns it right now.
+                continue;
+            }
+            op.in_flight = true;
+            batch.emplace_back(segment_id, op.endpoint, op.payload);
+        }
+    }
+    for (const auto& [segment_id, endpoint, payload] : batch) {
+        auto persisted = PersistSegmentOpForHAOrEnqueue(
+            "FlushPendingSegmentUnmount", OpType::SEGMENT_UNMOUNT, endpoint,
+            payload);
+        if (persisted) {
+            CompleteSegmentUnmountLog(segment_id);
+        } else {
+            ReleaseSegmentUnmountClaim(segment_id);
+        }
+    }
+}
+
 bool MasterService::EndpointCleanupPendingLocked(
     const std::string& endpoint) const {
     auto it = pending_by_endpoint_.find(endpoint);
@@ -2521,25 +2641,28 @@ void MasterService::MaybeClearCleanupLocked() {
     }
 }
 
-bool MasterService::WaitForEndpointCleanup(const std::string& endpoint) {
+bool MasterService::WaitForEndpointCleanup(
+    const std::string& endpoint,
+    std::chrono::steady_clock::time_point deadline) {
     if (!CleanupBarrierEnabled()) {
         return true;
     }
-    const auto deadline =
-        std::chrono::steady_clock::now() + kMountCleanupWaitBudget;
     std::unique_lock<std::mutex> lock(barrier_mutex_);
     for (;;) {
-        if (!EndpointCleanupPendingLocked(endpoint)) {
-            return true;
-        }
-        if (cleanup_stalled_) {
-            return false;
-        }
+        // The deadline is the whole mount's, so it is checked before "is the
+        // endpoint clear": a mount that spent its budget does not mount even
+        // if the endpoint became clear meanwhile.
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             LOG(WARNING) << "endpoint=" << endpoint
                          << ", action=mount_cleanup_wait_exhausted";
             return false;
+        }
+        if (cleanup_gate_closed_ || cleanup_unrecoverable_) {
+            return false;
+        }
+        if (!EndpointCleanupPendingLocked(endpoint)) {
+            return true;
         }
         barrier_cv_.wait_for(
             lock,
@@ -2552,7 +2675,9 @@ bool MasterService::WaitForEndpointCleanup(const std::string& endpoint) {
 void MasterService::StallCleanupWaiters() {
     {
         std::lock_guard<std::mutex> lock(barrier_mutex_);
-        cleanup_stalled_ = true;
+        // Final: shutdown or a writer that reached its terminal state. Mount
+        // waiters fail from here on; no sweep or lifecycle change clears it.
+        cleanup_unrecoverable_ = true;
     }
     barrier_cv_.notify_all();
 }
@@ -2564,12 +2689,15 @@ void MasterService::RunReplicaCleanupSweep() {
         // flight; the restore itself owns the metadata transition. Mounts that
         // wait on this sweep learn it is not coming instead of waiting out the
         // budget.
-        cleanup_stalled_ = !AdmitsBusinessWorkers();
-        if (cleanup_stalled_) {
+        cleanup_gate_closed_ = !AdmitsBusinessWorkers();
+        if (cleanup_gate_closed_ || cleanup_unrecoverable_) {
             barrier_cv_.notify_all();
             return;
         }
     }
+    // A SEGMENT_UNMOUNT the writer refused can still land; retrying it may
+    // open an endpoint without any sweep.
+    FlushPendingSegmentUnmounts();
     uint64_t sweep_seq = 0;
     {
         std::lock_guard<std::mutex> lock(barrier_mutex_);
@@ -2801,21 +2929,28 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 !it->transport_endpoint.empty()) {
                 SegmentUnmountOp op{it->transport_endpoint};
                 auto bytes = struct_pack::serialize(op);
-                auto persist_result = AppendOpLogVisibleBeforeDurable(
-                    OpType::SEGMENT_UNMOUNT, TenantId::Default().value(),
-                    it->transport_endpoint,
-                    std::string(bytes.begin(), bytes.end()));
-                if (!persist_result) {
-                    LOG(ERROR)
-                        << "client_id=" << job.client_id
-                        << ", segment_name=" << it->segment_name
-                        << ", action=queue_client_offboarding_unmount"
-                        << ", error=" << toString(persist_result.error());
-                    MarkSegmentCleanupLogged(it->segment_id, false);
-                    ++it;
-                    continue;
+                std::string payload(bytes.begin(), bytes.end());
+                // The background flush may already own this token; submitting
+                // again here would append a second unmount after a later
+                // mount of the same endpoint.
+                if (TryClaimSegmentUnmount(it->segment_id,
+                                           it->transport_endpoint, payload)) {
+                    auto persist_result = AppendOpLogVisibleBeforeDurable(
+                        OpType::SEGMENT_UNMOUNT, TenantId::Default().value(),
+                        it->transport_endpoint, payload);
+                    if (!persist_result) {
+                        LOG(ERROR)
+                            << "client_id=" << job.client_id
+                            << ", segment_name=" << it->segment_name
+                            << ", action=queue_client_offboarding_unmount"
+                            << ", error=" << toString(persist_result.error());
+                        MarkSegmentCleanupLogged(it->segment_id, false);
+                        ReleaseSegmentUnmountClaim(it->segment_id);
+                        ++it;
+                        continue;
+                    }
+                    CompleteSegmentUnmountLog(it->segment_id);
                 }
-                MarkSegmentCleanupLogged(it->segment_id, true);
             } else {
                 MarkSegmentCleanupLogged(it->segment_id, true);
             }
@@ -2925,16 +3060,36 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         ErrorCode err = segment_access.PrepareUnmountSegment(
             segment_id, metrics_dec_capacity);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
-            // Return OK because this is an idempotent operation
+            // Idempotent: the segment is gone, but an earlier attempt may
+            // still owe its SEGMENT_UNMOUNT entry. Flush it before returning,
+            // otherwise the endpoint could stay closed forever.
+            FlushPendingSegmentUnmounts();
             return {};
         }
-        if (err != ErrorCode::OK) {
+        if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+            // A previous attempt prepared but did not commit. The allocator
+            // is already released and the segment is still registered as
+            // UNMOUNTING; finish the job instead of making the retry a no-op.
+            SegmentStatus status = SegmentStatus::UNDEFINED;
+            if (segment_access.GetSegmentStatusById(segment_id, status) !=
+                    ErrorCode::OK ||
+                status != SegmentStatus::UNMOUNTING) {
+                return tl::make_unexpected(err);
+            }
+            Segment pending_segment;
+            if (segment_access.GetSegment(segment_id, pending_segment)) {
+                segment_name = pending_segment.name;
+                te_endpoint = pending_segment.te_endpoint;
+                metrics_dec_capacity = pending_segment.size;
+            }
+        } else if (err != ErrorCode::OK) {
             return tl::make_unexpected(err);
-        }
-        Segment segment;
-        if (segment_access.GetSegment(segment_id, segment)) {
-            segment_name = segment.name;
-            te_endpoint = segment.te_endpoint;
+        } else {
+            Segment segment;
+            if (segment_access.GetSegment(segment_id, segment)) {
+                segment_name = segment.name;
+                te_endpoint = segment.te_endpoint;
+            }
         }
         // After a successful prepare the allocator is released and cannot be
         // restored, so the responsibility stays even if a later step fails.
@@ -2978,10 +3133,23 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     if (enable_oplog_ && ordered_oplog_writer_ && !te_endpoint.empty()) {
         SegmentUnmountOp op{te_endpoint};
         auto bytes = struct_pack::serialize(op);
-        auto persisted = PersistSegmentOpForHAOrEnqueue(
-            "UnmountSegment", OpType::SEGMENT_UNMOUNT, te_endpoint,
-            std::string(bytes.begin(), bytes.end()));
-        MarkSegmentCleanupLogged(segment_id, persisted.has_value());
+        std::string payload(bytes.begin(), bytes.end());
+        // One submitter per token: if the background flush (or an earlier
+        // attempt) already owns it, this RPC must not append a duplicate.
+        // A failed submission is retried in the background; the segment is
+        // already committed, so that retry is the only path that can complete
+        // the ordering the endpoint barrier waits on.
+        if (TryClaimSegmentUnmount(segment_id, te_endpoint, payload)) {
+            auto persisted = PersistSegmentOpForHAOrEnqueue(
+                "UnmountSegment", OpType::SEGMENT_UNMOUNT, te_endpoint,
+                payload);
+            if (persisted) {
+                CompleteSegmentUnmountLog(segment_id);
+            } else {
+                MarkSegmentCleanupLogged(segment_id, false);
+                ReleaseSegmentUnmountClaim(segment_id);
+            }
+        }
     } else {
         // No OpLog: nothing has to be ordered against the standby.
         MarkSegmentCleanupLogged(segment_id, true);
@@ -12064,6 +12232,7 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
     batch_oplog_kv_backend_ = std::move(backend);
     batch_oplog_storage_ = std::move(storage);
     ordered_oplog_writer_ = std::move(writer);
+    ordered_oplog_writer_->SetTerminalCallback(MakeComposedTerminalCallback());
     ordered_oplog_writer_->ActivateRuntimeMetrics();
     return ErrorCode::OK;
 }

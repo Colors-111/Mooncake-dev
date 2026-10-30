@@ -530,6 +530,10 @@ class MasterServiceTestPeer {
         return service_.ProcessClientOffboardingJob(job);
     }
 
+    void FlushPendingSegmentUnmounts() {
+        service_.FlushPendingSegmentUnmounts();
+    }
+
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr) {
