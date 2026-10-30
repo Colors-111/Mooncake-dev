@@ -2400,11 +2400,14 @@ TEST_F(MasterServiceHATest,
     EXPECT_FALSE(service.QuerySegmentStatusById(segment.id).has_value());
     EXPECT_EQ(metrics.get_total_mem_capacity(), baseline_capacity);
 
+    // The name is retained because the unmount is not durable yet, and the
+    // endpoint stays closed behind the cleanup barrier: the mount waits out
+    // its budget and is refused rather than opening the endpoint early.
     auto replacement = MakeSegment(segment.name, /*base=*/0x400000000);
     const UUID replacement_client = generate_uuid();
     auto blocked_mount = service.MountSegment(replacement, replacement_client);
     ASSERT_FALSE(blocked_mount.has_value());
-    EXPECT_EQ(blocked_mount.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(blocked_mount.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 
     ASSERT_TRUE(ProcessClientOffboardingForTesting(service, job));
     EXPECT_EQ(metrics.get_total_mem_capacity(), baseline_capacity);
@@ -7850,6 +7853,11 @@ TEST_F(MasterServiceHATest,
         .target_residency = WeightResidencyState::HOT,
     });
     ASSERT_TRUE(rehydrating);
+    // Hold the background sweep so the reconcile below observes one stable
+    // state (records still present, their replicas already unreadable) instead
+    // of racing the sweep that the unmount schedules.
+    auto& cleanup_worker = MasterServiceTestPeer::ReplicaCleanupWorker(service);
+    cleanup_worker.Stop();
     ASSERT_TRUE(service.UnmountSegment(segment.segment_id, segment.client_id));
     for (const auto& key : {payload_key, manifest_key}) {
         const auto readable = service.ExistKey(key, kDefaultTenant);
@@ -7872,8 +7880,134 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(degraded->metadata_generation,
               pending->fenced_metadata_generation);
     EXPECT_NE("completed", pending->message);
+    cleanup_worker.Start();
     service.StopBatchOpLogWriter();
     verify_restored(*pending);
+}
+
+// A mount on an endpoint whose previous segment has not finished its cleanup
+// waits for the sweep instead of reopening it.
+TEST_F(MasterServiceHATest, MountWaitsForTheSweepOfAReusedEndpoint) {
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id("mount_cleanup_barrier")
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallRejectOnceWriter(
+        service, std::make_shared<FakeBatchHaKvBackend>());
+    ASSERT_NE(writer, nullptr);
+
+    auto old_segment = MakeSegment("barrier_old_segment");
+    const UUID old_client = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(old_segment, old_client).has_value());
+    PutObjectOnSegment(service, old_client, "barrier_key", old_segment.name);
+
+    auto& worker = MasterServiceTestPeer::ReplicaCleanupWorker(service);
+    worker.Stop();
+    ASSERT_TRUE(service.UnmountSegment(old_segment.id, old_client).has_value());
+
+    auto new_segment = MakeSegment("barrier_new_segment");
+    new_segment.te_endpoint = old_segment.te_endpoint;
+    std::promise<tl::expected<void, ErrorCode>> mounted;
+    auto mount_result = mounted.get_future();
+    std::thread mount_thread([&] {
+        mounted.set_value(service.MountSegment(new_segment, generate_uuid()));
+    });
+
+    const auto before_sweep =
+        mount_result.wait_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(before_sweep, std::future_status::timeout);
+
+    worker.Start();
+    worker.Schedule();
+
+    const auto after_sweep = mount_result.wait_for(std::chrono::seconds(5));
+    mount_thread.join();
+    ASSERT_EQ(after_sweep, std::future_status::ready);
+    auto result = mount_result.get();
+    EXPECT_TRUE(result.has_value()) << toString(result.error());
+}
+
+// An unmount whose SEGMENT_UNMOUNT entry the writer refused cannot be ordered
+// against a later mount, so the endpoint stays closed and the mount fails
+// instead of waiting out the budget.
+TEST_F(MasterServiceHATest, MountFailsWhenTheUnmountEntryWasRejected) {
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id("mount_cleanup_rejected")
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallRejectOnceWriter(
+        service, std::make_shared<FakeBatchHaKvBackend>());
+    ASSERT_NE(writer, nullptr);
+
+    auto old_segment = MakeSegment("rejected_old_segment");
+    const UUID old_client = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(old_segment, old_client).has_value());
+    PutObjectOnSegment(service, old_client, "rejected_key", old_segment.name);
+
+    auto& worker = MasterServiceTestPeer::ReplicaCleanupWorker(service);
+    worker.Stop();
+    writer->RejectNextCommit();
+    ASSERT_TRUE(service.UnmountSegment(old_segment.id, old_client).has_value());
+
+    auto new_segment = MakeSegment("rejected_new_segment");
+    new_segment.te_endpoint = old_segment.te_endpoint;
+    const auto result = service.MountSegment(new_segment, generate_uuid());
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+    worker.Start();
+}
+
+// One endpoint can carry several segments. Reusing it needs every one of
+// them to finish, and one sweep covers them all.
+TEST_F(MasterServiceHATest, OneEndpointWaitsForEveryUnmountedSegment) {
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id("mount_cleanup_shared_endpoint")
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallRejectOnceWriter(
+        service, std::make_shared<FakeBatchHaKvBackend>());
+    ASSERT_NE(writer, nullptr);
+
+    auto first = MakeSegment("shared_endpoint_first");
+    auto second = MakeSegment("shared_endpoint_second", /*base=*/0x400000000);
+    second.te_endpoint = first.te_endpoint;
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(first, client_id).has_value());
+    ASSERT_TRUE(service.MountSegment(second, client_id).has_value());
+    PutObjectOnSegment(service, client_id, "shared_endpoint_key", first.name);
+
+    auto& worker = MasterServiceTestPeer::ReplicaCleanupWorker(service);
+    worker.Stop();
+    ASSERT_TRUE(service.UnmountSegment(first.id, client_id).has_value());
+    ASSERT_TRUE(service.UnmountSegment(second.id, client_id).has_value());
+
+    auto replacement = MakeSegment("shared_endpoint_replacement");
+    replacement.te_endpoint = first.te_endpoint;
+    std::promise<tl::expected<void, ErrorCode>> mounted;
+    auto mount_result = mounted.get_future();
+    std::thread mount_thread([&] {
+        mounted.set_value(service.MountSegment(replacement, generate_uuid()));
+    });
+
+    const auto before_sweep =
+        mount_result.wait_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(before_sweep, std::future_status::timeout);
+
+    worker.Start();
+    worker.Schedule();
+
+    const auto after_sweep = mount_result.wait_for(std::chrono::seconds(5));
+    mount_thread.join();
+    ASSERT_EQ(after_sweep, std::future_status::ready);
+    auto result = mount_result.get();
+    EXPECT_TRUE(result.has_value()) << toString(result.error());
 }
 
 }  // namespace mooncake::test

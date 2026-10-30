@@ -1188,9 +1188,12 @@ class MasterService {
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
-    void ClearInvalidHandles();
+    // Fails when any cleanup entry could not be persisted; callers that gate
+    // on a completed sweep (the segment cleanup barrier) must not treat a
+    // partial sweep as done.
+    tl::expected<void, ErrorCode> ClearInvalidHandles();
     // Caller owns master_state_mutex_ (shared) while metadata is swept.
-    void ClearInvalidHandles(
+    tl::expected<void, ErrorCode> ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
     // every tenant. Owner-targeted on purpose: a liveness-complement sweep
@@ -1206,6 +1209,53 @@ class MasterService {
     // handles stale table-wide.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
+
+    // Mount admission barrier for reused transfer endpoints, active with HA
+    // and the OpLog. A segment's endpoint stays closed to new mounts until the
+    // unmount that invalidated it has both enqueued its SEGMENT_UNMOUNT and
+    // been covered by a successful stale-handle sweep. Without that, the
+    // standby can still carry descriptors of the old segment on that endpoint
+    // when the new one mounts, and a promotion would bind them to it.
+    //
+    // One responsibility per segment: the same endpoint can carry several
+    // segments over time, and one unmount completing must not release the
+    // others. `outstanding` counts what is left for an endpoint.
+    struct EndpointCleanup {
+        UUID segment_id;
+        std::string endpoint;
+        uint64_t seq{0};
+        bool unmount_logged{false};
+        bool swept{false};
+    };
+    struct EndpointCleanupState {
+        size_t outstanding{0};
+    };
+    // The client does not retry a failed initial MountSegment, so the mount
+    // waits; the budget bounds that wait and is kept well below the client's
+    // RPC timeout. A mount that gives up never mounts.
+    static constexpr std::chrono::milliseconds kMountCleanupWaitBudget{3000};
+    static constexpr std::chrono::milliseconds kMountCleanupWaitSlice{100};
+    static constexpr std::chrono::milliseconds kReplicaCleanupRetryDelay{1000};
+
+    bool CleanupBarrierEnabled() const;
+    // Records the responsibility. The caller holds the segment lock that
+    // ordered the invalidation (PrepareUnmountSegment already released the
+    // allocator), so a sweep that takes its sequence afterwards sees it.
+    void PublishSegmentCleanup(const UUID& segment_id,
+                               const std::string& endpoint);
+    void MarkSegmentCleanupLogged(const UUID& segment_id, bool logged);
+    void MarkCleanupSwept(
+        uint64_t sweep_seq,
+        const std::unordered_set<UUID, boost::hash<UUID>>* tokens);
+    // Caller holds barrier_mutex_.
+    bool EndpointCleanupPendingLocked(const std::string& endpoint) const;
+    void MaybeClearCleanupLocked();
+    // True when the endpoint is clear, false when the wait gave up (a sweep
+    // that cannot run, or the budget exhausted).
+    bool WaitForEndpointCleanup(const std::string& endpoint);
+    void RunReplicaCleanupSweep();
+    void StallCleanupWaiters();
+
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
@@ -1590,6 +1640,19 @@ class MasterService {
     BackgroundWorker replica_cleanup_worker_;
     const bool enable_async_segment_cleanup_;
 
+    // Segment cleanup barrier state, guarded by barrier_mutex_ (see
+    // EndpointCleanup). Published under the segment lock, so a sweep that
+    // takes barrier_seq_ after a publication always sees the invalidation.
+    std::mutex barrier_mutex_;
+    std::condition_variable barrier_cv_;
+    uint64_t barrier_seq_{0};
+    std::unordered_map<UUID, EndpointCleanup, boost::hash<UUID>>
+        pending_cleanup_;
+    std::unordered_map<std::string, EndpointCleanupState> pending_by_endpoint_;
+    // Set while the sweep cannot run (stopping or the lifecycle gate is
+    // closed), so mount waiters fail instead of waiting out the budget.
+    bool cleanup_stalled_{false};
+
     /**
      * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an
      * task into the holder client's LocalSSD mailbox.
@@ -1642,9 +1705,9 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                 // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;             // in range [0.0, 1.0]
+    const double eviction_ratio_;                     // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
     // Memory eviction (see eviction::Evictor) and what it is built from: the
@@ -2382,20 +2445,24 @@ class MasterService {
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**
-     * Segment lifecycle persist helper. Tries to durably persist the
+     * Segment lifecycle persist helper. Tries to enqueue the
      * SEGMENT_MOUNT / SEGMENT_UNMOUNT entry up-front; on failure enqueues
      * the same OpLogEntry (with its already-allocated sequence_id) for
      * background retry so the standby segment registry eventually
      * converges. Suitable for paths where the local segment commit has
      * already happened (UnmountSegment) and rolling back is impossible.
+     *
+     * The result reports whether the entry was accepted by the writer, not
+     * whether it is durable. The segment cleanup barrier needs that
+     * distinction: order in the log follows the enqueue, durability does not
+     * gate the standby's apply order either way.
      */
-    void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                        const std::string& key,
-                                        const std::string& payload);
-    void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                        const TenantId& tenant_id,
-                                        const std::string& key,
-                                        const std::string& payload);
+    tl::expected<void, ErrorCode> PersistSegmentOpForHAOrEnqueue(
+        const char* why, OpType type, const std::string& key,
+        const std::string& payload);
+    tl::expected<void, ErrorCode> PersistSegmentOpForHAOrEnqueue(
+        const char* why, OpType type, const TenantId& tenant_id,
+        const std::string& key, const std::string& payload);
 
     /**
      * Helper to persist REMOVE OpLog for a key with strong-consistency.

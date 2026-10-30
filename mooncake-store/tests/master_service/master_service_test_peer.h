@@ -416,11 +416,13 @@ class MasterServiceTestPeer {
         service_.ClearLocalDiskHandlesOwnedBy(owner);
     }
 
-    void ClearInvalidHandles() { service_.ClearInvalidHandles(); }
+    tl::expected<void, ErrorCode> ClearInvalidHandles() {
+        return service_.ClearInvalidHandles();
+    }
 
-    void ClearInvalidHandles(
+    tl::expected<void, ErrorCode> ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
-        service_.ClearInvalidHandles(retaining_clients);
+        return service_.ClearInvalidHandles(retaining_clients);
     }
 
     void DiscardExpiredProcessingReplicas(

@@ -401,14 +401,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
                       << ", error=" << toString(result.error());
               }
           }),
-      replica_cleanup_worker_([this] {
-          // RFC #4700 slice 1: no metadata sweep while a promotion restore
-          // is in flight; the restore itself owns the metadata transition.
-          if (AdmitsBusinessWorkers()) {
-              ClearInvalidHandles();
-          }
-      }),
-      enable_async_segment_cleanup_(!config.enable_ha && !config.enable_cxl),
+      replica_cleanup_worker_([this] { RunReplicaCleanupSweep(); }),
+      // HA defers the sweep too: the segment cleanup barrier keeps a reused
+      // endpoint closed until the sweep has covered the invalidation, so the
+      // unmount RPC no longer has to scan the whole metadata itself. CXL
+      // keeps the synchronous sweep: its buffers are not unreadable the way a
+      // released memory allocator's are.
+      enable_async_segment_cleanup_(!config.enable_cxl),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
@@ -835,6 +834,7 @@ MasterService::~MasterService() {
         ordered_oplog_writer_->Stop();
     }
     graceful_unmount_scheduler_.Stop();
+    StallCleanupWaiters();
     replica_cleanup_worker_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
@@ -921,48 +921,86 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
-    {
-        std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
-        auto [record_it, inserted] = client_liveness_records_.try_emplace(
-            client_id, std::make_shared<ClientLivenessRecord>(
-                           ClientLivenessRecord::Clock::now()));
-        const auto record = record_it->second;
-        if (inserted) {
-            MasterMetricManager::instance().client_liveness_record_created();
+    // A mount on an endpoint whose previous segment has not finished its
+    // cleanup waits here, outside every lock the sweep needs, and retries the
+    // admission once the endpoint is clear. The check and the mount share one
+    // ScopedSegmentAccess, so a publication cannot slip between them; if one
+    // does, the loop simply waits again.
+    for (;;) {
+        bool cleanup_pending = false;
+        bool cleanup_blocked = false;
+        {
+            std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+            auto [record_it, inserted] = client_liveness_records_.try_emplace(
+                client_id, std::make_shared<ClientLivenessRecord>(
+                               ClientLivenessRecord::Clock::now()));
+            const auto record = record_it->second;
+            if (inserted) {
+                MasterMetricManager::instance()
+                    .client_liveness_record_created();
+            }
+            const auto observation =
+                record->ObserveAndRun(ClientLivenessRecord::Clock::now(), [&] {
+                    std::shared_lock<std::shared_mutex> snapshot_lock(
+                        master_state_mutex_);
+                    ScopedSegmentAccess segment_access =
+                        segment_manager_.getSegmentAccess();
+                    {
+                        std::lock_guard<std::mutex> barrier_lock(
+                            barrier_mutex_);
+                        if (cleanup_stalled_) {
+                            cleanup_blocked = true;
+                            return true;
+                        }
+                        if (EndpointCleanupPendingLocked(segment.te_endpoint)) {
+                            cleanup_pending = true;
+                            return true;
+                        }
+                    }
+                    LOG(INFO) << "client_id=" << client_id
+                              << ", action=mount_segment, segment_name="
+                              << segment.name;
+                    mount_result =
+                        segment_access.MountSegment(segment, client_id, record);
+                    return mount_result == ErrorCode::OK ||
+                           mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS;
+                });
+            if (observation == ClientLivenessObservation::REJECTED_OFFLINE) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+            if (cleanup_blocked) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+            if (!cleanup_pending) {
+                if (mount_result != ErrorCode::OK &&
+                    mount_result != ErrorCode::SEGMENT_ALREADY_EXISTS) {
+                    if (inserted) {
+                        client_liveness_records_.erase(client_id);
+                        MasterMetricManager::instance()
+                            .on_client_liveness_record_removed(
+                                ClientLivenessState::ACTIVE);
+                    }
+                    return tl::make_unexpected(mount_result);
+                }
+                if (observation ==
+                    ClientLivenessObservation::RECOVERED_ACTIVE) {
+                    MasterMetricManager::instance().client_liveness_recovered();
+                    LOG(INFO) << "client_id=" << client_id
+                              << ", action=client_liveness_recovered, "
+                                 "signal=memory_mount";
+                }
+                break;
+            }
         }
-        const auto observation =
-            record->ObserveAndRun(ClientLivenessRecord::Clock::now(), [&] {
-                std::shared_lock<std::shared_mutex> snapshot_lock(
-                    master_state_mutex_);
-                ScopedSegmentAccess segment_access =
-                    segment_manager_.getSegmentAccess();
-                LOG(INFO) << "client_id=" << client_id
-                          << ", action=mount_segment, segment_name="
-                          << segment.name;
-                mount_result =
-                    segment_access.MountSegment(segment, client_id, record);
-                return mount_result == ErrorCode::OK ||
-                       mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS;
-            });
-        if (observation == ClientLivenessObservation::REJECTED_OFFLINE) {
+        if (!WaitForEndpointCleanup(segment.te_endpoint)) {
+            LOG(WARNING)
+                << "client_id=" << client_id
+                << ", action=mount_segment_cleanup_pending, segment_name="
+                << segment.name;
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        }
-        if (mount_result != ErrorCode::OK &&
-            mount_result != ErrorCode::SEGMENT_ALREADY_EXISTS) {
-            if (inserted) {
-                client_liveness_records_.erase(client_id);
-                MasterMetricManager::instance()
-                    .on_client_liveness_record_removed(
-                        ClientLivenessState::ACTIVE);
-            }
-            return tl::make_unexpected(mount_result);
-        }
-        if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {
-            MasterMetricManager::instance().client_liveness_recovered();
-            LOG(INFO) << "client_id=" << client_id
-                      << ", action=client_liveness_recovered, "
-                         "signal=memory_mount";
         }
     }
 
@@ -975,9 +1013,9 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         op.is_memory_segment = true;
         op.file_path.clear();
         auto bytes = struct_pack::serialize(op);
-        PersistSegmentOpForHAOrEnqueue("MountSegment", OpType::SEGMENT_MOUNT,
-                                       segment.te_endpoint,
-                                       std::string(bytes.begin(), bytes.end()));
+        (void)PersistSegmentOpForHAOrEnqueue(
+            "MountSegment", OpType::SEGMENT_MOUNT, segment.te_endpoint,
+            std::string(bytes.begin(), bytes.end()));
     }
     if (mount_result == ErrorCode::OK) {
         UpdateClientHostId(client_id, segment.host_id);
@@ -1142,8 +1180,24 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     segment_access.GetAllocator(segments[i].id) != nullptr;
             }
 
-            remount_error =
-                segment_access.ReMountSegment(segments, client_id, record);
+            // Remount comes from the heartbeat, which retries; do not wait
+            // here. The check shares the segment access with the remount, so
+            // an endpoint whose cleanup is still outstanding cannot be
+            // reopened in this window.
+            {
+                std::lock_guard<std::mutex> barrier_lock(barrier_mutex_);
+                for (const auto& segment : segments) {
+                    if (EndpointCleanupPendingLocked(segment.te_endpoint)) {
+                        remount_error =
+                            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+                        break;
+                    }
+                }
+            }
+            if (remount_error == ErrorCode::OK) {
+                remount_error =
+                    segment_access.ReMountSegment(segments, client_id, record);
+            }
             if (remount_error == ErrorCode::OK) {
                 segment_access.BindClientLiveness(client_id, record);
                 for (const auto& segment : segments) {
@@ -1372,7 +1426,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             op.is_memory_segment = true;
             op.file_path.clear();
             auto bytes = struct_pack::serialize(op);
-            PersistSegmentOpForHAOrEnqueue(
+            (void)PersistSegmentOpForHAOrEnqueue(
                 "ReMountSegment", OpType::SEGMENT_MOUNT, seg.name,
                 std::string(bytes.begin(), bytes.end()));
         }
@@ -2355,17 +2409,17 @@ void MasterService::CleanupExpiredSoftPins(
     }
 }
 
-void MasterService::ClearInvalidHandles() {
+tl::expected<void, ErrorCode> MasterService::ClearInvalidHandles() {
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
-    ClearInvalidHandles(retaining_clients);
+    return ClearInvalidHandles(retaining_clients);
 }
 
-void MasterService::ClearInvalidHandles(
+tl::expected<void, ErrorCode> MasterService::ClearInvalidHandles(
     const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
-    (void)ClearStaleHandles([&retaining_clients](const Replica& replica) {
+    return ClearStaleHandles([&retaining_clients](const Replica& replica) {
         return (replica.has_invalid_mem_handle() ||
                 replica.has_invalid_nof_handle() ||
                 replica.has_stale_local_disk_client(retaining_clients)) &&
@@ -2378,6 +2432,157 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
         return replica.is_local_disk_replica() && replica.is_completed() &&
                replica.get_local_disk_client_id() == owner;
     });
+}
+
+bool MasterService::CleanupBarrierEnabled() const {
+    return enable_ha_ && enable_oplog_ && ordered_oplog_writer_ != nullptr;
+}
+
+void MasterService::PublishSegmentCleanup(const UUID& segment_id,
+                                          const std::string& endpoint) {
+    if (!CleanupBarrierEnabled()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(barrier_mutex_);
+    auto [it, inserted] = pending_cleanup_.try_emplace(segment_id);
+    if (!inserted) {
+        // A repeated prepare of one segment owns the responsibility already.
+        return;
+    }
+    it->second.segment_id = segment_id;
+    it->second.endpoint = endpoint;
+    it->second.seq = ++barrier_seq_;
+    ++pending_by_endpoint_[endpoint].outstanding;
+}
+
+void MasterService::MarkSegmentCleanupLogged(const UUID& segment_id,
+                                             bool logged) {
+    std::lock_guard<std::mutex> lock(barrier_mutex_);
+    auto it = pending_cleanup_.find(segment_id);
+    if (it == pending_cleanup_.end()) {
+        return;
+    }
+    if (!logged) {
+        // The unmount entry was not accepted, so the standby cannot be
+        // brought back in step yet. Keep the responsibility (a sweep must not
+        // clear it) without closing the endpoint forever: the unmount RPC or
+        // the offboarding job retries, and that retry publishes the entry.
+        LOG(WARNING) << "segment_id=" << segment_id
+                     << ", endpoint=" << it->second.endpoint
+                     << ", error=segment_unmount_log_rejected";
+    } else {
+        it->second.unmount_logged = true;
+        MaybeClearCleanupLocked();
+    }
+    barrier_cv_.notify_all();
+}
+
+void MasterService::MarkCleanupSwept(
+    uint64_t sweep_seq,
+    const std::unordered_set<UUID, boost::hash<UUID>>* tokens) {
+    std::lock_guard<std::mutex> lock(barrier_mutex_);
+    for (auto& [segment_id, cleanup] : pending_cleanup_) {
+        if (tokens != nullptr && !tokens->contains(segment_id)) {
+            continue;
+        }
+        // A sweep that took its sequence before the publication cannot have
+        // observed the invalidation, even if it happened to walk the object.
+        if (cleanup.seq < sweep_seq) {
+            cleanup.swept = true;
+        }
+    }
+    MaybeClearCleanupLocked();
+    barrier_cv_.notify_all();
+}
+
+bool MasterService::EndpointCleanupPendingLocked(
+    const std::string& endpoint) const {
+    auto it = pending_by_endpoint_.find(endpoint);
+    return it != pending_by_endpoint_.end() && it->second.outstanding > 0;
+}
+
+void MasterService::MaybeClearCleanupLocked() {
+    for (auto it = pending_cleanup_.begin(); it != pending_cleanup_.end();) {
+        const auto& cleanup = it->second;
+        if (!cleanup.unmount_logged || !cleanup.swept) {
+            ++it;
+            continue;
+        }
+        auto endpoint_it = pending_by_endpoint_.find(cleanup.endpoint);
+        if (endpoint_it != pending_by_endpoint_.end()) {
+            if (endpoint_it->second.outstanding > 0) {
+                --endpoint_it->second.outstanding;
+            }
+            if (endpoint_it->second.outstanding == 0) {
+                pending_by_endpoint_.erase(endpoint_it);
+            }
+        }
+        it = pending_cleanup_.erase(it);
+    }
+}
+
+bool MasterService::WaitForEndpointCleanup(const std::string& endpoint) {
+    if (!CleanupBarrierEnabled()) {
+        return true;
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + kMountCleanupWaitBudget;
+    std::unique_lock<std::mutex> lock(barrier_mutex_);
+    for (;;) {
+        if (!EndpointCleanupPendingLocked(endpoint)) {
+            return true;
+        }
+        if (cleanup_stalled_) {
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            LOG(WARNING) << "endpoint=" << endpoint
+                         << ", action=mount_cleanup_wait_exhausted";
+            return false;
+        }
+        barrier_cv_.wait_for(
+            lock,
+            std::min(kMountCleanupWaitSlice,
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         deadline - now)));
+    }
+}
+
+void MasterService::StallCleanupWaiters() {
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex_);
+        cleanup_stalled_ = true;
+    }
+    barrier_cv_.notify_all();
+}
+
+void MasterService::RunReplicaCleanupSweep() {
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex_);
+        // RFC #4700 slice 1: no metadata sweep while a promotion restore is in
+        // flight; the restore itself owns the metadata transition. Mounts that
+        // wait on this sweep learn it is not coming instead of waiting out the
+        // budget.
+        cleanup_stalled_ = !AdmitsBusinessWorkers();
+        if (cleanup_stalled_) {
+            barrier_cv_.notify_all();
+            return;
+        }
+    }
+    uint64_t sweep_seq = 0;
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex_);
+        sweep_seq = ++barrier_seq_;
+    }
+    auto swept = ClearInvalidHandles();
+    if (swept) {
+        MarkCleanupSwept(sweep_seq, nullptr);
+        return;
+    }
+    LOG(WARNING) << "replica cleanup sweep failed, retrying, err="
+                 << static_cast<int>(swept.error());
+    replica_cleanup_worker_.ScheduleAfter(kReplicaCleanupRetryDelay);
 }
 
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
@@ -2485,6 +2690,10 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                          .segment_name = it->segment_name,
                          .transport_endpoint = it->transport_endpoint,
                          .metrics_dec_capacity = metrics_dec_capacity});
+                    // Same responsibility the unmount RPC publishes, under
+                    // the segment lock that ordered the invalidation.
+                    PublishSegmentCleanup(it->segment_id,
+                                          it->transport_endpoint);
                     it = job.pending_prepare_segments.erase(it);
                     continue;
                 }
@@ -2504,6 +2713,18 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         }
 
         if (!job.metadata_cleanup_accepted) {
+            // This job's sweep only covers the segments it prepared itself. It
+            // cannot stand in for the global sweep other endpoints wait on, so
+            // it reports its own tokens only.
+            std::unordered_set<UUID, boost::hash<UUID>> sweep_tokens;
+            for (const auto& prepared : job.prepared_segments) {
+                sweep_tokens.insert(prepared.segment_id);
+            }
+            uint64_t sweep_seq = 0;
+            {
+                std::lock_guard<std::mutex> barrier_lock(barrier_mutex_);
+                sweep_seq = ++barrier_seq_;
+            }
             const auto cleanup_result =
                 ClearStaleHandles([&job](const Replica& replica) {
                     if (!replica.is_completed()) {
@@ -2522,6 +2743,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                            << ", error=" << toString(cleanup_result.error());
                 return false;
             }
+            MarkCleanupSwept(sweep_seq, &sweep_tokens);
             bool unfinished_affiliated_replica = false;
             VisitNamespaces([&](const TenantId& /*tenant_id*/,
                                 metadata::Namespace& ns) {
@@ -2589,9 +2811,13 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                         << ", segment_name=" << it->segment_name
                         << ", action=queue_client_offboarding_unmount"
                         << ", error=" << toString(persist_result.error());
+                    MarkSegmentCleanupLogged(it->segment_id, false);
                     ++it;
                     continue;
                 }
+                MarkSegmentCleanupLogged(it->segment_id, true);
+            } else {
+                MarkSegmentCleanupLogged(it->segment_id, true);
             }
 
             cleanupHttpMetadata(it->segment_name);
@@ -2687,7 +2913,12 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
-    // 1. Prepare to unmount the segment by deleting its allocator
+    // 1. Prepare to unmount the segment by deleting its allocator. The
+    // endpoint is read here, under the same segment lock that orders the
+    // invalidation, so a later mount cannot slip in before the cleanup
+    // responsibility is published.
+    std::string segment_name;
+    std::string te_endpoint;
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
@@ -2700,23 +2931,37 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         if (err != ErrorCode::OK) {
             return tl::make_unexpected(err);
         }
+        Segment segment;
+        if (segment_access.GetSegment(segment_id, segment)) {
+            segment_name = segment.name;
+            te_endpoint = segment.te_endpoint;
+        }
+        // After a successful prepare the allocator is released and cannot be
+        // restored, so the responsibility stays even if a later step fails.
+        PublishSegmentCleanup(segment_id, te_endpoint);
     }
 
-    // Keep HA, snapshot, and CXL behavior unchanged. Regular memory segments
-    // become unreadable as soon as PrepareUnmountSegment releases their
-    // allocator; only the physical metadata sweep is deferred.
+    // 2. Sweep the metadata that pointed at the released allocator. With a
+    // cleanup barrier the RPC no longer pays for the whole scan: the worker
+    // runs it and keeps this endpoint closed to new mounts until it lands.
+    // CXL keeps the synchronous sweep (its buffers are not invalidated the
+    // same way).
     if (enable_async_segment_cleanup_) {
         replica_cleanup_worker_.Schedule();
     } else {
-        ClearInvalidHandles(retaining_clients);
-    }
-
-    // Cache endpoint before commit removes segment from registry.
-    std::string segment_name;
-    std::string te_endpoint;
-    if (!segment_manager_.GetSegmentBasicInfo(segment_id, segment_name,
-                                              te_endpoint)) {
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        uint64_t sweep_seq = 0;
+        {
+            std::lock_guard<std::mutex> barrier_lock(barrier_mutex_);
+            sweep_seq = ++barrier_seq_;
+        }
+        auto swept = ClearInvalidHandles(retaining_clients);
+        if (swept) {
+            MarkCleanupSwept(sweep_seq, nullptr);
+        } else {
+            LOG(WARNING) << "segment_id=" << segment_id
+                         << ", error=unmount_sweep_failed, err="
+                         << static_cast<int>(swept.error());
+        }
     }
 
     // 3. Commit the unmount operation
@@ -2733,9 +2978,13 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     if (enable_oplog_ && ordered_oplog_writer_ && !te_endpoint.empty()) {
         SegmentUnmountOp op{te_endpoint};
         auto bytes = struct_pack::serialize(op);
-        PersistSegmentOpForHAOrEnqueue("UnmountSegment",
-                                       OpType::SEGMENT_UNMOUNT, te_endpoint,
-                                       std::string(bytes.begin(), bytes.end()));
+        auto persisted = PersistSegmentOpForHAOrEnqueue(
+            "UnmountSegment", OpType::SEGMENT_UNMOUNT, te_endpoint,
+            std::string(bytes.begin(), bytes.end()));
+        MarkSegmentCleanupLogged(segment_id, persisted.has_value());
+    } else {
+        // No OpLog: nothing has to be ordered against the standby.
+        MarkSegmentCleanupLogged(segment_id, true);
     }
     NotifyPolicyCapacityChanged();
     return {};
@@ -11962,24 +12211,25 @@ tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
     return {};
 }
 
-void MasterService::PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                                   const std::string& key,
-                                                   const std::string& payload) {
-    PersistSegmentOpForHAOrEnqueue(why, type, TenantId::Default(), key,
-                                   payload);
+tl::expected<void, ErrorCode> MasterService::PersistSegmentOpForHAOrEnqueue(
+    const char* why, OpType type, const std::string& key,
+    const std::string& payload) {
+    return PersistSegmentOpForHAOrEnqueue(why, type, TenantId::Default(), key,
+                                          payload);
 }
 
-void MasterService::PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                                   const TenantId& tenant_id,
-                                                   const std::string& key,
-                                                   const std::string& payload) {
+tl::expected<void, ErrorCode> MasterService::PersistSegmentOpForHAOrEnqueue(
+    const char* why, OpType type, const TenantId& tenant_id,
+    const std::string& key, const std::string& payload) {
     auto result =
         AppendOpLogVisibleBeforeDurable(type, tenant_id.value(), key, payload);
     if (!result) {
         LOG(WARNING) << why << ": segment OpLog queue failed for key=" << key
                      << ", type=" << static_cast<int>(type)
                      << ", err=" << static_cast<int>(result.error());
+        return tl::make_unexpected(result.error());
     }
+    return {};
 }
 
 std::vector<Replica::Descriptor>
