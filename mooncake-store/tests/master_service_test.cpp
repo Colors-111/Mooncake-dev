@@ -4437,6 +4437,124 @@ TEST_F(MasterServiceTest,
 }
 
 TEST_F(MasterServiceTest,
+       ClientOffboardingDropsTheProcessingReplicaItsPreparationInvalidates) {
+    MasterService service;
+    auto segment = MakeSegment("offboarding_processing_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = segment.name;
+    const std::string key = "offboarding_processing_key";
+    ASSERT_TRUE(
+        service.PutStart(client_id, key, TenantId::Default(), 1024, config)
+            .has_value());
+
+    // The production path: retiring the session prepares the client's
+    // segments and publishes their cleanup responsibility before the job
+    // runs (see OnClientSessionChanged), so the job starts with the prepared
+    // segment in hand.
+    auto job = MasterServiceTestPeer(service).BuildClientOffboardingJob(
+        client_id, FindClientLivenessForTest(service, client_id));
+    ASSERT_EQ(1u, job.prepared_segments.size());
+
+    // Preparing the segment invalidated its only replica, so the PROCESSING
+    // marker is not something the job waits for: no later attempt could make
+    // it readable, and the sweep drops the object. Waiting on it would only
+    // cost a retry.
+    ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
+    EXPECT_TRUE(job.metadata_cleanup_accepted);
+    EXPECT_TRUE(job.prepared_segments.empty());
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        &service, MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                      key, TenantId::Default()));
+    EXPECT_FALSE(accessor.IsPublished());
+}
+
+TEST_F(MasterServiceTest,
+       ClientOffboardingDoesNotWaitForAProcessingReplicaItDrops) {
+    MasterService service;
+    auto segment = MakeSegment("offboarding_drop_processing_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = segment.name;
+    const std::string key = "offboarding_drop_processing_key";
+    ASSERT_TRUE(
+        service.PutStart(client_id, key, TenantId::Default(), 1024, config)
+            .has_value());
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.retired_session = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.retired_session);
+
+    // Preparing the segment invalidates the only replica, so this attempt
+    // drops the object outright. Its PROCESSING marker is not something the
+    // job should wait for: no later attempt could ever see it again.
+    ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
+    EXPECT_TRUE(job.metadata_cleanup_accepted);
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        &service, MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                      key, TenantId::Default()));
+    EXPECT_FALSE(accessor.IsPublished());
+}
+
+TEST_F(MasterServiceTest,
+       ClientOffboardingWithoutOplogWaitsForTheProcessingReplicaItKeeps) {
+    // HA without an OpLog: the sweep cannot erase the object and has no
+    // REMOVE to enqueue, so the background reaper keeps it. The job must
+    // still wait for its PROCESSING replica instead of accepting cleanup.
+    auto config = MasterServiceConfig::builder().set_enable_ha(true).build();
+    MasterService service(config);
+    auto segment = MakeSegment("offboarding_ha_no_oplog_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig put_config;
+    put_config.replica_num = 1;
+    put_config.preferred_segment = segment.name;
+    const std::string key = "offboarding_ha_no_oplog_key";
+    ASSERT_TRUE(
+        service.PutStart(client_id, key, TenantId::Default(), 1024, put_config)
+            .has_value());
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.retired_session = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.retired_session);
+
+    ASSERT_FALSE(ProcessClientOffboardingForTest(service, job));
+    EXPECT_FALSE(job.metadata_cleanup_accepted);
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        &service, MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                      key, TenantId::Default()));
+    EXPECT_TRUE(accessor.IsPublished());
+    EXPECT_TRUE(accessor.Get().HasReplica(&Replica::fn_is_processing));
+}
+
+TEST_F(MasterServiceTest, ClearStaleHandlesVisitsEveryObjectExactlyOnce) {
+    MasterService service;
+    auto segment = MakeSegment("stale_visit_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    (void)PutObjectOnSegment(service, client_id, segment.name);
+    (void)PutObjectOnSegment(service, client_id, segment.name);
+
+    size_t visits = 0;
+    auto count_visited = [&visits](const auto&) { ++visits; };
+    auto result = MasterServiceTestPeer(service).ClearStaleHandles(
+        [](const Replica&) { return false; }, count_visited);
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    // The visitor rides on the read pass the sweep already performs: one call
+    // per object, no second walk.
+    EXPECT_EQ(visits, 2u);
+}
+
+TEST_F(MasterServiceTest,
        ClientOffboardingKeepsPreparedResidualWithoutRepreparingIt) {
     MasterService service;
     const UUID client_id = generate_uuid();

@@ -1178,8 +1178,16 @@ class MasterService {
     // tenant is first read to pick the objects that match, and only those are
     // cleaned, each under its own write lock, since a mass client expiry marks
     // handles stale table-wide.
+    //
+    // on_visited, when set, runs once per object during that read pass, under
+    // the stripe's shared lock. It lets a caller fold its own per-object
+    // question into the pass it already pays for instead of scanning again
+    // (client offboarding asks whether a PROCESSING replica of the offboarded
+    // client is still around). It must be cheap, must not take a lock, block,
+    // or throw, and must not rely on the object surviving the sweep.
     tl::expected<void, ErrorCode> ClearStaleHandles(
-        const std::function<bool(const Replica&)>& is_stale);
+        const std::function<bool(const Replica&)>& is_stale,
+        const std::function<void(const ObjectMetadata&)>& on_visited = {});
 
     // Mount admission barrier for reused transfer endpoints, active with HA
     // and the OpLog. A segment's endpoint stays closed to new mounts until the
@@ -1247,6 +1255,12 @@ class MasterService {
                                 std::chrono::steady_clock::time_point deadline);
     void RunReplicaCleanupSweep();
     void StallCleanupWaiters();
+
+    // Prepares what a retired client's segments need and publishes each
+    // prepared segment's cleanup responsibility. The session listener calls
+    // this before scheduling the job; tests drive the same function.
+    ClientOffboardingJob BuildClientOffboardingJob(
+        const UUID& client_id, const ClientSessionSharedPtr& session);
 
     void OnClientSessionChanged(const ClientSessionEvent& event);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);

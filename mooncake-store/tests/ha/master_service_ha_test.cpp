@@ -8238,11 +8238,7 @@ TEST_F(MasterServiceHATest,
 
     ClientOffboardingJob job;
     job.client_id = old_client;
-    job.liveness = liveness;
-    job.pending_prepare_segments.push_back(
-        {.segment_id = old_segment.id,
-         .segment_name = old_segment.name,
-         .transport_endpoint = old_segment.te_endpoint});
+    job.retired_session = liveness;
 
     auto& worker = MasterServiceTestPeer::ReplicaCleanupWorker(service);
     worker.Stop();
@@ -8348,11 +8344,7 @@ TEST_F(MasterServiceHATest, RpcKeepsItsStateWhenAnotherSubmitterLogsFirst) {
 
     ClientOffboardingJob job;
     job.client_id = old_client;
-    job.liveness = liveness;
-    job.pending_prepare_segments.push_back(
-        {.segment_id = old_segment.id,
-         .segment_name = old_segment.name,
-         .transport_endpoint = old_segment.te_endpoint});
+    job.retired_session = liveness;
 
     auto& worker = MasterServiceTestPeer::ReplicaCleanupWorker(service);
     worker.Stop();

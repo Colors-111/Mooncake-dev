@@ -2499,11 +2499,53 @@ void MasterService::OnClientSessionChanged(const ClientSessionEvent& event) {
             return pending.client_id == client_id;
         });
     // Only the job's completion removes the OFFLINE session and lifts the
-    // snapshot barrier.
+    // snapshot barrier. Preparing the segments here publishes their cleanup
+    // responsibility while the segment lock that ordered the invalidation is
+    // still the one that saw it, so a reused endpoint cannot be mounted
+    // before the barrier records why it must wait.
+    ClientOffboardingJob job =
+        BuildClientOffboardingJob(client_id, event.session);
+    client_offboarding_worker_.Schedule(std::move(job));
+}
+
+ClientOffboardingJob MasterService::BuildClientOffboardingJob(
+    const UUID& client_id, const ClientSessionSharedPtr& session) {
     ClientOffboardingJob job;
     job.client_id = client_id;
-    job.retired_session = event.session;
-    client_offboarding_worker_.Schedule(std::move(job));
+    job.retired_session = session;
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<Segment> segments;
+    if (segment_access.GetClientSegments(client_id, segments) != ErrorCode::OK) {
+        return job;
+    }
+    for (const auto& segment : segments) {
+        size_t metrics_dec_capacity = 0;
+        const auto prepare_result = segment_access.PrepareUnmountSegment(
+            segment.id, metrics_dec_capacity);
+        if (prepare_result == ErrorCode::OK) {
+            // Publish under the same segment lock that ordered the
+            // invalidation: the job may not run for a while, and until this
+            // responsibility is covered no new segment may mount on the
+            // endpoint. The job keeps the submission state for its retries.
+            auto unmount_log =
+                PublishSegmentCleanup(segment.id, segment.te_endpoint);
+            job.prepared_segments.push_back(
+                {.segment_id = segment.id,
+                 .segment_name = segment.name,
+                 .transport_endpoint = segment.te_endpoint,
+                 .metrics_dec_capacity = metrics_dec_capacity,
+                 .unmount_log = std::move(unmount_log)});
+        } else if (prepare_result != ErrorCode::SEGMENT_NOT_FOUND) {
+            // An existing unmount, or one this job will retry through its own
+            // per-attempt preparation loop.
+            LOG(ERROR) << "client_id=" << client_id
+                       << ", segment_name=" << segment.name
+                       << ", action=prepare_client_offboarding"
+                       << ", error=" << toString(prepare_result);
+        }
+    }
+    return job;
 }
 
 tl::expected<void, ErrorCode> MasterService::ClearInvalidHandles() {
@@ -2808,7 +2850,8 @@ void MasterService::RunReplicaCleanupSweep() {
 }
 
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
-    const std::function<bool(const Replica&)>& is_stale) {
+    const std::function<bool(const Replica&)>& is_stale,
+    const std::function<void(const ObjectMetadata&)>& on_visited) {
     std::optional<ErrorCode> first_persist_error;
     VisitNamespaces([&](const TenantId& tenant_id, metadata::Namespace& ns) {
         // Reader pre-check: an object with nothing to sweep never takes the
@@ -2818,6 +2861,9 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
         std::vector<route::ObjectRef> to_sweep;
         for (auto object : ns.objects.ReadCursor()) {
             const auto& metadata = object.metadata();
+            if (on_visited) {
+                on_visited(metadata);
+            }
             if (metadata.HasReplica(is_stale) || !metadata.IsValid()) {
                 to_sweep.push_back(object.ref());
             }
@@ -2954,8 +3000,17 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 std::lock_guard<std::mutex> barrier_lock(barrier_mutex_);
                 sweep_seq = ++barrier_seq_;
             }
-            const auto cleanup_result =
-                ClearStaleHandles([&job](const Replica& replica) {
+            // One pass: the sweep's read pass also answers the retry gate
+            // below. Asking both questions of the same walk is what keeps a
+            // retry from costing two full scans. The sweep predicate only
+            // matches completed replicas, so it can never erase the PROCESSING
+            // replica the visitor is looking for; at worst a replica that
+            // completes while this pass runs is still seen as PROCESSING, and
+            // the next attempt sweeps it. Objects this pass drops are ignored:
+            // their PROCESSING replica cannot surface again.
+            bool unfinished_affiliated_replica = false;
+            const auto cleanup_result = ClearStaleHandles(
+                [&job](const Replica& replica) {
                     if (!replica.is_completed()) {
                         return false;
                     }
@@ -2965,6 +3020,33 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                     }
                     return replica.is_memory_replica() &&
                            replica.isAffiliatedWith(job.retired_session);
+                },
+                [this, &job, &unfinished_affiliated_replica](
+                    const ObjectMetadata& metadata) {
+                    if (unfinished_affiliated_replica) {
+                        return;
+                    }
+                    const auto is_unfinished = [&job](const Replica& replica) {
+                        return replica.is_processing() &&
+                               replica.isAffiliatedWith(job.retired_session);
+                    };
+                    if (!metadata.HasReplica(is_unfinished)) {
+                        return;
+                    }
+                    if (metadata.IsValid()) {
+                        unfinished_affiliated_replica = true;
+                        return;
+                    }
+                    // No usable replica left. The sweep then erases the
+                    // object, or enqueues its REMOVE and fails the whole walk
+                    // if that enqueue fails, so its PROCESSING replica cannot
+                    // surface again and waiting on it would only cost a
+                    // retry. HA without an OpLog is the exception: the sweep
+                    // leaves the object to the background reaper, so the
+                    // replica is still one this job has to wait for.
+                    if (enable_ha_ && !enable_oplog_) {
+                        unfinished_affiliated_replica = true;
+                    }
                 });
             if (!cleanup_result) {
                 LOG(ERROR) << "client_id=" << job.client_id
@@ -2973,24 +3055,6 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 return false;
             }
             MarkCleanupSwept(sweep_seq, &sweep_tokens);
-            bool unfinished_affiliated_replica = false;
-            VisitNamespaces([&](const TenantId& /*tenant_id*/,
-                                metadata::Namespace& ns) {
-                if (unfinished_affiliated_replica) {
-                    return;
-                }
-                for (auto object : ns.objects.ReadCursor()) {
-                    if (object.metadata().HasReplica(
-                            [&job](const Replica& replica) {
-                                return replica.is_processing() &&
-                                       replica.isAffiliatedWith(
-                                           job.retired_session);
-                            })) {
-                        unfinished_affiliated_replica = true;
-                        break;
-                    }
-                }
-            });
             if (unfinished_affiliated_replica) {
                 LOG(ERROR)
                     << "client_id=" << job.client_id
