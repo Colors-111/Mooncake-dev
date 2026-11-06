@@ -67,6 +67,23 @@ class MasterServiceTestPeer {
         return MasterService::EvictionByteShare(amount, part, whole);
     }
 
+    void BeginOffboardingCleanupForTesting() {
+        service_.BeginOffboardingCleanup();
+    }
+    void EndOffboardingCleanupForTesting() {
+        service_.EndOffboardingCleanup();
+    }
+    void BeginUnmountCleanupForTesting() { service_.BeginUnmountCleanup(); }
+    uint64_t SnapshotUnmountCleanupsForTesting() const {
+        return service_.SnapshotUnmountCleanups();
+    }
+    void EndUnmountCleanupsForTesting(uint64_t snapshot) {
+        service_.EndUnmountCleanups(snapshot);
+    }
+    bool CleanupInProgressForTesting() const {
+        return service_.CleanupInProgress();
+    }
+
     double MemoryUsedRatio() const {
         return service_.segment_manager_.GetMemoryUsage().used_ratio();
     }

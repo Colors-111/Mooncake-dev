@@ -1174,9 +1174,11 @@ class MasterService {
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
-    void ClearInvalidHandles();
+    // Returns whether every stale handle the sweep met was cleaned; a partial
+    // OpLog failure reports false and is retried.
+    bool ClearInvalidHandles();
     // Caller owns master_state_mutex_ (shared) while metadata is swept.
-    void ClearInvalidHandles(
+    bool ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
     // every tenant. Owner-targeted on purpose: a liveness-complement sweep
@@ -1656,14 +1658,24 @@ class MasterService {
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;
-    // Outstanding failure cleanups: a retired client or a segment unmount.
-    // While the count is non-zero, eviction runs the byte-driven period
-    // instead of the object-ratio round; it returns to zero when the last
-    // related sweep has run and no offboarding job is left.
-    void BeginCleanupEpoch();
-    void EndCleanupEpochIfIdle();
+    // Outstanding failure cleanups, one begin paired with exactly one
+    // successful end. While the count is non-zero, eviction runs the
+    // byte-driven period instead of the object-ratio round.
+    // Offboarding jobs are counted from the moment they are queued (the
+    // monitor's own prepare included) and retired when the job completes or
+    // is dropped.
+    void BeginOffboardingCleanup();
+    void EndOffboardingCleanup();
+    // Unmounting segments are counted from a successful prepare and retired
+    // by the first successful global sweep that started after them: the sweep
+    // snapshots the pending count before scanning, so a prepare that races it
+    // keeps its own responsibility.
+    void BeginUnmountCleanup();
+    [[nodiscard]] uint64_t SnapshotUnmountCleanups() const;
+    void EndUnmountCleanups(uint64_t snapshot);
     [[nodiscard]] bool CleanupInProgress() const;
-    mutable std::atomic<uint64_t> cleanup_epochs_{0};  // in range [0.0, 1.0]
+    std::atomic<uint64_t> cleanup_epochs_{0};
+    std::atomic<uint64_t> pending_unmount_cleanups_{0};  // in range [0.0, 1.0]
     const double nof_eviction_ratio_;             // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 

@@ -91,6 +91,10 @@ class EvictionIndex {
     // Whether OnRead must be called.
     [[nodiscard]] bool observes_reads() const { return observes_reads_; }
 
+    // Identifies this index instance. A cursor kept across work slices uses
+    // it to tell that the namespace it borrowed was replaced, not reused.
+    [[nodiscard]] virtual uint64_t instance_id() const { return 0; }
+
    private:
     const bool observes_reads_;
 };

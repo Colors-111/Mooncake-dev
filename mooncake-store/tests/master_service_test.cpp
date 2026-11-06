@@ -2910,6 +2910,36 @@ TEST_F(MasterServiceTest, EvictionByteShareHandlesLargePools) {
               1234u);
 }
 
+TEST_F(MasterServiceTest, CleanupEpochPairsEveryResponsibility) {
+    MasterService service;
+    auto peer = MasterServiceTestPeer(service);
+    EXPECT_FALSE(peer.CleanupInProgressForTesting());
+
+    // Two unmounting segments; a sweep that starts after both retires both,
+    // but one that raced the second begin retires only what it saw.
+    peer.BeginUnmountCleanupForTesting();
+    const uint64_t snapshot = peer.SnapshotUnmountCleanupsForTesting();
+    peer.BeginUnmountCleanupForTesting();
+    peer.EndUnmountCleanupsForTesting(snapshot);
+    EXPECT_TRUE(peer.CleanupInProgressForTesting());
+    peer.EndUnmountCleanupsForTesting(
+        peer.SnapshotUnmountCleanupsForTesting());
+    EXPECT_FALSE(peer.CleanupInProgressForTesting());
+
+    // Offboarding responsibilities pair one begin with one end: a completed
+    // job must not clear another job's or an unmount's state.
+    peer.BeginOffboardingCleanupForTesting();
+    peer.BeginUnmountCleanupForTesting();
+    peer.BeginOffboardingCleanupForTesting();
+    peer.EndOffboardingCleanupForTesting();
+    EXPECT_TRUE(peer.CleanupInProgressForTesting());
+    peer.EndOffboardingCleanupForTesting();
+    EXPECT_TRUE(peer.CleanupInProgressForTesting());
+    peer.EndUnmountCleanupsForTesting(
+        peer.SnapshotUnmountCleanupsForTesting());
+    EXPECT_FALSE(peer.CleanupInProgressForTesting());
+}
+
 TEST_F(MasterServiceTest, EvictionWorkPeriodRunsToTheLowWatermark) {
     // The low-watermark work period: one period keeps evicting, re-deriving
     // the byte gap after every slice, until live usage is back below the low

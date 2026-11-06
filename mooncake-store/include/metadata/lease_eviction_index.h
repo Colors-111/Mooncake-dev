@@ -101,6 +101,10 @@ class LeaseEvictionIndex final : public EvictionIndex {
         return std::make_unique<LeaseCursor>(*this, BucketOf(now));
     }
 
+    [[nodiscard]] uint64_t instance_id() const override {
+        return instance_id_;
+    }
+
    private:
     using SlotList = route::KeySlot::EvictionList;
     class Buckets;
@@ -412,6 +416,12 @@ class LeaseEvictionIndex final : public EvictionIndex {
         }
     }
 
+    static uint64_t NextInstanceId() {
+        static std::atomic<uint64_t> next{1};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const uint64_t instance_id_ = NextInstanceId();
     mutable std::mutex mutex_;
     Buckets buckets_;
     // Each keyed by the lease it holds. Declared after the buckets, so every

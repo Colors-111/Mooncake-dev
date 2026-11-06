@@ -479,8 +479,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
           // RFC #4700 slice 1: no metadata sweep while a promotion restore
           // is in flight; the restore itself owns the metadata transition.
           if (AdmitsBusinessWorkers()) {
-              ClearInvalidHandles();
-              EndCleanupEpochIfIdle();
+              // The snapshot is taken before scanning: a prepare that races
+              // this sweep keeps its responsibility for the next one.
+              const uint64_t snapshot = SnapshotUnmountCleanups();
+              if (ClearInvalidHandles()) {
+                  EndUnmountCleanups(snapshot);
+              }
           }
       }),
       kvcs_capacity_refresh_worker_([this] { RefreshKvcsDfsUsage(); }),
@@ -2491,22 +2495,23 @@ void MasterService::CleanupExpiredSoftPins(
     }
 }
 
-void MasterService::ClearInvalidHandles() {
+bool MasterService::ClearInvalidHandles() {
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
-    ClearInvalidHandles(retaining_clients);
+    return ClearInvalidHandles(retaining_clients);
 }
 
-void MasterService::ClearInvalidHandles(
+bool MasterService::ClearInvalidHandles(
     const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
-    (void)ClearStaleHandles([&retaining_clients](const Replica& replica) {
-        return (replica.has_invalid_mem_handle() ||
-                replica.has_invalid_nof_handle() ||
-                replica.has_stale_local_disk_client(retaining_clients)) &&
-               replica.is_completed();
-    });
+    return ClearStaleHandles([&retaining_clients](const Replica& replica) {
+               return (replica.has_invalid_mem_handle() ||
+                       replica.has_invalid_nof_handle() ||
+                       replica.has_stale_local_disk_client(retaining_clients)) &&
+                      replica.is_completed();
+           })
+        .has_value();
 }
 
 void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
@@ -2631,9 +2636,9 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                          .segment_name = it->segment_name,
                          .transport_endpoint = it->transport_endpoint,
                          .metrics_dec_capacity = metrics_dec_capacity});
-                    // Until this client's sweep runs, eviction runs the
+                    // Until this segment's sweep runs, eviction runs the
                     // failure-cleanup period instead of an object round.
-                    BeginCleanupEpoch();
+                    BeginUnmountCleanup();
                     it = job.pending_prepare_segments.erase(it);
                     continue;
                 }
@@ -2866,10 +2871,10 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
             return tl::make_unexpected(err);
         }
     }
-    // The allocator is released: from here until a sweep has run, eviction
-    // runs the failure-cleanup period so the still-filed keys on this segment
-    // do not drown the healthy ones.
-    BeginCleanupEpoch();
+    // The allocator is released: from here until a successful sweep covers
+    // it, eviction runs the failure-cleanup period so the still-filed keys on
+    // this segment do not drown the healthy ones.
+    BeginUnmountCleanup();
 
     // Keep HA, snapshot, and CXL behavior unchanged. Regular memory segments
     // become unreadable as soon as PrepareUnmountSegment releases their
@@ -2877,8 +2882,10 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     if (enable_async_segment_cleanup_) {
         replica_cleanup_worker_.Schedule();
     } else {
-        ClearInvalidHandles(retaining_clients);
-        EndCleanupEpochIfIdle();
+        const uint64_t snapshot = SnapshotUnmountCleanups();
+        if (ClearInvalidHandles(retaining_clients)) {
+            EndUnmountCleanups(snapshot);
+        }
     }
 
     // Cache endpoint before commit removes segment from registry.
@@ -2979,11 +2986,13 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
         }
     }  // Release the segment mutex before long-running step 2 and avoid
        // deadlocks
-    BeginCleanupEpoch();
+    BeginUnmountCleanup();
 
     // 2. Remove the metadata of the related objects
-    ClearInvalidHandles(retaining_clients);
-    EndCleanupEpochIfIdle();
+    const uint64_t snapshot = SnapshotUnmountCleanups();
+    if (ClearInvalidHandles(retaining_clients)) {
+        EndUnmountCleanups(snapshot);
+    }
 
     // 3. Commit the unmount operation
     ScopedNoFSegmentAccess segment_access =
@@ -9686,15 +9695,48 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     return {};
 }
 
-void MasterService::BeginCleanupEpoch() {
+void MasterService::BeginOffboardingCleanup() {
     cleanup_epochs_.fetch_add(1, std::memory_order_relaxed);
 }
 
-void MasterService::EndCleanupEpochIfIdle() {
-    // A sweep covers every responsibility that existed when it started; once
-    // no offboarding job is left, the next prepare starts a fresh epoch.
-    if (!client_offboarding_worker_.HasPending()) {
-        cleanup_epochs_.store(0, std::memory_order_relaxed);
+void MasterService::EndOffboardingCleanup() {
+    uint64_t open = cleanup_epochs_.load(std::memory_order_relaxed);
+    while (open > 0 && !cleanup_epochs_.compare_exchange_weak(open, open - 1)) {
+    }
+}
+
+void MasterService::BeginUnmountCleanup() {
+    // The pending count goes first, so a sweep that snapshots between the two
+    // increments never retires a responsibility this segment does not own.
+    pending_unmount_cleanups_.fetch_add(1, std::memory_order_relaxed);
+    cleanup_epochs_.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t MasterService::SnapshotUnmountCleanups() const {
+    return pending_unmount_cleanups_.load(std::memory_order_relaxed);
+}
+
+void MasterService::EndUnmountCleanups(uint64_t snapshot) {
+    uint64_t pending = pending_unmount_cleanups_.load(std::memory_order_relaxed);
+    for (;;) {
+        const uint64_t retired = std::min(snapshot, pending);
+        if (retired == 0) {
+            return;
+        }
+        if (pending_unmount_cleanups_.compare_exchange_weak(
+                pending, pending - retired, std::memory_order_relaxed)) {
+            uint64_t open = cleanup_epochs_.load(std::memory_order_relaxed);
+            while (open > 0) {
+                const uint64_t take = std::min(retired, open);
+                uint64_t next = open;
+                if (cleanup_epochs_.compare_exchange_weak(
+                        next, open - take, std::memory_order_relaxed)) {
+                    break;
+                }
+                open = next;
+            }
+            return;
+        }
     }
 }
 
@@ -9832,14 +9874,40 @@ void MasterService::RunEvictionWorkPeriod() {
                                  static_cast<uint64_t>(slice_target);
             const uint64_t tenant_share = std::max<uint64_t>(
                 1, EvictionByteShare(gap, share.filed, remaining_filed));
+            // Bounded, resumable slices: the cursor keeps its walk position
+            // and deferred entries across steps, so this tenant's share is
+            // not re-walked from the index head between steps.
+            static constexpr size_t kCandidatesPerStep = 4096;
             const auto slice_started = std::chrono::steady_clock::now();
             eviction::Report report;
-            {
-                std::shared_lock<std::shared_mutex> shared_lock(
-                    master_state_mutex_);
-                report = memory_eviction_->evictor.Run(
-                    share.tenant,
-                    eviction::ByteGoal{.target_bytes = tenant_share});
+            auto work = memory_eviction_->evictor.BeginTenantWork(
+                share.tenant,
+                eviction::ByteGoal{.target_bytes = tenant_share},
+                std::chrono::system_clock::now());
+            if (work) {
+                for (;;) {
+                    eviction::Evictor::WorkStep step;
+                    {
+                        std::shared_lock<std::shared_mutex> shared_lock(
+                            master_state_mutex_);
+                        step = memory_eviction_->evictor.StepTenantWork(
+                            *work, kCandidatesPerStep);
+                    }
+                    report = memory_eviction_->evictor.WorkReport(*work);
+                    if (step != eviction::Evictor::WorkStep::kMore) {
+                        break;
+                    }
+                    // Yield between steps: the pool target may already be met,
+                    // and the next step re-reads usage before continuing.
+                    const auto step_usage = segment_manager_.GetMemoryUsage();
+                    if (step_usage.capacity_bytes == 0) {
+                        break;
+                    }
+                    if (static_cast<double>(step_usage.used_bytes) <=
+                        low * static_cast<double>(step_usage.capacity_bytes)) {
+                        break;
+                    }
+                }
             }
             const auto slice_ms =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -10617,6 +10685,7 @@ void MasterService::ClientMonitorFunc() {
                                     segment_access.PrepareUnmountSegment(
                                         segment.id, metrics_dec_capacity);
                                 if (prepare_result == ErrorCode::OK) {
+                                    BeginUnmountCleanup();
                                     job.prepared_segments.push_back(
                                         {.segment_id = segment.id,
                                          .segment_name = segment.name,
@@ -10644,6 +10713,9 @@ void MasterService::ClientMonitorFunc() {
 
                     MasterMetricManager::instance()
                         .client_liveness_became_offline();
+                    // Counted from queue time: the monitor already prepared
+                    // some segments, and the job retires it on completion.
+                    BeginOffboardingCleanup();
                     client_offboarding_worker_.ScheduleReserved(std::move(job));
                 });
 

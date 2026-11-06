@@ -68,6 +68,10 @@ struct ByteGoal {
 };
 
 class Evictor {
+   private:
+    struct Aim;
+    class Pass;
+
    public:
     // Everything given outlives the evictor.
     Evictor(metadata::NamespaceTable& namespaces, const EvictionPolicy& policy,
@@ -81,10 +85,46 @@ class Evictor {
     Report Run(const Scope& scope, const ObjectGoal& goal);
     Report Run(const TenantId& tenant_id, const ByteGoal& goal);
 
-   private:
-    struct Aim;
-    class Pass;
+    // One tenant's share of a longer work period, resumed across bounded
+    // slices. The cursor keeps the walk position, the deferred entries and the
+    // running report; each Step judges at most `max_candidates` keys. The
+    // namespace and its index instance are re-checked every step, so a tenant
+    // that was removed or whose namespace was rebuilt drops its progress
+    // instead of reading stale memory.
+    class TenantCursor {
+       public:
+        // Out of line: the resumable pass is complete only in the .cpp.
+        ~TenantCursor();
+        TenantCursor(TenantCursor&&) = delete;
+        TenantCursor(const TenantCursor&) = delete;
+        TenantCursor& operator=(const TenantCursor&) = delete;
 
+       private:
+        friend class Evictor;
+        TenantCursor(const Evictor& evictor, TenantId tenant,
+                     metadata::Namespace* ns, uint64_t index_instance,
+                     Clock::time_point now, const ByteGoal& goal);
+
+        const Evictor& evictor_;
+        const TenantId tenant_;
+        metadata::Namespace* const ns_;
+        const uint64_t index_instance_;
+        const Clock::time_point now_;
+        const ByteGoal goal_;
+        Report report_;
+        std::unique_ptr<Pass> pass_;
+    };
+
+    enum class WorkStep { kMore, kDone, kInvalidated };
+
+    // Null when the tenant has no namespace right now.
+    [[nodiscard]] std::unique_ptr<TenantCursor> BeginTenantWork(
+        const TenantId& tenant_id, const ByteGoal& goal, Clock::time_point now);
+    [[nodiscard]] WorkStep StepTenantWork(TenantCursor& cursor,
+                                          size_t max_candidates);
+    [[nodiscard]] const Report& WorkReport(const TenantCursor& cursor) const;
+
+   private:
     Report RunFor(const Scope& scope, const Aim& aim);
 
     metadata::NamespaceTable& namespaces_;

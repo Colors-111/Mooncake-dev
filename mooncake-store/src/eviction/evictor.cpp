@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -70,10 +71,25 @@ class Evictor::Pass {
     // also ends when an OpLog write fails or nothing is left. A group's
     // members come in one entry and go together, one key lock at a time, in
     // the walk and in the fallback alike.
-    void Run() {
-        while (!report_.stopped && !Met(/*fallback=*/false)) {
+   public:
+    enum class StepKind { kMore, kDone };
+
+    // Walks until the aim is met, the cursor is spent, or `max_candidates`
+    // keys were judged; a group finishes before the slice yields. Calling it
+    // again resumes where it stopped.
+    StepKind Step(size_t max_candidates) {
+        size_t judged = 0;
+        while (!walk_done_) {
+            if (report_.stopped || Met(/*fallback=*/false)) {
+                walk_done_ = true;
+                break;
+            }
+            if (max_candidates != kUnbounded && judged >= max_candidates) {
+                return StepKind::kMore;
+            }
             std::optional<Entry> entry = cursor_->Next();
             if (!entry) {
+                walk_done_ = true;
                 break;
             }
             deferred_.emplace_back();
@@ -82,25 +98,44 @@ class Evictor::Pass {
                     break;
                 }
                 Evict(ns_.objects.Write(key), &*entry);
+                ++judged;
             }
             if (deferred_.back().empty()) {
                 deferred_.pop_back();
             }
         }
-        for (const std::vector<route::ObjectRef>& refs : deferred_) {
+        while (!fallback_done_) {
             if (report_.stopped || Met(/*fallback=*/true)) {
+                fallback_done_ = true;
                 break;
             }
-            for (const route::ObjectRef& ref : refs) {
+            if (max_candidates != kUnbounded && judged >= max_candidates) {
+                return StepKind::kMore;
+            }
+            if (fallback_entry_ >= deferred_.size()) {
+                fallback_done_ = true;
+                break;
+            }
+            for (const route::ObjectRef& ref : deferred_[fallback_entry_]) {
                 if (report_.stopped) {
                     break;
                 }
                 // Only the publication the policy deferred: a replacement was
                 // never judged.
                 Evict(ns_.objects.Write(ref), /*entry=*/nullptr);
+                ++judged;
             }
+            ++fallback_entry_;
+        }
+        return StepKind::kDone;
+    }
+
+    void Run() {
+        while (Step(kUnbounded) == StepKind::kMore) {
         }
     }
+
+   private:
 
    private:
     using Entry = metadata::EvictionIndex::Entry;
@@ -205,7 +240,62 @@ class Evictor::Pass {
     const Clock::time_point now_;
     // In the order the walk met them, one list for each entry that had any.
     std::vector<std::vector<route::ObjectRef>> deferred_;
+    // Slice bounds: where the walk and the fallback stopped.
+    static constexpr size_t kUnbounded = std::numeric_limits<size_t>::max();
+    bool walk_done_{false};
+    bool fallback_done_{false};
+    size_t fallback_entry_{0};
 };
+
+Evictor::TenantCursor::TenantCursor(const Evictor& evictor, TenantId tenant,
+                                     metadata::Namespace* ns,
+                                     uint64_t index_instance,
+                                     Clock::time_point now,
+                                     const ByteGoal& goal)
+    : evictor_(evictor),
+      tenant_(std::move(tenant)),
+      ns_(ns),
+      index_instance_(index_instance),
+      now_(now),
+      goal_(goal) {}
+
+Evictor::TenantCursor::~TenantCursor() = default;
+
+std::unique_ptr<Evictor::TenantCursor> Evictor::BeginTenantWork(
+    const TenantId& tenant_id, const ByteGoal& goal, Clock::time_point now) {
+    metadata::Namespace* ns = namespaces_.Lookup(tenant_id);
+    if (ns == nullptr) {
+        return nullptr;
+    }
+    auto cursor = std::unique_ptr<TenantCursor>(
+        new TenantCursor(*this, tenant_id, ns,
+                         ns->eviction_index().instance_id(), now, goal));
+    // What this tenant's index held when the work began, for the period's
+    // measurements; the pass counts its own baseline for the aim.
+    cursor->report_.filed = ns->eviction_index().Scan(now)->Total();
+    return cursor;
+}
+
+Evictor::WorkStep Evictor::StepTenantWork(TenantCursor& cursor,
+                                          size_t max_candidates) {
+    if (namespaces_.Lookup(cursor.tenant_) != cursor.ns_ ||
+        cursor.ns_->eviction_index().instance_id() != cursor.index_instance_) {
+        return WorkStep::kInvalidated;
+    }
+    if (!cursor.pass_) {
+        const Aim aim{.in_bytes = true, .target_bytes = cursor.goal_.target_bytes};
+        cursor.pass_ = std::make_unique<Pass>(
+            *this, *cursor.ns_, cursor.ns_->eviction_index().Scan(cursor.now_),
+            aim, cursor.report_, cursor.now_);
+    }
+    return cursor.pass_->Step(max_candidates) == Pass::StepKind::kDone
+               ? WorkStep::kDone
+               : WorkStep::kMore;
+}
+
+const Report& Evictor::WorkReport(const TenantCursor& cursor) const {
+    return cursor.report_;
+}
 
 Evictor::Evictor(metadata::NamespaceTable& namespaces,
                  const EvictionPolicy& policy, Reclaimer& reclaimer,
