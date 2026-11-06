@@ -163,13 +163,6 @@ DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
 DEFINE_double(eviction_high_watermark_ratio,
               mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction in Memory");
-DEFINE_double(eviction_low_watermark_ratio, 0.0,
-              "Low watermark of a memory eviction work period, as a fraction "
-              "of the current capacity. 0 keeps the object-ratio eviction "
-              "round; > 0 must be below eviction_high_watermark_ratio and "
-              "makes one high-watermark period run until live usage is back "
-              "below it, re-deriving the gap from the latest usage and "
-              "capacity after every slice.");
 DEFINE_double(tenant_eviction_high_watermark_ratio,
               mooncake::DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO,
               "Per-tenant high watermark, as a fraction of that tenant's own "
@@ -573,9 +566,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
                              FLAGS_eviction_high_watermark_ratio);
-    default_config.GetDouble("eviction_low_watermark_ratio",
-                             &master_config.eviction_low_watermark_ratio,
-                             FLAGS_eviction_low_watermark_ratio);
     default_config.GetDouble(
         "tenant_eviction_high_watermark_ratio",
         &master_config.tenant_eviction_high_watermark_ratio,
@@ -910,12 +900,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.eviction_ratio = FLAGS_eviction_ratio;
-    }
-    if (google::GetCommandLineFlagInfo("eviction_low_watermark_ratio",
-                                       &info) &&
-        !info.is_default) {
-        master_config.eviction_low_watermark_ratio =
-            FLAGS_eviction_low_watermark_ratio;
     }
     if ((google::GetCommandLineFlagInfo("eviction_high_watermark_ratio",
                                         &info) &&

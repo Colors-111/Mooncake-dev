@@ -56,38 +56,6 @@ class LeaseEvictionIndexTest : public ::testing::Test {
                             ObjectDataType::UNKNOWN, group_id, TenantId(), key);
     }
 
-    // Publishes `key` holding one memory replica whose buffer is bound to
-    // `liveness`, as a mounted segment's buffers are.
-    void PublishWithLiveness(
-        const std::string& key,
-        const std::shared_ptr<ClientLivenessRecord>& liveness,
-        Clock::time_point deadline) {
-        auto guard = ns_.objects.WriteKey(key);
-        auto buffer = allocator_->allocate(128);
-        buffer->bindClientLiveness(liveness);
-        std::vector<Replica> replicas;
-        replicas.emplace_back(std::move(buffer), ReplicaStatus::COMPLETE);
-        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
-                            std::move(replicas), std::nullopt,
-                            /*hard_pinned=*/false, ObjectDataType::UNKNOWN,
-                            std::string(), TenantId(), key);
-        SetDeadline(guard.metadata(), deadline);
-    }
-
-    // A liveness record that never served: ACTIVE, then SUSPECTED, then
-    // OFFLINE. A returning client registers a new record.
-    static std::shared_ptr<ClientLivenessRecord> LivenessIn(
-        ClientLivenessState state) {
-        auto record = std::make_shared<ClientLivenessRecord>(
-            ClientLivenessRecord::Clock::now());
-        const auto now = ClientLivenessRecord::Clock::now();
-        (void)record->Evaluate(now, seconds(0), seconds(0));
-        if (state != ClientLivenessState::SUSPECTED) {
-            (void)record->Evaluate(now, seconds(0), seconds(0));
-        }
-        return record;
-    }
-
     static void SetDeadline(const ObjectMetadata& metadata,
                             Clock::time_point deadline) {
         SpinLocker locker(&metadata.lock);
@@ -151,64 +119,6 @@ TEST_F(LeaseEvictionIndexTest, FilesOnlyObjectsEvictionCanTakeMemoryFrom) {
 
     EXPECT_EQ(Filed(), 1u);
     EXPECT_EQ(DueKeys(t0_ + seconds(1)), std::vector<std::string>{"complete"});
-}
-
-TEST_F(LeaseEvictionIndexTest, OfflineClientsKeysNeverEnterTheIndex) {
-    PublishWithLiveness("offline", LivenessIn(ClientLivenessState::OFFLINE),
-                        t0_);
-    Publish("healthy", t0_);
-
-    EXPECT_EQ(Filed(), 1u);
-    EXPECT_EQ(DueKeys(t0_ + seconds(1)), std::vector<std::string>{"healthy"});
-}
-
-TEST_F(LeaseEvictionIndexTest, SuspectedClientsKeysStayFiled) {
-    // SUSPECTED may still come back, so its keys remain evictable.
-    PublishWithLiveness("suspected", LivenessIn(ClientLivenessState::SUSPECTED),
-                        t0_);
-
-    EXPECT_EQ(Filed(), 1u);
-    EXPECT_EQ(DueKeys(t0_ + seconds(1)), std::vector<std::string>{"suspected"});
-}
-
-TEST_F(LeaseEvictionIndexTest, AKeyKeepsItsPlaceWhileOneMemoryReplicaServes) {
-    {
-        // The guard's release is what files the key, so it ends before the
-        // assertions below.
-        auto guard = ns_.objects.WriteKey("mixed");
-        auto offline = allocator_->allocate(128);
-        offline->bindClientLiveness(LivenessIn(ClientLivenessState::OFFLINE));
-        auto healthy = allocator_->allocate(128);
-        std::vector<Replica> replicas;
-        replicas.emplace_back(std::move(offline), ReplicaStatus::COMPLETE);
-        replicas.emplace_back(std::move(healthy), ReplicaStatus::COMPLETE);
-        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
-                            std::move(replicas), std::nullopt,
-                            /*hard_pinned=*/false, ObjectDataType::UNKNOWN,
-                            std::string(), TenantId(), "mixed");
-        SetDeadline(guard.metadata(), t0_);
-    }
-
-    EXPECT_EQ(Filed(), 1u);
-    EXPECT_EQ(DueKeys(t0_ + seconds(1)), std::vector<std::string>{"mixed"});
-}
-
-TEST_F(LeaseEvictionIndexTest, AnUnmountedSegmentsKeyLeavesOnItsFirstVisit) {
-    Publish("on_segment", t0_);
-    ASSERT_EQ(Filed(), 1u);
-
-    // The segment is unmounted: the allocator the replica's buffer points at
-    // is gone, so the replica can never serve again.
-    allocator_.reset();
-
-    // Eviction visits the key, takes its write lock and lets it go; the
-    // release re-files it, and it no longer qualifies.
-    {
-        auto guard = ns_.objects.Write("on_segment");
-        ASSERT_TRUE(guard.has_value());
-    }
-    EXPECT_EQ(Filed(), 0u);
-    EXPECT_TRUE(DueKeys(t0_ + seconds(1)).empty());
 }
 
 TEST_F(LeaseEvictionIndexTest, WalksKeysOldestLeaseFirstUpToNow) {

@@ -117,14 +117,9 @@ class Evictor::Pass {
         if (!hold) {
             return;
         }
-        // Measurement only: how much of a round walks keys that can never
-        // release anything, so a slow round after a client goes offline can
-        // be told apart from one that is simply short of evictable keys.
+        // One increment per judged key: cheap enough for the healthy path,
+        // and it is what tells a slow round from a short one.
         ++report_.visited;
-        if (hold->has_object() &&
-            !hold->metadata().HasServiceableMemoryReplica()) {
-            ++report_.permanently_unavailable;
-        }
         // Freed as this returns, after the lock is let go.
         const std::vector<Replica> detached = EvictLocked(*hold, entry);
         hold.reset();

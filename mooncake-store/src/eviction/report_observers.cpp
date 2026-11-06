@@ -52,8 +52,6 @@ void LogObserver::OnRunEnd(const Scope& scope, const Report& report) {
                   << ", eviction_base=" << report.filed
                   << ", actual_evict_ratio=" << actual_evict_ratio
                   << ", visited=" << report.visited
-                  << ", permanently_unavailable="
-                  << report.permanently_unavailable
                   << ", nothing_to_release=" << report.nothing_to_release;
     }
 

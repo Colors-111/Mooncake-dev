@@ -480,6 +480,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
           // is in flight; the restore itself owns the metadata transition.
           if (AdmitsBusinessWorkers()) {
               ClearInvalidHandles();
+              EndCleanupEpochIfIdle();
           }
       }),
       kvcs_capacity_refresh_worker_([this] { RefreshKvcsDfsUsage(); }),
@@ -490,7 +491,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
-      eviction_low_watermark_ratio_(config.eviction_low_watermark_ratio),
       nof_eviction_ratio_(config.nof_eviction_ratio),
       nof_eviction_high_watermark_ratio_(
           config.nof_eviction_high_watermark_ratio),
@@ -2631,6 +2631,9 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                          .segment_name = it->segment_name,
                          .transport_endpoint = it->transport_endpoint,
                          .metrics_dec_capacity = metrics_dec_capacity});
+                    // Until this client's sweep runs, eviction runs the
+                    // failure-cleanup period instead of an object round.
+                    BeginCleanupEpoch();
                     it = job.pending_prepare_segments.erase(it);
                     continue;
                 }
@@ -2863,6 +2866,10 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
             return tl::make_unexpected(err);
         }
     }
+    // The allocator is released: from here until a sweep has run, eviction
+    // runs the failure-cleanup period so the still-filed keys on this segment
+    // do not drown the healthy ones.
+    BeginCleanupEpoch();
 
     // Keep HA, snapshot, and CXL behavior unchanged. Regular memory segments
     // become unreadable as soon as PrepareUnmountSegment releases their
@@ -2871,6 +2878,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         replica_cleanup_worker_.Schedule();
     } else {
         ClearInvalidHandles(retaining_clients);
+        EndCleanupEpochIfIdle();
     }
 
     // Cache endpoint before commit removes segment from registry.
@@ -2971,9 +2979,11 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
         }
     }  // Release the segment mutex before long-running step 2 and avoid
        // deadlocks
+    BeginCleanupEpoch();
 
     // 2. Remove the metadata of the related objects
     ClearInvalidHandles(retaining_clients);
+    EndCleanupEpochIfIdle();
 
     // 3. Commit the unmount operation
     ScopedNoFSegmentAccess segment_access =
@@ -9676,6 +9686,22 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     return {};
 }
 
+void MasterService::BeginCleanupEpoch() {
+    cleanup_epochs_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MasterService::EndCleanupEpochIfIdle() {
+    // A sweep covers every responsibility that existed when it started; once
+    // no offboarding job is left, the next prepare starts a fresh epoch.
+    if (!client_offboarding_worker_.HasPending()) {
+        cleanup_epochs_.store(0, std::memory_order_relaxed);
+    }
+}
+
+bool MasterService::CleanupInProgress() const {
+    return cleanup_epochs_.load(std::memory_order_relaxed) > 0;
+}
+
 uint64_t MasterService::EvictionByteShare(uint64_t amount, uint64_t part,
                                           uint64_t whole) {
     if (whole == 0) {
@@ -9688,8 +9714,10 @@ uint64_t MasterService::EvictionByteShare(uint64_t amount, uint64_t part,
 }
 
 void MasterService::RunEvictionWorkPeriod() {
-    const double low = eviction_low_watermark_ratio_;
     const double high = eviction_high_watermark_ratio_;
+    // The low watermark is the high one less one round's worth: the period
+    // drains what a failure left behind, not a fixed fraction of the pool.
+    const double low = high - eviction_ratio_;
     // A REMOVE this period enqueued but the writer has not made durable still
     // holds its bytes; that is when waiting for the finalize is the right
     // move instead of queueing more.
@@ -9828,8 +9856,6 @@ void MasterService::RunEvictionWorkPeriod() {
             LOG(INFO) << "[EVICT-SLICE] tenant=" << share.tenant.value()
                       << ", filed=" << report.filed
                       << ", visited=" << report.visited
-                      << ", permanently_unavailable="
-                      << report.permanently_unavailable
                       << ", nothing_to_release=" << report.nothing_to_release
                       << ", requested_bytes=" << tenant_share
                       << ", released_bytes=" << report.released_bytes
@@ -9938,25 +9964,19 @@ void MasterService::EvictionThreadFunc() {
         double used_ratio = usage.used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
-            if (eviction_low_watermark_ratio_ > 0.0 &&
-                eviction_low_watermark_ratio_ >=
-                    eviction_high_watermark_ratio_ &&
-                !low_watermark_config_reported_) {
-                LOG(ERROR) << "eviction_low_watermark_ratio="
-                           << eviction_low_watermark_ratio_
-                           << " must be below eviction_high_watermark_ratio="
-                           << eviction_high_watermark_ratio_
-                           << "; the low-watermark work period stays disabled";
-                low_watermark_config_reported_ = true;
-            }
-            const bool period_mode =
-                eviction_low_watermark_ratio_ > 0.0 &&
-                eviction_low_watermark_ratio_ < eviction_high_watermark_ratio_;
+            // The byte-driven period belongs to failure cleanup only: a
+            // healthy pool keeps the object-ratio round, which pays no
+            // per-key client/allocator check.
+            const bool period_mode = CleanupInProgress() &&
+                                     eviction_ratio_ > 0.0 &&
+                                     eviction_high_watermark_ratio_ >
+                                         eviction_ratio_;
             LOG(INFO) << "[EVICT-TRIGGER] mode="
-                      << (period_mode ? "work_period" : "object_ratio")
+                      << (period_mode ? "cleanup_work_period"
+                                      : "object_ratio")
                       << " memory_ratio=" << used_ratio
                       << " high_watermark=" << eviction_high_watermark_ratio_
-                      << " low_watermark=" << eviction_low_watermark_ratio_
+                      << " cleanup_in_progress=" << CleanupInProgress()
                       << " need_mem_eviction=" << need_mem_eviction_
                       << " eviction_ratio=" << eviction_ratio_;
             if (period_mode) {
@@ -10332,15 +10352,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - measure_started)
             .count();
-    // Measurement only: round duration next to how much of the walk met keys
-    // that can never release anything (offline clients, unmounted segments),
-    // which is what stretches a round after a store goes offline.
+    // Measurement only: round duration next to how far the walk got and how
+    // many keys had nothing to release. Cheap counters, nothing per key that
+    // reads client or allocator state.
     LOG(INFO) << "[EVICT-MEASURE] duration_ms=" << measure_elapsed_ms
               << ", target_ratio=" << evict_ratio_target
               << ", lowerbound_ratio=" << evict_ratio_lowerbound
               << ", filed=" << report.filed << ", visited=" << report.visited
-              << ", permanently_unavailable="
-              << report.permanently_unavailable
               << ", nothing_to_release=" << report.nothing_to_release
               << ", evicted=" << report.evicted_objects
               << ", released_bytes=" << report.released_bytes

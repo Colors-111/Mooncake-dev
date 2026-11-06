@@ -56,15 +56,12 @@ class LeaseEvictionIndex final : public EvictionIndex {
 
     LeaseEvictionIndex() : EvictionIndex(/*observes_reads=*/false) {}
 
-    // Whether eviction may ever take memory from `metadata`. A key whose
-    // completed memory replicas are all permanently unavailable -- unmounted
-    // segments, offline clients -- releases nothing, so it is not filed at
-    // all: the first visit lets the write guard's release drop it, and later
-    // rounds no longer walk it. A temporary reason to skip (a live lease, a
-    // pin, a refcount, a SUSPECTED client) still files the key.
+    // Whether eviction may ever take memory from `metadata`.
     [[nodiscard]] static bool Qualifies(const ObjectMetadata& metadata) {
         return !metadata.IsHardPinned() &&
-               metadata.HasServiceableMemoryReplica();
+               metadata.HasReplica([](const Replica& replica) {
+                   return replica.is_memory_replica() && replica.is_completed();
+               });
     }
 
     void OnRead(const route::ReadGuard&) override {}

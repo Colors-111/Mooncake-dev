@@ -68,6 +68,9 @@ std::chrono::seconds ClientOffboardingWorker::RetryDelay(uint64_t retry_count) {
 
 void ClientOffboardingWorker::CompleteJob(const ClientOffboardingJob& job) {
     pending_jobs_.fetch_sub(1, std::memory_order_acq_rel);
+    // The last job's cleanup is done; leave the failure-cleanup eviction
+    // state once nothing else is queued.
+    service_->EndCleanupEpochIfIdle();
     MasterMetricManager::instance().dec_client_offboarding_queue_depth();
     const auto duration_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(

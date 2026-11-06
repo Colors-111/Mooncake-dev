@@ -108,8 +108,6 @@ struct MasterConfig {
     bool allow_evict_soft_pinned_objects;
     double eviction_ratio;
     double eviction_high_watermark_ratio;
-    // 0 disables the low-watermark work period.
-    double eviction_low_watermark_ratio = 0;
     double tenant_eviction_high_watermark_ratio;
     double nof_eviction_ratio;
     double nof_eviction_high_watermark_ratio;
@@ -250,8 +248,6 @@ class MasterServiceSupervisorConfig {
     RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
 
     // Parameters with default values (optional parameters)
-    // 0 disables the low-watermark work period.
-    double eviction_low_watermark_ratio = 0;
     double tenant_eviction_high_watermark_ratio =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
@@ -352,7 +348,6 @@ class MasterServiceSupervisorConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
-        eviction_low_watermark_ratio = config.eviction_low_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
@@ -548,10 +543,6 @@ class WrappedMasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
-    // 0 disables the low-watermark work period and keeps the object-ratio
-    // eviction round; > 0 makes a high-watermark period run until the live
-    // usage is back to this fraction of the current capacity.
-    double eviction_low_watermark_ratio = 0;
     double tenant_eviction_high_watermark_ratio =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
@@ -646,7 +637,6 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(config.metrics.port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
-        eviction_low_watermark_ratio = config.eviction_low_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
@@ -772,7 +762,6 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(metrics.port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
-        eviction_low_watermark_ratio = config.eviction_low_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
@@ -869,7 +858,6 @@ class MasterServiceConfigBuilder {
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio_ =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
-    double eviction_low_watermark_ratio_ = 0;
     double tenant_eviction_high_watermark_ratio_ =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
     double nof_eviction_ratio_ = DEFAULT_NOF_EVICTION_RATIO;
@@ -956,12 +944,6 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_eviction_high_watermark_ratio(
         double ratio) {
         eviction_high_watermark_ratio_ = ratio;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_eviction_low_watermark_ratio(
-        double ratio) {
-        eviction_low_watermark_ratio_ = ratio;
         return *this;
     }
 
@@ -1228,10 +1210,6 @@ class MasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
-    // 0 disables the low-watermark work period and keeps the object-ratio
-    // eviction round; > 0 makes a high-watermark period run until the live
-    // usage is back to this fraction of the current capacity.
-    double eviction_low_watermark_ratio = 0;
     double tenant_eviction_high_watermark_ratio =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
@@ -1326,7 +1304,6 @@ class MasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
-        eviction_low_watermark_ratio = config.eviction_low_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
@@ -1431,7 +1408,6 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
-    config.eviction_low_watermark_ratio = eviction_low_watermark_ratio_;
     config.tenant_eviction_high_watermark_ratio =
         tenant_eviction_high_watermark_ratio_;
     config.nof_eviction_ratio = nof_eviction_ratio_;
@@ -1504,7 +1480,6 @@ struct InProcMasterConfig {
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
     std::optional<double> eviction_high_watermark_ratio;
-    std::optional<double> eviction_low_watermark_ratio;
     std::optional<std::string> root_fs_dir;
     std::optional<bool> enable_disk_eviction;
     std::optional<uint64_t> quota_bytes;
@@ -1524,7 +1499,6 @@ class InProcMasterConfigBuilder {
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
     std::optional<double> eviction_high_watermark_ratio_ = std::nullopt;
-    std::optional<double> eviction_low_watermark_ratio_ = std::nullopt;
     std::optional<std::string> root_fs_dir_ = std::nullopt;
     std::optional<bool> enable_disk_eviction_ = std::nullopt;
     std::optional<uint64_t> quota_bytes_ = std::nullopt;
@@ -1583,15 +1557,6 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
-    InProcMasterConfigBuilder& set_eviction_low_watermark_ratio(double ratio) {
-        if (ratio < 0.0 || ratio > 1.0) {
-            throw std::invalid_argument(
-                "eviction_low_watermark_ratio must be between 0.0 and 1.0");
-        }
-        eviction_low_watermark_ratio_ = ratio;
-        return *this;
-    }
-
     InProcMasterConfigBuilder& set_root_fs_dir(const std::string& dir) {
         root_fs_dir_ = dir;
         return *this;
@@ -1633,7 +1598,6 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
-    config.eviction_low_watermark_ratio = eviction_low_watermark_ratio_;
     config.root_fs_dir = root_fs_dir_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;

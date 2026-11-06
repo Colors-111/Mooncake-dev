@@ -1557,10 +1557,11 @@ class MasterService {
         const std::chrono::system_clock::time_point& now);
 
     // Eviction thread function
-    // One high-watermark work period: while live usage is above the low
-    // watermark, run bounded per-tenant byte slices and re-derive the gap from
-    // the latest usage and capacity after each of them. Only reached when
-    // eviction_low_watermark_ratio_ is configured.
+    // One failure-cleanup work period: while a retired client or an unmounting
+    // segment still owes cleanup, run per-tenant byte slices and re-derive the
+    // gap from the latest usage and capacity after each of them, until live
+    // usage is back to the high watermark minus eviction_ratio. The healthy
+    // path keeps the object-ratio round.
     void RunEvictionWorkPeriod();
     // `amount`'s share of `whole` for the `part` keys a tenant filed, without
     // overflowing 64 bits: a 1e12-byte gap times 1e8 keys does not fit.
@@ -1655,10 +1656,14 @@ class MasterService {
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;
-    const double eviction_low_watermark_ratio_;
-    // Whether an invalid low/high pair has been reported, so a misconfigured
-    // master logs it once instead of on every trigger.
-    mutable bool low_watermark_config_reported_{false};  // in range [0.0, 1.0]
+    // Outstanding failure cleanups: a retired client or a segment unmount.
+    // While the count is non-zero, eviction runs the byte-driven period
+    // instead of the object-ratio round; it returns to zero when the last
+    // related sweep has run and no offboarding job is left.
+    void BeginCleanupEpoch();
+    void EndCleanupEpochIfIdle();
+    [[nodiscard]] bool CleanupInProgress() const;
+    mutable std::atomic<uint64_t> cleanup_epochs_{0};  // in range [0.0, 1.0]
     const double nof_eviction_ratio_;             // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 

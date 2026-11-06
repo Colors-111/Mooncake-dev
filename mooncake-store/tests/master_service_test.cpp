@@ -2914,10 +2914,11 @@ TEST_F(MasterServiceTest, EvictionWorkPeriodRunsToTheLowWatermark) {
     // The low-watermark work period: one period keeps evicting, re-deriving
     // the byte gap after every slice, until live usage is back below the low
     // fraction of capacity -- unlike a fixed 5%-of-objects round.
+    // The period's target is high - eviction_ratio, so 0.9 - 0.4 = 0.5.
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(0)
                               .set_eviction_high_watermark_ratio(0.9)
-                              .set_eviction_low_watermark_ratio(0.5)
+                              .set_eviction_ratio(0.4)
                               .build();
     auto service = std::make_unique<MasterService>(service_config);
     constexpr size_t kSegmentSize = 64ULL * 1024 * 1024;
