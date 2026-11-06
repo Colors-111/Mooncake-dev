@@ -1,8 +1,10 @@
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 
@@ -55,7 +57,27 @@ class BackgroundWorker {
             if (!running_) {
                 return;
             }
+            // An immediate request wins over a pending delay.
             requested_ = true;
+            deadline_.reset();
+        }
+        cv_.notify_one();
+    }
+
+    // Runs the callback no earlier than `delay` from now. Coalesced with
+    // Schedule() and other ScheduleAfter() calls: the earliest deadline wins,
+    // and an immediate Schedule() overrides it.
+    void ScheduleAfter(std::chrono::milliseconds delay) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!running_) {
+                return;
+            }
+            const auto when = std::chrono::steady_clock::now() + delay;
+            if (!requested_ || !deadline_ || when < *deadline_) {
+                requested_ = true;
+                deadline_ = when;
+            }
         }
         cv_.notify_one();
     }
@@ -65,11 +87,22 @@ class BackgroundWorker {
         while (true) {
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this] { return !running_ || requested_; });
-                if (!running_) {
-                    return;
+                for (;;) {
+                    if (!running_) {
+                        return;
+                    }
+                    if (!requested_) {
+                        cv_.wait(lock);
+                        continue;
+                    }
+                    if (!deadline_ ||
+                        std::chrono::steady_clock::now() >= *deadline_) {
+                        break;
+                    }
+                    cv_.wait_until(lock, *deadline_);
                 }
                 requested_ = false;
+                deadline_.reset();
             }
             callback_();
         }
@@ -81,6 +114,7 @@ class BackgroundWorker {
     std::thread thread_;
     bool running_{false};
     bool requested_{false};
+    std::optional<std::chrono::steady_clock::time_point> deadline_;
 };
 
 }  // namespace mooncake

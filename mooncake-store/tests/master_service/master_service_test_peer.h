@@ -67,12 +67,18 @@ class MasterServiceTestPeer {
         return MasterService::EvictionByteShare(amount, part, whole);
     }
 
+    void RetireClientForOffboarding(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& record) {
+        // The monitor reserves the queue slot before its retire callback runs.
+        service_.ReserveClientOffboardingJob();
+        service_.RetireClientForOffboarding(client_id, record);
+    }
+
     void BeginOffboardingCleanupForTesting() {
         service_.BeginOffboardingCleanup();
     }
-    void EndOffboardingCleanupForTesting() {
-        service_.EndOffboardingCleanup();
-    }
+    void EndOffboardingCleanupForTesting() { service_.EndOffboardingCleanup(); }
     void BeginUnmountCleanupForTesting() { service_.BeginUnmountCleanup(); }
     uint64_t SnapshotUnmountCleanupsForTesting() const {
         return service_.SnapshotUnmountCleanups();
@@ -82,6 +88,9 @@ class MasterServiceTestPeer {
     }
     bool CleanupInProgressForTesting() const {
         return service_.CleanupInProgress();
+    }
+    bool OffboardingPendingForTesting() const {
+        return service_.client_offboarding_worker_.HasPending();
     }
 
     double MemoryUsedRatio() const {

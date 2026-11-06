@@ -1202,6 +1202,15 @@ class MasterService {
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale,
         StaleSweepStats* stats = nullptr);
+    // The client monitor's retire step: counts one offboarding responsibility,
+    // removes the client's bookkeeping, prepares its segments and queues the
+    // job. The monitor calls this; tests drive the same path.
+    void RetireClientForOffboarding(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& record);
+    // The queue slot the monitor reserves before its retire callback runs;
+    // tests drive the same order.
+    void ReserveClientOffboardingJob();
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
@@ -1656,7 +1665,7 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                 // in range [0.0, 1.0]
+    const double eviction_ratio_;  // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;
     // Outstanding failure cleanups, one begin paired with exactly one
     // successful end. While the count is non-zero, eviction runs the
@@ -1666,17 +1675,22 @@ class MasterService {
     // is dropped.
     void BeginOffboardingCleanup();
     void EndOffboardingCleanup();
-    // Unmounting segments are counted from a successful prepare and retired
-    // by the first successful global sweep that started after them: the sweep
-    // snapshots the pending count before scanning, so a prepare that races it
-    // keeps its own responsibility.
+    // Unmounting segments are published with a sequence number and retired by
+    // a successful global sweep whose coverage covers that sequence: the sweep
+    // snapshots the sequence before scanning, so a prepare published after it
+    // keeps its own responsibility whatever order the sweeps finish in.
     void BeginUnmountCleanup();
     [[nodiscard]] uint64_t SnapshotUnmountCleanups() const;
-    void EndUnmountCleanups(uint64_t snapshot);
+    void EndUnmountCleanups(uint64_t coverage);
     [[nodiscard]] bool CleanupInProgress() const;
-    std::atomic<uint64_t> cleanup_epochs_{0};
-    std::atomic<uint64_t> pending_unmount_cleanups_{0};  // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;             // in range [0.0, 1.0]
+    // Both counts move under one lock: a sweep can never observe the pending
+    // publication without the matching epoch increment.
+    mutable std::mutex cleanup_mutex_;
+    size_t cleanup_epochs_ = 0;         // guarded by cleanup_mutex_
+    uint64_t unmount_publish_seq_ = 0;  // guarded by cleanup_mutex_
+    std::deque<uint64_t>
+        pending_unmount_seqs_;  // guarded, ascending  // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
     // Memory eviction (see eviction::Evictor) and what it is built from: the
@@ -1691,6 +1705,10 @@ class MasterService {
     // Eviction thread related members
     std::thread eviction_thread_;
     std::atomic<bool> eviction_running_{false};
+    // Backoff for a failed sweep: it keeps its responsibilities and is
+    // retried in the background, so a rejected OpLog entry cannot leave the
+    // failure-cleanup mode on forever.
+    static constexpr std::chrono::milliseconds kReplicaCleanupRetryDelay{1000};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
 

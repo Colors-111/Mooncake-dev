@@ -54,15 +54,15 @@ struct Evictor::Aim {
 class Evictor::Pass {
    public:
     Pass(const Evictor& evictor, metadata::Namespace& ns,
-         std::unique_ptr<metadata::EvictionIndex::Cursor> cursor,
-         const Aim& aim, Report& report, Clock::time_point now)
+         std::unique_ptr<metadata::EvictionIndex::Cursor> cursor, Aim aim,
+         Report& report, Clock::time_point now)
         : evictor_(evictor),
           ns_(ns),
           cursor_(std::move(cursor)),
           filed_(cursor_->Total()),
           evicted_before_(report.evicted_objects),
           released_before_(report.released_bytes),
-          aim_(aim),
+          aim_(std::move(aim)),
           report_(report),
           now_(now) {}
 
@@ -235,7 +235,8 @@ class Evictor::Pass {
     const uint64_t filed_;
     const uint64_t evicted_before_;
     const uint64_t released_before_;
-    const Aim& aim_;
+    // Owned by value: a cursor outlives the call that built its aim.
+    const Aim aim_;
     Report& report_;
     const Clock::time_point now_;
     // In the order the walk met them, one list for each entry that had any.

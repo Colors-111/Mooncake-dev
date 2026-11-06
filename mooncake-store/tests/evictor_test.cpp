@@ -198,6 +198,34 @@ class EvictorTest : public ::testing::Test {
     RecordingObserver observer_;
 };
 
+// A work cursor outlives the call that built its aim: stepping it twice must
+// read the aim it owns, not a reference to a stack object.
+TEST_F(EvictorTest, AWorkCursorResumesAcrossSteps) {
+    Publish("a", "a1", seconds(5));
+    Publish("a", "a2", seconds(4));
+    Publish("a", "a3", seconds(3));
+
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer_});
+    auto work = evictor.BeginTenantWork(
+        TenantId("a"), ByteGoal{.target_bytes = 1u << 20}, Clock::now());
+    ASSERT_NE(work, nullptr);
+
+    // One key per step forces a second and third step on the same cursor.
+    size_t steps = 0;
+    for (;;) {
+        const auto step = evictor.StepTenantWork(*work, /*max_candidates=*/1);
+        ++steps;
+        ASSERT_LT(steps, 10u);
+        if (step != eviction::Evictor::WorkStep::kMore) {
+            break;
+        }
+    }
+    // One step per key, plus the step that finds the cursor spent.
+    EXPECT_GE(steps, 3u);
+    EXPECT_EQ(evictor.WorkReport(*work).evicted_objects, 3u);
+    EXPECT_EQ(reclaimer_.applied.size(), 3u);
+}
+
 // Each namespace gives up its own share first, however much older another
 // namespace's objects are.
 TEST_F(EvictorTest, EachNamespaceGivesUpItsOwnShare) {

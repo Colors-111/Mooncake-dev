@@ -6130,6 +6130,42 @@ TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {
     EXPECT_FALSE(unmount_batch.entries[0].payload.empty());
 }
 
+TEST_F(MasterServiceHATest, FailedUnmountSweepRetriesWithoutAnotherUnmount) {
+    // In HA the unmount sweeps synchronously; if the OpLog writer rejects one
+    // of its entries the responsibility stays open. A background retry must
+    // finish it, otherwise eviction never returns to the object-ratio round.
+    const std::string cluster_id = "unmount_sweep_retry";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallRejectOnceWriter(service, backend);
+    ASSERT_NE(writer, nullptr);
+
+    auto segment = MakeSegment("sweep_retry_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    PutObjectOnSegment(service, client_id, "sweep_retry_key", segment.name);
+
+    // The sweep's REMOVE entry is the next commit; the writer rejects it.
+    writer->RejectNextCommit();
+    ASSERT_TRUE(service.UnmountSegment(segment.id, client_id).has_value());
+    EXPECT_TRUE(MasterServiceTestPeer(service).CleanupInProgressForTesting());
+
+    // No second unmount: the scheduled retry alone must land the sweep.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (MasterServiceTestPeer(service).CleanupInProgressForTesting() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_FALSE(MasterServiceTestPeer(service).CleanupInProgressForTesting());
+}
+
 TEST_F(MasterServiceHATest, NotifyPromotionSuccessWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_promotion_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();

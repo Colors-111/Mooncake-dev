@@ -1,5 +1,6 @@
 #include "background_worker.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -63,6 +64,39 @@ TEST(BackgroundWorkerTest, ScheduleIsIgnoredWhileStopped) {
 
     std::lock_guard<std::mutex> lock(mutex);
     EXPECT_EQ(callback_count, 0);
+}
+
+TEST(BackgroundWorkerTest, ScheduleAfterWaitsForTheDelay) {
+    std::atomic<int> calls{0};
+    BackgroundWorker worker([&] { ++calls; });
+    worker.Start();
+    worker.ScheduleAfter(std::chrono::milliseconds(200));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(calls.load(), 0);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (calls.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(calls.load(), 1);
+    worker.Stop();
+}
+
+TEST(BackgroundWorkerTest, ImmediateScheduleWinsOverAPendingDelay) {
+    std::atomic<int> calls{0};
+    BackgroundWorker worker([&] { ++calls; });
+    worker.Start();
+    worker.ScheduleAfter(std::chrono::seconds(5));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // An immediate request must not wait behind the delayed one.
+    worker.Schedule();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (calls.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(calls.load(), 1);
+    worker.Stop();
 }
 
 }  // namespace mooncake::test

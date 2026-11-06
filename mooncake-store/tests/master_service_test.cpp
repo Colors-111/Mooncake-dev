@@ -2910,6 +2910,96 @@ TEST_F(MasterServiceTest, EvictionByteShareHandlesLargePools) {
               1234u);
 }
 
+TEST_F(MasterServiceTest, UnmountCleanupCoverageRetiresOnlyWhatASweepSaw) {
+    MasterService service;
+    auto peer = MasterServiceTestPeer(service);
+
+    // Two overlapping sweeps: both snapshot before a third prepare. The
+    // earlier sweep finishing later must not retire the responsibility it
+    // never saw, in either completion order.
+    peer.BeginUnmountCleanupForTesting();
+    const uint64_t first = peer.SnapshotUnmountCleanupsForTesting();
+    peer.BeginUnmountCleanupForTesting();
+    const uint64_t second = peer.SnapshotUnmountCleanupsForTesting();
+    peer.BeginUnmountCleanupForTesting();
+    const uint64_t third = peer.SnapshotUnmountCleanupsForTesting();
+
+    peer.EndUnmountCleanupsForTesting(first);
+    EXPECT_TRUE(peer.CleanupInProgressForTesting());
+    peer.EndUnmountCleanupsForTesting(second);
+    EXPECT_TRUE(peer.CleanupInProgressForTesting());
+    peer.EndUnmountCleanupsForTesting(third);
+    EXPECT_FALSE(peer.CleanupInProgressForTesting());
+
+    // The later sweep finishing first, then the older one: the older
+    // coverage retires nothing it did not see.
+    peer.BeginUnmountCleanupForTesting();
+    const uint64_t older = peer.SnapshotUnmountCleanupsForTesting();
+    peer.BeginUnmountCleanupForTesting();
+    const uint64_t newer = peer.SnapshotUnmountCleanupsForTesting();
+    peer.EndUnmountCleanupsForTesting(newer);
+    EXPECT_FALSE(peer.CleanupInProgressForTesting());
+    peer.EndUnmountCleanupsForTesting(older);
+    EXPECT_FALSE(peer.CleanupInProgressForTesting());
+}
+
+TEST_F(MasterServiceTest, MonitorRetireClearsTheCleanupStateWhenTheJobEnds) {
+    // The monitor path prepares the client's segments itself and then queues
+    // the job. That must be one responsibility from retire to job completion:
+    // a per-segment responsibility the job never ends would keep eviction in
+    // the cleanup period forever.
+    MasterService service;
+    auto segment = MakeSegment("retire_cleanup_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    (void)PutObjectOnSegment(service, client_id, segment.name);
+    const auto liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(liveness);
+
+    auto peer = MasterServiceTestPeer(service);
+    peer.RetireClientForOffboarding(client_id, liveness);
+    EXPECT_TRUE(peer.CleanupInProgressForTesting());
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (peer.OffboardingPendingForTesting() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    // The job finished and ended its one responsibility, so the next trigger
+    // uses the object-ratio round again.
+    EXPECT_FALSE(peer.OffboardingPendingForTesting());
+    EXPECT_FALSE(peer.CleanupInProgressForTesting());
+}
+
+TEST_F(MasterServiceTest, MonitorRetireDoesNotClearAnIndependentUnmount) {
+    MasterService service;
+    auto segment = MakeSegment("retire_concurrent_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    (void)PutObjectOnSegment(service, client_id, segment.name);
+    const auto liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(liveness);
+
+    auto peer = MasterServiceTestPeer(service);
+    // An independent unmount owns its own responsibility; the job finishing
+    // must not clear it.
+    peer.BeginUnmountCleanupForTesting();
+    const uint64_t unmount_snapshot = peer.SnapshotUnmountCleanupsForTesting();
+
+    peer.RetireClientForOffboarding(client_id, liveness);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (peer.OffboardingPendingForTesting() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_FALSE(peer.OffboardingPendingForTesting());
+    EXPECT_TRUE(peer.CleanupInProgressForTesting());
+    peer.EndUnmountCleanupsForTesting(unmount_snapshot);
+    EXPECT_FALSE(peer.CleanupInProgressForTesting());
+}
+
 TEST_F(MasterServiceTest, CleanupEpochPairsEveryResponsibility) {
     MasterService service;
     auto peer = MasterServiceTestPeer(service);
@@ -2922,8 +3012,7 @@ TEST_F(MasterServiceTest, CleanupEpochPairsEveryResponsibility) {
     peer.BeginUnmountCleanupForTesting();
     peer.EndUnmountCleanupsForTesting(snapshot);
     EXPECT_TRUE(peer.CleanupInProgressForTesting());
-    peer.EndUnmountCleanupsForTesting(
-        peer.SnapshotUnmountCleanupsForTesting());
+    peer.EndUnmountCleanupsForTesting(peer.SnapshotUnmountCleanupsForTesting());
     EXPECT_FALSE(peer.CleanupInProgressForTesting());
 
     // Offboarding responsibilities pair one begin with one end: a completed
@@ -2935,8 +3024,7 @@ TEST_F(MasterServiceTest, CleanupEpochPairsEveryResponsibility) {
     EXPECT_TRUE(peer.CleanupInProgressForTesting());
     peer.EndOffboardingCleanupForTesting();
     EXPECT_TRUE(peer.CleanupInProgressForTesting());
-    peer.EndUnmountCleanupsForTesting(
-        peer.SnapshotUnmountCleanupsForTesting());
+    peer.EndUnmountCleanupsForTesting(peer.SnapshotUnmountCleanupsForTesting());
     EXPECT_FALSE(peer.CleanupInProgressForTesting());
 }
 
