@@ -2893,6 +2893,61 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
     EXPECT_LT(buckets_after, buckets_before / 2);
 }
 
+TEST_F(MasterServiceTest, EvictionByteShareHandlesLargePools) {
+    // 200 GB of gap across 200M filed keys: 112M of them means 112 GB. The
+    // naive uint64_t product overflows (2e11 * 1.12e8 > 2^64).
+    EXPECT_EQ(MasterServiceTestPeer::EvictionByteShareForTesting(
+                  200ULL * 1000 * 1000 * 1000, 112000000ULL, 200000000ULL),
+              112ULL * 1000 * 1000 * 1000);
+    EXPECT_EQ(MasterServiceTestPeer::EvictionByteShareForTesting(
+                  1000ULL * 1000 * 1000 * 1000, 100000000ULL, 200000000ULL),
+              500ULL * 1000 * 1000 * 1000);
+    // A tenant that filed everything takes the whole gap; an empty pool keeps
+    // it too rather than dividing by zero.
+    EXPECT_EQ(MasterServiceTestPeer::EvictionByteShareForTesting(1234, 7, 7),
+              1234u);
+    EXPECT_EQ(MasterServiceTestPeer::EvictionByteShareForTesting(1234, 7, 0),
+              1234u);
+}
+
+TEST_F(MasterServiceTest, EvictionWorkPeriodRunsToTheLowWatermark) {
+    // The low-watermark work period: one period keeps evicting, re-deriving
+    // the byte gap after every slice, until live usage is back below the low
+    // fraction of capacity -- unlike a fixed 5%-of-objects round.
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(0)
+                              .set_eviction_high_watermark_ratio(0.9)
+                              .set_eviction_low_watermark_ratio(0.5)
+                              .build();
+    auto service = std::make_unique<MasterService>(service_config);
+    constexpr size_t kSegmentSize = 64ULL * 1024 * 1024;
+    constexpr size_t kObjectSize = 1ULL << 20;  // 1 MiB
+    constexpr size_t kObjects = 60;             // 93.75% of the segment
+    auto segment =
+        MakeSegment("work_period_segment", kDefaultSegmentBase, kSegmentSize);
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = segment.name;
+    for (size_t i = 0; i < kObjects; ++i) {
+        const std::string key = "work_period_key_" + std::to_string(i);
+        ASSERT_TRUE(service
+                        ->PutStart(client_id, key, TenantId::Default(),
+                                   kObjectSize, config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        ->PutEnd(client_id, key, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                        .has_value());
+    }
+    ASSERT_GT(MasterServiceTestPeer(*service).MemoryUsedRatio(), 0.9);
+
+    MasterServiceTestPeer(*service).RunEvictionWorkPeriod();
+
+    EXPECT_LE(MasterServiceTestPeer(*service).MemoryUsedRatio(), 0.55);
+}
+
 TEST_F(MasterServiceTest, BatchEvictCountsARoundOnlyWhenItHadSomethingToDo) {
     // Zero lease TTL so the committed object is immediately evictable.
     auto service_config =

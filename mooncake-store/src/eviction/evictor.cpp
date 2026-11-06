@@ -117,6 +117,14 @@ class Evictor::Pass {
         if (!hold) {
             return;
         }
+        // Measurement only: how much of a round walks keys that can never
+        // release anything, so a slow round after a client goes offline can
+        // be told apart from one that is simply short of evictable keys.
+        ++report_.visited;
+        if (hold->has_object() &&
+            !hold->metadata().HasServiceableMemoryReplica()) {
+            ++report_.permanently_unavailable;
+        }
         // Freed as this returns, after the lock is let go.
         const std::vector<Replica> detached = EvictLocked(*hold, entry);
         hold.reset();
@@ -181,6 +189,9 @@ class Evictor::Pass {
     }
 
     void Skip(const route::WriteGuard& hold, SkipReason reason) {
+        if (reason == SkipReason::kNothingToRelease) {
+            ++report_.nothing_to_release;
+        }
         const ObjectView view{ns_.id(), hold.key(), hold.metadata()};
         for (EvictionObserver* observer : evictor_.observers_) {
             observer->OnSkipped(view, reason);

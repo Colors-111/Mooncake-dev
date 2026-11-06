@@ -581,6 +581,24 @@ class Replica {
         return std::get<DfsReplicaData>(data_).descriptor;
     }
 
+    // True when nothing can ever serve from this replica again: its buffer's
+    // allocator lifetime ended (the segment was unmounted) or the client that
+    // owns it is irreversibly OFFLINE. SUSPECTED is not permanent -- that
+    // client may come back -- and neither is a lease, a pin or a refcount,
+    // which are temporary reasons eviction may skip a key today.
+    [[nodiscard]] bool is_permanently_unavailable() const {
+        if (!is_memory_replica()) {
+            return false;  // only memory replicas feed the eviction index
+        }
+        const auto& memory = std::get<MemoryReplicaData>(data_);
+        if (!memory.buffer || !memory.buffer->isAllocatorValid()) {
+            return true;
+        }
+        const auto liveness = memory.buffer->getClientLiveness();
+        return liveness != nullptr &&
+               liveness->state() == ClientLivenessState::OFFLINE;
+    }
+
     [[nodiscard]] bool has_invalid_mem_handle() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);

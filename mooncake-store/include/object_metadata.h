@@ -269,6 +269,17 @@ struct ObjectMetadata {
         return num_visited;
     }
 
+    // Whether at least one COMPLETE memory replica can still serve. The
+    // eviction index files a key only while this holds, so a key whose memory
+    // all sits on unmounted segments or offline clients leaves the index the
+    // first time eviction visits it instead of being revisited every round.
+    bool HasServiceableMemoryReplica() const {
+        return HasReplica([](const Replica& replica) {
+            return replica.is_memory_replica() && replica.is_completed() &&
+                   !replica.is_permanently_unavailable();
+        });
+    }
+
     bool HasReplica(const std::function<bool(const Replica&)>& pred_fn) const {
         return std::ranges::any_of(GetPart(0).replicas(), pred_fn);
     }

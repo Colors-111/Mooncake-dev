@@ -1190,8 +1190,16 @@ class MasterService {
     // tenant is first read to pick the objects that match, and only those are
     // cleaned, each under its own write lock, since a mass client expiry marks
     // handles stale table-wide.
+    // Counts one sweep's work, for logging: objects the read pass met,
+    // objects it picked for cleanup, and objects it tore down entirely.
+    struct StaleSweepStats {
+        uint64_t visited = 0;
+        uint64_t candidates = 0;
+        uint64_t erased = 0;
+    };
     tl::expected<void, ErrorCode> ClearStaleHandles(
-        const std::function<bool(const Replica&)>& is_stale);
+        const std::function<bool(const Replica&)>& is_stale,
+        StaleSweepStats* stats = nullptr);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
@@ -1549,6 +1557,16 @@ class MasterService {
         const std::chrono::system_clock::time_point& now);
 
     // Eviction thread function
+    // One high-watermark work period: while live usage is above the low
+    // watermark, run bounded per-tenant byte slices and re-derive the gap from
+    // the latest usage and capacity after each of them. Only reached when
+    // eviction_low_watermark_ratio_ is configured.
+    void RunEvictionWorkPeriod();
+    // `amount`'s share of `whole` for the `part` keys a tenant filed, without
+    // overflowing 64 bits: a 1e12-byte gap times 1e8 keys does not fit.
+    [[nodiscard]] static uint64_t EvictionByteShare(uint64_t amount,
+                                                    uint64_t part,
+                                                    uint64_t whole);
     void EvictionThreadFunc();
     void NofHeartbeatThreadFunc();
     bool TryUnmountNoFSegmentByHeartbeat(
@@ -1636,7 +1654,11 @@ class MasterService {
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                 // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;
+    const double eviction_low_watermark_ratio_;
+    // Whether an invalid low/high pair has been reported, so a misconfigured
+    // master logs it once instead of on every trigger.
+    mutable bool low_watermark_config_reported_{false};  // in range [0.0, 1.0]
     const double nof_eviction_ratio_;             // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 

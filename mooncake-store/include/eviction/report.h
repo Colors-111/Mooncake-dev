@@ -61,6 +61,12 @@ struct Effect {
 struct Report {
     // Keys the eviction indexes had filed when the run began.
     uint64_t filed = 0;
+    // Keys the run met and judged (a group counts each member).
+    uint64_t visited = 0;
+    // Of those, keys with no memory replica that can ever serve again.
+    uint64_t permanently_unavailable = 0;
+    // Keys the policy skipped because no replica it would release was left.
+    uint64_t nothing_to_release = 0;
     // Objects that released memory, and the memory they released.
     uint64_t evicted_objects = 0;
     uint64_t released_bytes = 0;

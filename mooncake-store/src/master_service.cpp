@@ -490,6 +490,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
+      eviction_low_watermark_ratio_(config.eviction_low_watermark_ratio),
       nof_eviction_ratio_(config.nof_eviction_ratio),
       nof_eviction_high_watermark_ratio_(
           config.nof_eviction_high_watermark_ratio),
@@ -2516,7 +2517,8 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
 }
 
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
-    const std::function<bool(const Replica&)>& is_stale) {
+    const std::function<bool(const Replica&)>& is_stale,
+    StaleSweepStats* stats) {
     std::optional<ErrorCode> first_persist_error;
     VisitNamespaces([&](const TenantId& tenant_id, metadata::Namespace& ns) {
         // Reader pre-check: an object with nothing to sweep never takes the
@@ -2526,7 +2528,13 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
         std::vector<route::ObjectRef> to_sweep;
         for (auto object : ns.objects.ReadCursor()) {
             const auto& metadata = object.metadata();
+            if (stats != nullptr) {
+                ++stats->visited;
+            }
             if (metadata.HasReplica(is_stale) || !metadata.IsValid()) {
+                if (stats != nullptr) {
+                    ++stats->candidates;
+                }
                 to_sweep.push_back(object.ref());
             }
         }
@@ -2580,6 +2588,9 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                 continue;
             }
             accessor.Erase();
+            if (stats != nullptr) {
+                ++stats->erased;
+            }
         }
     });
     if (first_persist_error) {
@@ -2639,8 +2650,10 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         }
 
         if (!job.metadata_cleanup_accepted) {
-            const auto cleanup_result =
-                ClearStaleHandles([&job](const Replica& replica) {
+            StaleSweepStats sweep_stats;
+            const auto sweep_started = std::chrono::steady_clock::now();
+            const auto cleanup_result = ClearStaleHandles(
+                [&job](const Replica& replica) {
                     if (!replica.is_completed()) {
                         return false;
                     }
@@ -2650,7 +2663,21 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                     }
                     return replica.is_memory_replica() &&
                            replica.isAffiliatedWith(job.liveness);
-                });
+                },
+                &sweep_stats);
+            const auto sweep_elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - sweep_started)
+                    .count();
+            // Measurement only: how much metadata this attempt walked and
+            // cleaned, and how long it held the store's stripes doing so.
+            // Eviction competes for the same locks during this window.
+            LOG(INFO) << "[OFFBOARD-MEASURE] client_id=" << job.client_id
+                      << ", visited=" << sweep_stats.visited
+                      << ", candidates=" << sweep_stats.candidates
+                      << ", erased=" << sweep_stats.erased
+                      << ", duration_ms=" << sweep_elapsed_ms
+                      << ", retry_count=" << job.retry_count;
             if (!cleanup_result) {
                 LOG(ERROR) << "client_id=" << job.client_id
                            << ", action=queue_client_offboarding_metadata"
@@ -9649,6 +9676,247 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     return {};
 }
 
+uint64_t MasterService::EvictionByteShare(uint64_t amount, uint64_t part,
+                                          uint64_t whole) {
+    if (whole == 0) {
+        return amount;
+    }
+    // 128-bit product: amount can be terabytes and part tens of millions.
+    return static_cast<uint64_t>((static_cast<unsigned __int128>(amount) *
+                                  part) /
+                                 whole);
+}
+
+void MasterService::RunEvictionWorkPeriod() {
+    const double low = eviction_low_watermark_ratio_;
+    const double high = eviction_high_watermark_ratio_;
+    // A REMOVE this period enqueued but the writer has not made durable still
+    // holds its bytes; that is when waiting for the finalize is the right
+    // move instead of queueing more.
+    const bool waits_for_finalize = enable_ha_ && enable_oplog_;
+    const bool allocation_pressure =
+        need_mem_eviction_.exchange(false, std::memory_order_relaxed);
+    const auto started = std::chrono::steady_clock::now();
+    const auto start_usage = segment_manager_.GetMemoryUsage();
+    uint64_t requested_bytes = 0;
+    uint64_t passes = 0;
+    uint64_t slices = 0;
+    uint64_t finalize_waits = 0;
+    uint64_t discarded_bytes = 0;
+    bool pressure_pass_spent = false;
+    bool exhausted = true;
+    const char* outcome = "exhausted";
+
+    // Expired PROCESSING replicas and deferred releases go first, as the
+    // object-ratio round does. A long period keeps resetting the discard
+    // timer, so without this the idle branch would never reach them while
+    // memory stays high.
+    const auto discard_expired = [&]() {
+        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+        const auto now = std::chrono::system_clock::now();
+        VisitNamespaces([&](const TenantId& /*tenant_id*/,
+                            metadata::Namespace& ns) {
+            DiscardExpiredProcessingReplicas(ns, now);
+        });
+        discarded_bytes += ReleaseExpiredDiscardedReplicas(now);
+    };
+    discard_expired();
+
+    for (;;) {
+        if (!eviction_running_) {
+            outcome = "stopped";
+            exhausted = false;
+            break;
+        }
+        if (!AdmitsBusinessWorkers()) {
+            outcome = "gated";
+            exhausted = false;
+            break;
+        }
+        auto usage = segment_manager_.GetMemoryUsage();
+        if (usage.capacity_bytes == 0) {
+            outcome = "capacity_zero";
+            break;
+        }
+        const double target = low * static_cast<double>(usage.capacity_bytes);
+        if (static_cast<double>(usage.used_bytes) <= target) {
+            // An allocation failure is an entry of its own: try one pass even
+            // below the low watermark instead of dropping the signal.
+            if (allocation_pressure && !pressure_pass_spent) {
+                pressure_pass_spent = true;
+            } else {
+                outcome = "done";
+                exhausted = false;
+                break;
+            }
+        }
+        discard_expired();
+
+        // One pass over the tenants, sharing what is left of the gap by how
+        // many keys each has filed. The shares are recomputed from the latest
+        // usage before every slice, and a tenant's unfinished part falls to
+        // the tenants after it.
+        struct TenantShare {
+            TenantId tenant;
+            uint64_t filed;
+        };
+        std::vector<TenantShare> tenants;
+        {
+            std::shared_lock<std::shared_mutex> shared_lock(
+                master_state_mutex_);
+            const auto now = std::chrono::system_clock::now();
+            VisitNamespaces([&](const TenantId& tenant_id,
+                                metadata::Namespace& ns) {
+                tenants.push_back(
+                    {tenant_id, ns.eviction_index().Scan(now)->Total()});
+            });
+        }
+        uint64_t remaining_filed = 0;
+        for (const TenantShare& share : tenants) {
+            remaining_filed += share.filed;
+        }
+        if (remaining_filed == 0) {
+            outcome = "nothing_filed";
+            break;
+        }
+        ++passes;
+        bool pass_progress = false;
+        uint64_t pass_evicted = 0;
+        uint64_t pass_released = 0;
+        uint64_t pass_filed = 0;
+        for (const TenantShare& share : tenants) {
+            if (!eviction_running_ || !AdmitsBusinessWorkers()) {
+                break;
+            }
+            if (share.filed == 0) {
+                continue;
+            }
+            const auto slice_usage = segment_manager_.GetMemoryUsage();
+            if (slice_usage.capacity_bytes == 0) {
+                break;
+            }
+            const double slice_target =
+                low * static_cast<double>(slice_usage.capacity_bytes);
+            if (static_cast<double>(slice_usage.used_bytes) <= slice_target) {
+                break;
+            }
+            const uint64_t gap = slice_usage.used_bytes -
+                                 static_cast<uint64_t>(slice_target);
+            const uint64_t tenant_share = std::max<uint64_t>(
+                1, EvictionByteShare(gap, share.filed, remaining_filed));
+            const auto slice_started = std::chrono::steady_clock::now();
+            eviction::Report report;
+            {
+                std::shared_lock<std::shared_mutex> shared_lock(
+                    master_state_mutex_);
+                report = memory_eviction_->evictor.Run(
+                    share.tenant,
+                    eviction::ByteGoal{.target_bytes = tenant_share});
+            }
+            const auto slice_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - slice_started)
+                    .count();
+            ++slices;
+            requested_bytes += report.released_bytes;
+            pass_evicted += report.evicted_objects;
+            pass_released += report.released_bytes;
+            pass_filed += report.filed;
+            if (report.MadeProgress()) {
+                pass_progress = true;
+            }
+            LOG(INFO) << "[EVICT-SLICE] tenant=" << share.tenant.value()
+                      << ", filed=" << report.filed
+                      << ", visited=" << report.visited
+                      << ", permanently_unavailable="
+                      << report.permanently_unavailable
+                      << ", nothing_to_release=" << report.nothing_to_release
+                      << ", requested_bytes=" << tenant_share
+                      << ", released_bytes=" << report.released_bytes
+                      << ", evicted=" << report.evicted_objects
+                      << ", duration_ms=" << slice_ms;
+            remaining_filed -= share.filed;
+        }
+
+        // Same accounting as the object-ratio round: a pass that released
+        // something is a success, one that had keys filed and released
+        // nothing is a failure.
+        auto& metrics = MasterMetricManager::instance();
+        if (pass_progress) {
+            metrics.inc_eviction_success(static_cast<int64_t>(pass_evicted),
+                                         static_cast<int64_t>(pass_released));
+            metrics.inc_mem_eviction_success(
+                static_cast<int64_t>(pass_evicted),
+                static_cast<int64_t>(pass_released));
+        } else if (pass_filed > 0) {
+            metrics.inc_eviction_fail();
+            metrics.inc_mem_eviction_fail();
+        }
+
+        usage = segment_manager_.GetMemoryUsage();
+        if (usage.capacity_bytes != 0 &&
+            static_cast<double>(usage.used_bytes) <=
+                low * static_cast<double>(usage.capacity_bytes)) {
+            outcome = "done";
+            exhausted = false;
+            break;
+        }
+        if (waits_for_finalize && requested_bytes > 0) {
+            const uint64_t dropped =
+                start_usage.used_bytes > usage.used_bytes
+                    ? start_usage.used_bytes - usage.used_bytes
+                    : 0;
+            if (dropped * 2 < requested_bytes) {
+                // What this period asked to release already covers the gap
+                // but the bytes are still in use: wait for the durable
+                // finalize instead of queueing more REMOVEs or spinning.
+                ++finalize_waits;
+                bool moved = false;
+                for (int poll = 0; poll < 10; ++poll) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(100));
+                    const auto polled = segment_manager_.GetMemoryUsage();
+                    if (polled.used_bytes < usage.used_bytes) {
+                        moved = true;
+                        break;
+                    }
+                }
+                if (!moved) {
+                    outcome = "waiting_for_finalize";
+                    exhausted = false;
+                    break;
+                }
+                continue;
+            }
+        }
+        if (!pass_progress) {
+            outcome = "exhausted";
+            break;
+        }
+    }
+
+    if (allocation_pressure && exhausted) {
+        // No progress: keep the allocation-failure signal for the next
+        // iteration instead of dropping it because the period ended.
+        need_mem_eviction_.store(true, std::memory_order_relaxed);
+    }
+    const auto end_usage = segment_manager_.GetMemoryUsage();
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count();
+    LOG(INFO) << "[EVICT-PERIOD] outcome=" << outcome
+              << ", start_used_bytes=" << start_usage.used_bytes
+              << ", end_used_bytes=" << end_usage.used_bytes
+              << ", capacity_bytes=" << end_usage.capacity_bytes
+              << ", high=" << high << ", low=" << low
+              << ", passes=" << passes << ", slices=" << slices
+              << ", requested_bytes=" << requested_bytes
+              << ", discarded_bytes=" << discarded_bytes
+              << ", finalize_waits=" << finalize_waits
+              << ", duration_ms=" << elapsed_ms;
+}
+
 void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
@@ -9666,21 +9934,44 @@ void MasterService::EvictionThreadFunc() {
         }
 
         const auto now = std::chrono::system_clock::now();
-        double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
+        const auto usage = segment_manager_.GetMemoryUsage();
+        double used_ratio = usage.used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
-            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
+            if (eviction_low_watermark_ratio_ > 0.0 &&
+                eviction_low_watermark_ratio_ >=
+                    eviction_high_watermark_ratio_ &&
+                !low_watermark_config_reported_) {
+                LOG(ERROR) << "eviction_low_watermark_ratio="
+                           << eviction_low_watermark_ratio_
+                           << " must be below eviction_high_watermark_ratio="
+                           << eviction_high_watermark_ratio_
+                           << "; the low-watermark work period stays disabled";
+                low_watermark_config_reported_ = true;
+            }
+            const bool period_mode =
+                eviction_low_watermark_ratio_ > 0.0 &&
+                eviction_low_watermark_ratio_ < eviction_high_watermark_ratio_;
+            LOG(INFO) << "[EVICT-TRIGGER] mode="
+                      << (period_mode ? "work_period" : "object_ratio")
+                      << " memory_ratio=" << used_ratio
                       << " high_watermark=" << eviction_high_watermark_ratio_
+                      << " low_watermark=" << eviction_low_watermark_ratio_
                       << " need_mem_eviction=" << need_mem_eviction_
                       << " eviction_ratio=" << eviction_ratio_;
-            double evict_ratio_target = std::max(
-                eviction_ratio_,
-                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_);
-            double evict_ratio_lowerbound =
-                std::max(evict_ratio_target * 0.5,
-                         used_ratio - eviction_high_watermark_ratio_);
-            BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
-            LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
+            if (period_mode) {
+                RunEvictionWorkPeriod();
+            } else {
+                double evict_ratio_target = std::max(
+                    eviction_ratio_, used_ratio -
+                                         eviction_high_watermark_ratio_ +
+                                         eviction_ratio_);
+                double evict_ratio_lowerbound =
+                    std::max(evict_ratio_target * 0.5,
+                             used_ratio - eviction_high_watermark_ratio_);
+                BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+                LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
+            }
             last_discard_time = now;
         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
             // Try discarding expired processing keys and ongoing replication
@@ -10032,10 +10323,28 @@ void MasterService::BatchEvict(double evict_ratio_target,
             DiscardExpiredProcessingReplicas(ns, now);
         });
     const uint64_t released_discarded = ReleaseExpiredDiscardedReplicas(now);
+    const auto measure_started = std::chrono::steady_clock::now();
     const eviction::Report report = memory_eviction_->evictor.Run(
         eviction::Scope::All(),
         eviction::ObjectGoal{.target_ratio = evict_ratio_target,
                              .min_ratio = evict_ratio_lowerbound});
+    const auto measure_elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - measure_started)
+            .count();
+    // Measurement only: round duration next to how much of the walk met keys
+    // that can never release anything (offline clients, unmounted segments),
+    // which is what stretches a round after a store goes offline.
+    LOG(INFO) << "[EVICT-MEASURE] duration_ms=" << measure_elapsed_ms
+              << ", target_ratio=" << evict_ratio_target
+              << ", lowerbound_ratio=" << evict_ratio_lowerbound
+              << ", filed=" << report.filed << ", visited=" << report.visited
+              << ", permanently_unavailable="
+              << report.permanently_unavailable
+              << ", nothing_to_release=" << report.nothing_to_release
+              << ", evicted=" << report.evicted_objects
+              << ", released_bytes=" << report.released_bytes
+              << ", stopped=" << (report.stopped ? 1 : 0);
     const bool made_progress = report.MadeProgress() || released_discarded > 0;
     if (allocation_pressure && !report.stopped && !made_progress &&
         report.filed > 0) {

@@ -58,6 +58,23 @@ class MasterServiceTestPeer {
         MasterService& service, const ObjectMetadata& metadata,
         const std::vector<Replica::Descriptor>& replicas);
 
+    // One synchronous high-watermark work period, as the eviction thread
+    // runs it when eviction_low_watermark_ratio is configured.
+    void RunEvictionWorkPeriod() { service_.RunEvictionWorkPeriod(); }
+
+    static uint64_t EvictionByteShareForTesting(uint64_t amount, uint64_t part,
+                                                uint64_t whole) {
+        return MasterService::EvictionByteShare(amount, part, whole);
+    }
+
+    double MemoryUsedRatio() const {
+        return service_.segment_manager_.GetMemoryUsage().used_ratio();
+    }
+
+    size_t MemoryUsedBytes() const {
+        return service_.segment_manager_.GetMemoryUsage().used_bytes;
+    }
+
     // Drive one eviction cycle synchronously, without the periodic worker.
     void RunBatchEvictForTesting(double evict_ratio_target,
                                  double evict_ratio_lowerbound);

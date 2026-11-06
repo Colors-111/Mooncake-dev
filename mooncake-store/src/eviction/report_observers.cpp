@@ -50,7 +50,11 @@ void LogObserver::OnRunEnd(const Scope& scope, const Report& report) {
                 << ", actual_evict_ratio=" << actual_evict_ratio;
         LOG(INFO) << "[EVICT-RESULT] evicted_count=" << report.evicted_objects
                   << ", eviction_base=" << report.filed
-                  << ", actual_evict_ratio=" << actual_evict_ratio;
+                  << ", actual_evict_ratio=" << actual_evict_ratio
+                  << ", visited=" << report.visited
+                  << ", permanently_unavailable="
+                  << report.permanently_unavailable
+                  << ", nothing_to_release=" << report.nothing_to_release;
     }
 
     const std::string prefix =
