@@ -1211,7 +1211,18 @@ class MasterService {
     // The queue slot the monitor reserves before its retire callback runs;
     // tests drive the same order.
     void ReserveClientOffboardingJob();
-    bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
+    ClientOffboardingOutcome ProcessClientOffboardingJob(
+        ClientOffboardingJob& job);
+    // One bounded slice of the offboarding metadata sweep: collect one
+    // stripe's candidates under the route's read lock, release it, then clean
+    // them in bounded sub-batches with the master lock released between them.
+    ClientOffboardingOutcome SweepOffboardingBatch(ClientOffboardingJob& job);
+    // One candidate, re-judged under its own write lock. Returns an error only
+    // when an OpLog persist attempt failed.
+    std::optional<ErrorCode> CleanStaleHandleObject(
+        const TenantId& tenant_id, const route::ObjectRef& object,
+        const std::function<bool(const Replica&)>& is_stale,
+        StaleSweepStats* stats);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();

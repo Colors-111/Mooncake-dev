@@ -598,8 +598,25 @@ class MasterServiceTestPeer {
                                                            object_id.user_key);
     }
 
-    bool ProcessClientOffboardingJob(ClientOffboardingJob& job) {
+    ClientOffboardingOutcome ProcessClientOffboardingJob(
+        ClientOffboardingJob& job) {
         return service_.ProcessClientOffboardingJob(job);
+    }
+
+    // Drives the bounded slices until the job finishes or needs a retry, as
+    // the worker does without a backoff for kContinue.
+    bool ProcessClientOffboardingJobToCompletion(ClientOffboardingJob& job) {
+        for (int slice = 0; slice < 100000; ++slice) {
+            const ClientOffboardingOutcome outcome =
+                service_.ProcessClientOffboardingJob(job);
+            if (outcome == ClientOffboardingOutcome::kDone) {
+                return true;
+            }
+            if (outcome == ClientOffboardingOutcome::kWait) {
+                return false;
+            }
+        }
+        return false;
     }
 
     tl::expected<void, ErrorCode> PushOffloadingQueue(

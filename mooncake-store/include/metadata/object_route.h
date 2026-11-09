@@ -455,6 +455,20 @@ class ObjectRoute {
     [[nodiscard]] Cursor<LockMode::kRead> ReadCursor() const;
     [[nodiscard]] Cursor<LockMode::kWrite> WriteCursor();
 
+    // Visits every object of stripe `index`, each under its own key's read
+    // lock, and returns after releasing every route lock. A stripe is the
+    // resume point for a long sweep: the caller keeps no iterator across
+    // calls, only the stripe index. A slot busy elsewhere is kept in the map
+    // with a handle and visited after the stripe lock is released, exactly as
+    // the cursor does, so it is not skipped for good. The callback runs under
+    // the stripe's shared lock for the slots that were free to lock, so it
+    // must not reach this route or wait on a lock a route holder may need.
+    template <typename Visit>
+    void VisitStripe(size_t index, Visit&& visit) const;
+
+    // How many stripes a route has: the units a resumable walk advances by.
+    [[nodiscard]] static constexpr size_t StripeCount() { return kStripeCount; }
+
     // The member keys of one group, as a snapshot to resolve again: a key in
     // it may hold a different object by the time the caller reads it, or none.
     [[nodiscard]] std::vector<std::string> GroupMembers(
@@ -831,6 +845,40 @@ inline void ObjectRoute::TearDownLocked(KeySlot& slot) {
     slot.record_.reset();
     slot.state_.fetch_and(~KeySlot::kOccupied, std::memory_order_relaxed);
     object_count_.fetch_sub(1, std::memory_order_relaxed);
+}
+
+template <typename Visit>
+void ObjectRoute::VisitStripe(size_t index, Visit&& visit) const {
+    AssertNotInCursor();
+    if (index >= kStripeCount) {
+        return;
+    }
+    Stripe& stripe = stripes_[index];
+    std::vector<SlotHandle> deferred;
+    {
+        std::shared_lock<std::shared_mutex> stripe_lock(stripe.lock);
+        for (auto it = stripe.slots.begin(); it != stripe.slots.end(); ++it) {
+            KeySlot& slot = it->second;
+            std::shared_lock<std::shared_mutex> slot_lock(slot.mutex_,
+                                                          std::try_to_lock);
+            if (!slot_lock.owns_lock()) {
+                // A handle keeps it in the map while we come back for it.
+                deferred.emplace_back(stripe, slot);
+                continue;
+            }
+            if (slot.record_.has_value()) {
+                visit(slot.key(), slot.record_->generation,
+                      slot.record_->metadata);
+            }
+        }
+    }
+    for (SlotHandle& handle : deferred) {
+        KeySlot& slot = *handle;
+        std::shared_lock<std::shared_mutex> slot_lock(slot.mutex_);
+        if (slot.record_.has_value()) {
+            visit(slot.key(), slot.record_->generation, slot.record_->metadata);
+        }
+    }
 }
 
 inline ObjectRoute::Cursor<LockMode::kRead> ObjectRoute::ReadCursor() const {

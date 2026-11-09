@@ -2527,6 +2527,60 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
     });
 }
 
+std::optional<ErrorCode> MasterService::CleanStaleHandleObject(
+    const TenantId& tenant_id, const route::ObjectRef& object,
+    const std::function<bool(const Replica&)>& is_stale,
+    StaleSweepStats* stats) {
+    // The by-reference accessor skips the invalid-replica cleanup, which
+    // would drop the stale replicas before this pass could see what it erased.
+    MetadataAccessorRW accessor(this, tenant_id, object);
+    if (!accessor.IsPublished()) {
+        return std::nullopt;
+    }
+    auto& metadata = accessor.Get();
+    const auto cleanup_plan = BuildStaleHandleCleanupPlan(metadata, is_stale);
+    if (!cleanup_plan.removed_ids.empty()) {
+        if (enable_ha_ && enable_oplog_) {
+            // The erase runs from the durable-finalize callback.
+            auto persist_result = PersistStaleHandleCleanupForHA(
+                "ClearStaleHandles", tenant_id, object.key, metadata,
+                cleanup_plan);
+            if (!persist_result) {
+                return persist_result.error();
+            }
+            return std::nullopt;
+        }
+        if (!CleanupStaleHandles(object.key, tenant_id, metadata,
+                                 accessor.GetState(), is_stale)) {
+            return std::nullopt;
+        }
+    } else if (metadata.IsValid()) {
+        return std::nullopt;
+    } else if (enable_ha_) {
+        if (enable_oplog_) {
+            auto persist_result = AppendOpLogWithDurableFinalize(
+                OpType::REMOVE, tenant_id.value(), object.key, {},
+                [this, object](const OpLogEntry& durable_entry) {
+                    FinalizeMetadataEraseAfterDurable(
+                        object, TenantId(durable_entry.tenant_id));
+                });
+            if (!persist_result) {
+                LOG(WARNING)
+                    << "ClearStaleHandles(last replica)"
+                    << ": REMOVE persist failed for key=" << object.key
+                    << ", err=" << static_cast<int>(persist_result.error());
+                return persist_result.error();
+            }
+        }
+        return std::nullopt;
+    }
+    accessor.Erase();
+    if (stats != nullptr) {
+        ++stats->erased;
+    }
+    return std::nullopt;
+}
+
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale,
     StaleSweepStats* stats) {
@@ -2550,57 +2604,10 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
             }
         }
         for (const auto& object : to_sweep) {
-            // The by-reference accessor skips the invalid-replica cleanup,
-            // which would drop the stale replicas before this pass could see
-            // what it erased.
-            MetadataAccessorRW accessor(this, tenant_id, object);
-            if (!accessor.IsPublished()) {
-                continue;
-            }
-            auto& metadata = accessor.Get();
-            const auto cleanup_plan =
-                BuildStaleHandleCleanupPlan(metadata, is_stale);
-            if (!cleanup_plan.removed_ids.empty()) {
-                if (enable_ha_ && enable_oplog_) {
-                    // The erase runs from the durable-finalize callback.
-                    auto persist_result = PersistStaleHandleCleanupForHA(
-                        "ClearStaleHandles", tenant_id, object.key, metadata,
-                        cleanup_plan);
-                    if (!persist_result && !first_persist_error) {
-                        first_persist_error = persist_result.error();
-                    }
-                    continue;
-                }
-                if (!CleanupStaleHandles(object.key, tenant_id, metadata,
-                                         accessor.GetState(), is_stale)) {
-                    continue;
-                }
-            } else if (metadata.IsValid()) {
-                continue;
-            } else if (enable_ha_) {
-                if (enable_oplog_) {
-                    auto persist_result = AppendOpLogWithDurableFinalize(
-                        OpType::REMOVE, tenant_id.value(), object.key, {},
-                        [this, object](const OpLogEntry& durable_entry) {
-                            FinalizeMetadataEraseAfterDurable(
-                                object, TenantId(durable_entry.tenant_id));
-                        });
-                    if (!persist_result) {
-                        LOG(WARNING)
-                            << "ClearStaleHandles(last replica)"
-                            << ": REMOVE persist failed for key=" << object.key
-                            << ", err="
-                            << static_cast<int>(persist_result.error());
-                        if (!first_persist_error) {
-                            first_persist_error = persist_result.error();
-                        }
-                    }
-                }
-                continue;
-            }
-            accessor.Erase();
-            if (stats != nullptr) {
-                ++stats->erased;
+            auto error =
+                CleanStaleHandleObject(tenant_id, object, is_stale, stats);
+            if (error && !first_persist_error) {
+                first_persist_error = error;
             }
         }
     });
@@ -2610,11 +2617,170 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     return {};
 }
 
-bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
+ClientOffboardingOutcome MasterService::SweepOffboardingBatch(
+    ClientOffboardingJob& job) {
+    // A stripe is the resume boundary, not the work batch: its candidates are
+    // collected under the route's read lock into the job, then cleaned in
+    // bounded sub-batches with the master lock released between them. The
+    // candidate list and offset live on the job, so the budget can end a slice
+    // inside a stripe. Collection itself may exceed the budget (a busy stripe
+    // is one lock hold); the logs report collection and the longest cleaning
+    // batch separately rather than claiming a hard bound.
+    static constexpr size_t kCandidatesPerCleanBatch = 8192;
+    static constexpr auto kSliceBudget = std::chrono::milliseconds(50);
+    const auto slice_started = std::chrono::steady_clock::now();
+    const auto is_stale = [&job](const Replica& replica) {
+        if (!replica.is_completed()) {
+            return false;
+        }
+        if (replica.is_local_disk_replica()) {
+            return replica.get_local_disk_client_id() == job.client_id;
+        }
+        return replica.is_memory_replica() &&
+               replica.isAffiliatedWith(job.liveness);
+    };
+    const auto is_unfinished = [&job](const Replica& replica) {
+        return replica.is_processing() &&
+               replica.isAffiliatedWith(job.liveness);
+    };
+
+    if (!job.sweep_tenants_captured) {
+        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+        VisitNamespaces(
+            [&](const TenantId& tenant_id, metadata::Namespace& /*ns*/) {
+                job.sweep_tenants.push_back(tenant_id);
+            });
+        job.sweep_tenants_captured = true;
+    }
+
+    for (;;) {
+        if (!eviction_running_ || !AdmitsBusinessWorkers()) {
+            return ClientOffboardingOutcome::kWait;
+        }
+        if (job.sweep_tenant_index >= job.sweep_tenants.size()) {
+            return ClientOffboardingOutcome::kDone;
+        }
+        const TenantId tenant = job.sweep_tenants[job.sweep_tenant_index];
+
+        if (job.sweep_candidates.empty() && job.sweep_candidate_offset == 0) {
+            std::vector<route::ObjectRef> candidates;
+            size_t collected = 0;
+            bool saw_unfinished = false;
+            const auto collect_started = std::chrono::steady_clock::now();
+            {
+                std::shared_lock<std::shared_mutex> shared_lock(
+                    master_state_mutex_);
+                metadata::Namespace* ns = namespaces_.Lookup(tenant);
+                if (ns != nullptr) {
+                    ns->objects.VisitStripe(
+                        job.sweep_stripe, [&](const std::string& key,
+                                              route::Generation generation,
+                                              const ObjectMetadata& metadata) {
+                            ++collected;
+                            if (metadata.HasReplica(is_stale) ||
+                                !metadata.IsValid()) {
+                                candidates.push_back({key, generation});
+                            }
+                            if (!saw_unfinished &&
+                                metadata.HasReplica(is_unfinished)) {
+                                saw_unfinished = true;
+                            }
+                        });
+                }
+            }
+            job.unfinished_processing_seen |= saw_unfinished;
+            job.sweep_candidates = std::move(candidates);
+            job.sweep_candidate_offset = 0;
+            const auto collect_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - collect_started)
+                    .count();
+            LOG(INFO) << "[OFFBOARD-COLLECT] client_id=" << job.client_id
+                      << ", tenant=" << tenant.value()
+                      << ", stripe=" << job.sweep_stripe
+                      << ", visited=" << collected
+                      << ", candidates=" << job.sweep_candidates.size()
+                      << ", duration_ms=" << collect_ms;
+        }
+
+        if (job.sweep_candidates.empty()) {
+            // Nothing to clean in this stripe; move on.
+            if (++job.sweep_stripe >= route::ObjectRoute::StripeCount()) {
+                job.sweep_stripe = 0;
+                ++job.sweep_tenant_index;
+            }
+            if (std::chrono::steady_clock::now() - slice_started >=
+                kSliceBudget) {
+                return ClientOffboardingOutcome::kContinue;
+            }
+            continue;
+        }
+
+        const size_t first = job.sweep_candidate_offset;
+        const size_t last = std::min(job.sweep_candidates.size(),
+                                     first + kCandidatesPerCleanBatch);
+        std::optional<ErrorCode> first_error;
+        const auto clean_started = std::chrono::steady_clock::now();
+        {
+            std::shared_lock<std::shared_mutex> shared_lock(
+                master_state_mutex_);
+            for (size_t i = first; i < last; ++i) {
+                auto error = CleanStaleHandleObject(
+                    tenant, job.sweep_candidates[i], is_stale, nullptr);
+                if (error) {
+                    ++job.sweep_candidate_offset;
+                    if (!first_error) {
+                        first_error = error;
+                    }
+                } else {
+                    ++job.sweep_candidate_offset;
+                }
+            }
+        }
+        const auto clean_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - clean_started)
+                .count();
+        LOG(INFO) << "[OFFBOARD-BATCH] client_id=" << job.client_id
+                  << ", tenant=" << tenant.value()
+                  << ", stripe=" << job.sweep_stripe
+                  << ", candidates=" << job.sweep_candidates.size()
+                  << ", cleaned_offset=" << job.sweep_candidate_offset
+                  << ", cleaned=" << (last - first)
+                  << ", duration_ms=" << clean_ms
+                  << ", retry_count=" << job.retry_count;
+        if (first_error) {
+            // Keep the candidates and the offset: the retry resumes here.
+            LOG(ERROR) << "client_id=" << job.client_id
+                       << ", tenant=" << tenant.value()
+                       << ", stripe=" << job.sweep_stripe
+                       << ", action=sweep_offboarding_metadata"
+                       << ", error=" << toString(*first_error);
+            return ClientOffboardingOutcome::kWait;
+        }
+
+        if (job.sweep_candidate_offset >= job.sweep_candidates.size()) {
+            job.sweep_candidates.clear();
+            job.sweep_candidate_offset = 0;
+            if (++job.sweep_stripe >= route::ObjectRoute::StripeCount()) {
+                job.sweep_stripe = 0;
+                ++job.sweep_tenant_index;
+            }
+        }
+        if (std::chrono::steady_clock::now() - slice_started >= kSliceBudget) {
+            return ClientOffboardingOutcome::kContinue;
+        }
+    }
+}
+
+ClientOffboardingOutcome MasterService::ProcessClientOffboardingJob(
+    ClientOffboardingJob& job) {
     bool quota_recompute_needed = false;
+
+    // 1. Prepare the segments this client still owns. The lock is scoped to
+    // the phase: nothing below holds it across the sweep's yield points.
     {
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
-
         if (!job.pending_prepare_segments.empty()) {
             ScopedSegmentAccess segment_access =
                 segment_manager_.getSegmentAccess();
@@ -2655,72 +2821,41 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                            << ", error=" << toString(err);
                 ++it;
             }
-            if (!job.pending_prepare_segments.empty()) {
-                return false;
-            }
         }
+    }
+    if (!job.pending_prepare_segments.empty()) {
+        return ClientOffboardingOutcome::kWait;
+    }
 
-        if (!job.metadata_cleanup_accepted) {
-            StaleSweepStats sweep_stats;
-            const auto sweep_started = std::chrono::steady_clock::now();
-            const auto cleanup_result = ClearStaleHandles(
-                [&job](const Replica& replica) {
-                    if (!replica.is_completed()) {
-                        return false;
-                    }
-                    if (replica.is_local_disk_replica()) {
-                        return replica.get_local_disk_client_id() ==
-                               job.client_id;
-                    }
-                    return replica.is_memory_replica() &&
-                           replica.isAffiliatedWith(job.liveness);
-                },
-                &sweep_stats);
-            const auto sweep_elapsed_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - sweep_started)
-                    .count();
-            // Measurement only: how much metadata this attempt walked and
-            // cleaned, and how long it held the store's stripes doing so.
-            // Eviction competes for the same locks during this window.
-            LOG(INFO) << "[OFFBOARD-MEASURE] client_id=" << job.client_id
-                      << ", visited=" << sweep_stats.visited
-                      << ", candidates=" << sweep_stats.candidates
-                      << ", erased=" << sweep_stats.erased
-                      << ", duration_ms=" << sweep_elapsed_ms
-                      << ", retry_count=" << job.retry_count;
-            if (!cleanup_result) {
-                LOG(ERROR) << "client_id=" << job.client_id
-                           << ", action=queue_client_offboarding_metadata"
-                           << ", error=" << toString(cleanup_result.error());
-                return false;
-            }
-            bool unfinished_affiliated_replica = false;
-            VisitNamespaces([&](const TenantId& /*tenant_id*/,
-                                metadata::Namespace& ns) {
-                if (unfinished_affiliated_replica) {
-                    return;
-                }
-                for (auto object : ns.objects.ReadCursor()) {
-                    if (object.metadata().HasReplica(
-                            [&job](const Replica& replica) {
-                                return replica.is_processing() &&
-                                       replica.isAffiliatedWith(job.liveness);
-                            })) {
-                        unfinished_affiliated_replica = true;
-                        break;
-                    }
-                }
-            });
-            if (unfinished_affiliated_replica) {
-                LOG(ERROR)
-                    << "client_id=" << job.client_id
-                    << ", action=wait_client_offboarding_processing_replica";
-                return false;
-            }
-            job.metadata_cleanup_accepted = true;
+    // 2. The metadata sweep, one bounded slice at a time. The job keeps the
+    // tenant/stripe it stands on and whether it ever saw an affiliated
+    // PROCESSING replica, so the second full pass the old code ran (to answer
+    // that question) is gone: the answer comes from the same walk.
+    if (!job.metadata_cleanup_accepted) {
+        const auto outcome = SweepOffboardingBatch(job);
+        if (outcome == ClientOffboardingOutcome::kWait) {
+            return ClientOffboardingOutcome::kWait;
         }
+        if (outcome == ClientOffboardingOutcome::kContinue) {
+            return ClientOffboardingOutcome::kContinue;
+        }
+        if (job.unfinished_processing_seen) {
+            // A PROCESSING replica of this client was still there somewhere in
+            // the walk. Start over next attempt: objects change while the walk
+            // yields, so the flag is only trusted for a complete pass.
+            job.unfinished_processing_seen = false;
+            job.sweep_tenant_index = 0;
+            job.sweep_stripe = 0;
+            LOG(ERROR) << "client_id=" << job.client_id
+                       << ", action=wait_client_offboarding_processing_replica";
+            return ClientOffboardingOutcome::kWait;
+        }
+        job.metadata_cleanup_accepted = true;
+    }
 
+    // 3. Local SSD release and segment commit.
+    {
+        std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         if (!job.local_ssd_unregistered) {
             auto capacity = local_ssd_manager_.UnregisterClient(job.client_id);
             if (capacity && *capacity > 0) {
@@ -2782,19 +2917,21 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         NotifyPolicyCapacityChanged();
     }
     if (!job.prepared_segments.empty()) {
-        return false;
+        return ClientOffboardingOutcome::kWait;
     }
 
-    std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
-    const auto current = client_liveness_records_.find(job.client_id);
-    if (current != client_liveness_records_.end() &&
-        current->second == job.liveness) {
-        const auto state = current->second->state();
-        client_liveness_records_.erase(current);
-        MasterMetricManager::instance().on_client_liveness_record_removed(
-            state);
+    {
+        std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        const auto current = client_liveness_records_.find(job.client_id);
+        if (current != client_liveness_records_.end() &&
+            current->second == job.liveness) {
+            const auto state = current->second->state();
+            client_liveness_records_.erase(current);
+            MasterMetricManager::instance().on_client_liveness_record_removed(
+                state);
+        }
     }
-    return true;
+    return ClientOffboardingOutcome::kDone;
 }
 
 void MasterService::TaskCleanupThreadFunc() {

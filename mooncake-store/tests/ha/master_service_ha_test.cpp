@@ -1001,7 +1001,8 @@ class MasterServiceHATest : public ::testing::Test {
 
     static bool ProcessClientOffboardingForTesting(MasterService& service,
                                                    ClientOffboardingJob& job) {
-        return MasterServiceTestPeer(service).ProcessClientOffboardingJob(job);
+        return MasterServiceTestPeer(service)
+            .ProcessClientOffboardingJobToCompletion(job);
     }
 
     static bool HasCompletedMemoryReplicaForTesting(MasterService& service,

@@ -2893,6 +2893,87 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
     EXPECT_LT(buckets_after, buckets_before / 2);
 }
 
+TEST_F(MasterServiceTest, AnOffboardingJobDoesNotLeakAnUnmountResponsibility) {
+    // The job holds one responsibility, from queue time to completion. A
+    // prepare it performs while retrying must not add a second one: the job's
+    // completion only settles the one the monitor began.
+    MasterService service;
+    auto segment = MakeSegment("offboarding_no_leak");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    PutObjectOnSegment(service, client_id, segment.name);
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.liveness);
+    job.pending_prepare_segments.push_back(
+        {.segment_id = segment.id,
+         .segment_name = segment.name,
+         .transport_endpoint = segment.te_endpoint});
+
+    auto peer = MasterServiceTestPeer(service);
+    // What the monitor does when it queues the job.
+    peer.BeginOffboardingCleanupForTesting();
+    ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
+    EXPECT_FALSE(peer.CleanupInProgressForTesting());
+}
+
+TEST_F(MasterServiceTest,
+       AnOffboardingSweepDoesNotSkipATenantThatEmptiesFirst) {
+    // The tenant set is captured when the walk begins. Re-enumerating with a
+    // saved index would skip tenant B as soon as sweeping tenant A emptied it
+    // and dropped it from VisitNamespaces.
+    MasterService service;
+    auto seg_a = MakeSegment("skip_seg_a");
+    auto seg_b = MakeSegment("skip_seg_b", 0x400000000ULL);
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(seg_a, client_id).has_value());
+    ASSERT_TRUE(service.MountSegment(seg_b, client_id).has_value());
+    const TenantId tenant_a("tenant_a");
+    const TenantId tenant_b("tenant_b");
+    ReplicateConfig config_a;
+    config_a.replica_num = 1;
+    config_a.preferred_segment = seg_a.name;
+    ReplicateConfig config_b;
+    config_b.replica_num = 1;
+    config_b.preferred_segment = seg_b.name;
+    ASSERT_TRUE(service.PutStart(client_id, "key_a", tenant_a, 1024, config_a)
+                    .has_value());
+    ASSERT_TRUE(
+        service.PutEnd(client_id, "key_a", tenant_a, ReplicaType::MEMORY)
+            .has_value());
+    ASSERT_TRUE(service.PutStart(client_id, "key_b", tenant_b, 1024, config_b)
+                    .has_value());
+    ASSERT_TRUE(
+        service.PutEnd(client_id, "key_b", tenant_b, ReplicaType::MEMORY)
+            .has_value());
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.liveness);
+    job.pending_prepare_segments.push_back(
+        {.segment_id = seg_a.id,
+         .segment_name = seg_a.name,
+         .transport_endpoint = seg_a.te_endpoint});
+    job.pending_prepare_segments.push_back(
+        {.segment_id = seg_b.id,
+         .segment_name = seg_b.name,
+         .transport_endpoint = seg_b.te_endpoint});
+
+    auto peer = MasterServiceTestPeer(service);
+    peer.BeginOffboardingCleanupForTesting();
+    ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
+    auto exists_a = service.ExistKey("key_a", tenant_a);
+    ASSERT_TRUE(exists_a.has_value());
+    EXPECT_FALSE(*exists_a);
+    auto exists_b = service.ExistKey("key_b", tenant_b);
+    ASSERT_TRUE(exists_b.has_value());
+    EXPECT_FALSE(*exists_b);
+    EXPECT_FALSE(peer.CleanupInProgressForTesting());
+}
+
 TEST_F(MasterServiceTest, EvictionByteShareHandlesLargePools) {
     // 200 GB of gap across 200M filed keys: 112M of them means 112 GB. The
     // naive uint64_t product overflows (2e11 * 1.12e8 > 2^64).

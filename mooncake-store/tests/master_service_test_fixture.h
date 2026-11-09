@@ -67,7 +67,14 @@ class MasterServiceTest : public ::testing::Test {
 
     bool ProcessClientOffboardingForTest(MasterService& service,
                                          ClientOffboardingJob& job) {
-        return MasterServiceTestPeer(service).ProcessClientOffboardingJob(job);
+        MasterServiceTestPeer peer(service);
+        const bool done = peer.ProcessClientOffboardingJobToCompletion(job);
+        // Mirror the worker: a finished job settles the one offboarding
+        // responsibility the monitor began when it queued it.
+        if (done) {
+            peer.EndOffboardingCleanupForTesting();
+        }
+        return done;
     }
 
     ErrorCode PrepareUnmountSegmentForTest(MasterService& service,

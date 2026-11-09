@@ -126,8 +126,30 @@ void ClientOffboardingWorker::ThreadFunc() {
             jobs_.erase(next);
         }
 
-        if (service_->ProcessClientOffboardingJob(job)) {
+        const ClientOffboardingOutcome outcome =
+            service_->ProcessClientOffboardingJob(job);
+        if (outcome == ClientOffboardingOutcome::kDone) {
             CompleteJob(job);
+            continue;
+        }
+        if (outcome == ClientOffboardingOutcome::kContinue) {
+            // A bounded slice finished with work left: keep its progress and
+            // requeue at once. Yielding is not a failure, so neither the retry
+            // count nor the backoff moves.
+            bool requeued = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (running_) {
+                    job.next_attempt_at = std::chrono::steady_clock::now();
+                    jobs_.push_back(std::move(job));
+                    requeued = true;
+                }
+            }
+            if (requeued) {
+                cv_.notify_one();
+            } else {
+                DropJob(job, "master_stopping_after_attempt");
+            }
             continue;
         }
 
