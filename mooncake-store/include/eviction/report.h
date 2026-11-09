@@ -76,6 +76,9 @@ struct Report {
     uint64_t offload_rejected_drops = 0;
     // An OpLog write failed and cut the run short.
     bool stopped = false;
+    // The caller asked the run to end at a batch boundary (a cleanup started);
+    // this is not a failure and the round's released bytes still count.
+    bool interrupted = false;
 
     [[nodiscard]] uint64_t Count(Outcome outcome) const {
         return outcomes[static_cast<size_t>(outcome)];

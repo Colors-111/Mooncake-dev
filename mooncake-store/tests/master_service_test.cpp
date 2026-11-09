@@ -3028,6 +3028,44 @@ TEST_F(MasterServiceTest, CleanupEpochPairsEveryResponsibility) {
     EXPECT_FALSE(peer.CleanupInProgressForTesting());
 }
 
+TEST_F(MasterServiceTest, AnInterruptedRoundKeepsTheAllocationPressure) {
+    // An allocation-failure round that yields to a cleanup must hand the
+    // signal over: the work period may start below its low watermark and must
+    // still try to release something.
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(0)
+                              .set_eviction_high_watermark_ratio(0.9)
+                              .set_eviction_ratio(0.05)
+                              .build();
+    auto service = std::make_unique<MasterService>(service_config);
+    constexpr size_t kSegmentSize = 64ULL * 1024 * 1024;
+    auto segment =
+        MakeSegment("pressure_segment", kDefaultSegmentBase, kSegmentSize);
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = segment.name;
+    for (int i = 0; i < 4200; ++i) {
+        const std::string key = "pressure_key_" + std::to_string(i);
+        ASSERT_TRUE(
+            service->PutStart(client_id, key, TenantId::Default(), 1024, config)
+                .has_value());
+        ASSERT_TRUE(service
+                        ->PutEnd(client_id, key, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                        .has_value());
+    }
+
+    auto peer = MasterServiceTestPeer(*service);
+    peer.SetNeedMemEviction(true);
+    // A cleanup responsibility makes the round stop at its next batch
+    // boundary.
+    peer.BeginUnmountCleanupForTesting();
+    peer.RunBatchEvictForTesting(1.0, 1.0);
+    EXPECT_TRUE(peer.NeedMemEviction());
+}
+
 TEST_F(MasterServiceTest, EvictionWorkPeriodRunsToTheLowWatermark) {
     // The low-watermark work period: one period keeps evicting, re-deriving
     // the byte gap after every slice, until live usage is back below the low

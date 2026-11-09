@@ -55,7 +55,8 @@ class Evictor::Pass {
    public:
     Pass(const Evictor& evictor, metadata::Namespace& ns,
          std::unique_ptr<metadata::EvictionIndex::Cursor> cursor, Aim aim,
-         Report& report, Clock::time_point now)
+         Report& report, Clock::time_point now,
+         const std::function<bool()>* stop)
         : evictor_(evictor),
           ns_(ns),
           cursor_(std::move(cursor)),
@@ -64,7 +65,8 @@ class Evictor::Pass {
           released_before_(report.released_bytes),
           aim_(std::move(aim)),
           report_(report),
-          now_(now) {}
+          now_(now),
+          stop_(stop) {}
 
     // Walks the cursor until the namespace's share of the target is met, then
     // the objects the policy deferred until its share of the minimum is; each
@@ -99,9 +101,15 @@ class Evictor::Pass {
                 }
                 Evict(ns_.objects.Write(key), &*entry);
                 ++judged;
+                ++judged_since_check_;
             }
             if (deferred_.back().empty()) {
                 deferred_.pop_back();
+            }
+            // Asked only once the entry (a whole group, at most) is done, so
+            // a stop never leaves half a group evicted.
+            if (ShouldHalt()) {
+                return StepKind::kDone;
             }
         }
         while (!fallback_done_) {
@@ -124,8 +132,12 @@ class Evictor::Pass {
                 // never judged.
                 Evict(ns_.objects.Write(ref), /*entry=*/nullptr);
                 ++judged;
+                ++judged_since_check_;
             }
             ++fallback_entry_;
+            if (ShouldHalt()) {
+                return StepKind::kDone;
+            }
         }
         return StepKind::kDone;
     }
@@ -136,9 +148,29 @@ class Evictor::Pass {
     }
 
    private:
-
    private:
     using Entry = metadata::EvictionIndex::Entry;
+
+    // The caller's stop predicate, asked every batch of judged keys, so a
+    // healthy round pays one counter increment per key and nothing else. A
+    // halt is not an OpLog failure: the report keeps what this round released.
+    bool ShouldHalt() {
+        if (stop_ == nullptr || !*stop_) {
+            return false;
+        }
+        if (judged_since_check_ < kStopCheckInterval) {
+            return false;
+        }
+        judged_since_check_ = 0;
+        if (!(*stop_)()) {
+            return false;
+        }
+        halted_ = true;
+        report_.interrupted = true;
+        return true;
+    }
+
+    static constexpr size_t kStopCheckInterval = 4096;
 
     [[nodiscard]] bool Met(bool fallback) const {
         return aim_.Met(filed_, report_.evicted_objects - evicted_before_,
@@ -239,6 +271,9 @@ class Evictor::Pass {
     const Aim aim_;
     Report& report_;
     const Clock::time_point now_;
+    const std::function<bool()>* const stop_;
+    bool halted_ = false;
+    size_t judged_since_check_ = 0;
     // In the order the walk met them, one list for each entry that had any.
     std::vector<std::vector<route::ObjectRef>> deferred_;
     // Slice bounds: where the walk and the fallback stopped.
@@ -249,10 +284,9 @@ class Evictor::Pass {
 };
 
 Evictor::TenantCursor::TenantCursor(const Evictor& evictor, TenantId tenant,
-                                     metadata::Namespace* ns,
-                                     uint64_t index_instance,
-                                     Clock::time_point now,
-                                     const ByteGoal& goal)
+                                    metadata::Namespace* ns,
+                                    uint64_t index_instance,
+                                    Clock::time_point now, const ByteGoal& goal)
     : evictor_(evictor),
       tenant_(std::move(tenant)),
       ns_(ns),
@@ -268,9 +302,8 @@ std::unique_ptr<Evictor::TenantCursor> Evictor::BeginTenantWork(
     if (ns == nullptr) {
         return nullptr;
     }
-    auto cursor = std::unique_ptr<TenantCursor>(
-        new TenantCursor(*this, tenant_id, ns,
-                         ns->eviction_index().instance_id(), now, goal));
+    auto cursor = std::unique_ptr<TenantCursor>(new TenantCursor(
+        *this, tenant_id, ns, ns->eviction_index().instance_id(), now, goal));
     // What this tenant's index held when the work began, for the period's
     // measurements; the pass counts its own baseline for the aim.
     cursor->report_.filed = ns->eviction_index().Scan(now)->Total();
@@ -284,10 +317,11 @@ Evictor::WorkStep Evictor::StepTenantWork(TenantCursor& cursor,
         return WorkStep::kInvalidated;
     }
     if (!cursor.pass_) {
-        const Aim aim{.in_bytes = true, .target_bytes = cursor.goal_.target_bytes};
+        const Aim aim{.in_bytes = true,
+                      .target_bytes = cursor.goal_.target_bytes};
         cursor.pass_ = std::make_unique<Pass>(
             *this, *cursor.ns_, cursor.ns_->eviction_index().Scan(cursor.now_),
-            aim, cursor.report_, cursor.now_);
+            aim, cursor.report_, cursor.now_, /*stop=*/nullptr);
     }
     return cursor.pass_->Step(max_candidates) == Pass::StepKind::kDone
                ? WorkStep::kDone
@@ -306,7 +340,8 @@ Evictor::Evictor(metadata::NamespaceTable& namespaces,
       reclaimer_(reclaimer),
       observers_(std::move(observers)) {}
 
-Report Evictor::Run(const Scope& scope, const ObjectGoal& goal) {
+Report Evictor::Run(const Scope& scope, const ObjectGoal& goal,
+                    std::function<bool()> stop) {
     Aim aim{.target_ratio = Sanitized("evict_ratio_target", goal.target_ratio),
             .min_ratio = Sanitized("evict_ratio_lowerbound", goal.min_ratio)};
     if (aim.min_ratio > aim.target_ratio) {
@@ -315,15 +350,18 @@ Report Evictor::Run(const Scope& scope, const ObjectGoal& goal) {
                    << ", error=invalid_params";
         aim.min_ratio = aim.target_ratio;
     }
-    return RunFor(scope, aim);
+    const std::function<bool()>* stop_ptr = stop ? &stop : nullptr;
+    return RunFor(scope, aim, stop_ptr);
 }
 
 Report Evictor::Run(const TenantId& tenant_id, const ByteGoal& goal) {
     return RunFor(Scope::Of(tenant_id),
-                  Aim{.in_bytes = true, .target_bytes = goal.target_bytes});
+                  Aim{.in_bytes = true, .target_bytes = goal.target_bytes},
+                  /*stop=*/nullptr);
 }
 
-Report Evictor::RunFor(const Scope& scope, const Aim& aim) {
+Report Evictor::RunFor(const Scope& scope, const Aim& aim,
+                       const std::function<bool()>* stop) {
     std::vector<metadata::Namespace*> namespaces;
     if (const TenantId* tenant_id = scope.tenant_id()) {
         // A tenant with no namespace owns no object.
@@ -348,9 +386,13 @@ Report Evictor::RunFor(const Scope& scope, const Aim& aim) {
     // A run an OpLog write cuts short leaves the namespaces after that one to
     // the next run, which starts one namespace further on.
     const size_t start = next_start_.fetch_add(1, std::memory_order_relaxed);
-    for (size_t n = 0; n < namespaces.size() && !report.stopped; ++n) {
+    // An interrupted round must not start on the next namespace: the caller
+    // is switching modes, not asking for the rest of this round.
+    for (size_t n = 0;
+         n < namespaces.size() && !report.stopped && !report.interrupted; ++n) {
         const size_t i = (start + n) % namespaces.size();
-        Pass(*this, *namespaces[i], std::move(cursors[i]), aim, report, now)
+        Pass(*this, *namespaces[i], std::move(cursors[i]), aim, report, now,
+             stop)
             .Run();
     }
 

@@ -62,6 +62,14 @@ class MasterServiceTestPeer {
     // runs it when eviction_low_watermark_ratio is configured.
     void RunEvictionWorkPeriod() { service_.RunEvictionWorkPeriod(); }
 
+    void SetNeedMemEviction(bool value) {
+        service_.need_mem_eviction_.store(value, std::memory_order_relaxed);
+    }
+
+    bool NeedMemEviction() const {
+        return service_.need_mem_eviction_.load(std::memory_order_relaxed);
+    }
+
     static uint64_t EvictionByteShareForTesting(uint64_t amount, uint64_t part,
                                                 uint64_t whole) {
         return MasterService::EvictionByteShare(amount, part, whole);

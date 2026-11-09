@@ -198,6 +198,74 @@ class EvictorTest : public ::testing::Test {
     RecordingObserver observer_;
 };
 
+// A cleanup that starts mid-round ends it at a batch boundary; the round
+// reports that as interrupted, not as a failure, and keeps what it released.
+TEST_F(EvictorTest, AStopRequestEndsTheRoundAsInterrupted) {
+    for (int i = 0; i < 4200; ++i) {
+        Publish("a", "stop_" + std::to_string(i), seconds(1));
+    }
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer_});
+    int calls = 0;
+    const auto report = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0}, [&] {
+            ++calls;
+            return true;
+        });
+    EXPECT_TRUE(report.interrupted);
+    EXPECT_FALSE(report.stopped);
+    EXPECT_GE(calls, 1);
+    EXPECT_GT(report.evicted_objects, 0u);
+    EXPECT_LT(report.evicted_objects, 4200u);
+    EXPECT_GT(report.released_bytes, 0u);
+}
+
+// An interrupted round stops before the next tenant: the caller is switching
+// modes, not asking for the rest of the round.
+TEST_F(EvictorTest, AnInterruptedRoundDoesNotStartOnTheNextTenant) {
+    // Both tenants are large enough to be interrupted on their own; whichever
+    // the round visits first must be the only one it touches.
+    for (int i = 0; i < 4200; ++i) {
+        Publish("a", "a" + std::to_string(i), seconds(1));
+        Publish("b", "b" + std::to_string(i), seconds(1));
+    }
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer_});
+    const auto report = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0},
+        [] { return true; });
+
+    EXPECT_TRUE(report.interrupted);
+    ASSERT_FALSE(reclaimer_.applied.empty());
+    const char interrupted_tenant = reclaimer_.applied.front().front();
+    for (const std::string& key : reclaimer_.applied) {
+        EXPECT_EQ(key.front(), interrupted_tenant)
+            << "the round continued into the next tenant: " << key;
+    }
+}
+
+// A group is one entry: a stop that lands on its boundary must not leave half
+// of it evicted.
+TEST_F(EvictorTest, AStopNeverLeavesHalfAGroup) {
+    for (int i = 0; i < 4095; ++i) {
+        Publish("a", "s" + std::to_string(i), seconds(1));
+    }
+    Publish("a", "g1", seconds(1), /*group_id=*/"group");
+    Publish("a", "g2", seconds(1), /*group_id=*/"group");
+
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer_});
+    const auto report = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0},
+        [] { return true; });
+
+    EXPECT_TRUE(report.interrupted);
+    const bool g1 =
+        std::find(reclaimer_.applied.begin(), reclaimer_.applied.end(), "g1") !=
+        reclaimer_.applied.end();
+    const bool g2 =
+        std::find(reclaimer_.applied.begin(), reclaimer_.applied.end(), "g2") !=
+        reclaimer_.applied.end();
+    EXPECT_EQ(g1, g2);
+}
+
 // A work cursor outlives the call that built its aim: stepping it twice must
 // read the aim it owns, not a reference to a stack object.
 TEST_F(EvictorTest, AWorkCursorResumesAcrossSteps) {

@@ -82,7 +82,11 @@ class Evictor {
     // Evicts within `scope`, or in `tenant_id`'s namespace, until `goal` is
     // met, nothing more qualifies, or an OpLog write fails. Namespaces created
     // during the run join the next one.
-    Report Run(const Scope& scope, const ObjectGoal& goal);
+    // `stop`, when set, is asked every batch of judged keys whether the round
+    // should end early; Report::interrupted records that it did. It costs
+    // nothing per key beyond a counter.
+    Report Run(const Scope& scope, const ObjectGoal& goal,
+               std::function<bool()> stop = {});
     Report Run(const TenantId& tenant_id, const ByteGoal& goal);
 
     // One tenant's share of a longer work period, resumed across bounded
@@ -125,7 +129,8 @@ class Evictor {
     [[nodiscard]] const Report& WorkReport(const TenantCursor& cursor) const;
 
    private:
-    Report RunFor(const Scope& scope, const Aim& aim);
+    Report RunFor(const Scope& scope, const Aim& aim,
+                  const std::function<bool()>* stop);
 
     metadata::NamespaceTable& namespaces_;
     const EvictionPolicy& policy_;

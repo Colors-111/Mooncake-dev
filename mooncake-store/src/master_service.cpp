@@ -10030,19 +10030,27 @@ void MasterService::EvictionThreadFunc() {
         const auto now = std::chrono::system_clock::now();
         const auto usage = segment_manager_.GetMemoryUsage();
         double used_ratio = usage.used_ratio();
-        if (used_ratio > eviction_high_watermark_ratio_ ||
-            (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
-            // The byte-driven period belongs to failure cleanup only: a
-            // healthy pool keeps the object-ratio round, which pays no
-            // per-key client/allocator check.
-            const bool period_mode =
-                CleanupInProgress() && eviction_ratio_ > 0.0 &&
-                eviction_high_watermark_ratio_ > eviction_ratio_;
+        // The byte-driven period belongs to failure cleanup only: a healthy
+        // pool keeps the object-ratio round, which pays no per-key
+        // client/allocator check. Once a cleanup responsibility exists the
+        // period starts as soon as usage is above its low watermark, not only
+        // at the high one.
+        const bool cleanup = CleanupInProgress();
+        const double low_watermark =
+            std::max(0.0, eviction_high_watermark_ratio_ - eviction_ratio_);
+        const bool period_mode =
+            cleanup && eviction_ratio_ > 0.0 &&
+            eviction_high_watermark_ratio_ > eviction_ratio_ &&
+            (used_ratio > low_watermark || need_mem_eviction_);
+        const bool round_mode = used_ratio > eviction_high_watermark_ratio_ ||
+                                (need_mem_eviction_ && eviction_ratio_ > 0.0);
+        if (period_mode || round_mode) {
             LOG(INFO) << "[EVICT-TRIGGER] mode="
                       << (period_mode ? "cleanup_work_period" : "object_ratio")
                       << " memory_ratio=" << used_ratio
                       << " high_watermark=" << eviction_high_watermark_ratio_
-                      << " cleanup_in_progress=" << CleanupInProgress()
+                      << " low_watermark=" << low_watermark
+                      << " cleanup_in_progress=" << cleanup
                       << " need_mem_eviction=" << need_mem_eviction_
                       << " eviction_ratio=" << eviction_ratio_;
             if (period_mode) {
@@ -10057,6 +10065,11 @@ void MasterService::EvictionThreadFunc() {
                              used_ratio - eviction_high_watermark_ratio_);
                 BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
                 LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
+                if (CleanupInProgress() && eviction_ratio_ > 0.0) {
+                    // The round was cut short (or ended just as the cleanup
+                    // began): switch now instead of waiting for the next tick.
+                    RunEvictionWorkPeriod();
+                }
             }
             last_discard_time = now;
         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
@@ -10413,7 +10426,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
     const eviction::Report report = memory_eviction_->evictor.Run(
         eviction::Scope::All(),
         eviction::ObjectGoal{.target_ratio = evict_ratio_target,
-                             .min_ratio = evict_ratio_lowerbound});
+                             .min_ratio = evict_ratio_lowerbound},
+        // A cleanup that starts during this round takes over: the round ends
+        // at its next batch boundary and the caller switches to the
+        // byte-driven period instead of finishing an out-of-date object goal.
+        [this] { return CleanupInProgress(); });
     const auto measure_elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - measure_started)
@@ -10428,10 +10445,20 @@ void MasterService::BatchEvict(double evict_ratio_target,
               << ", nothing_to_release=" << report.nothing_to_release
               << ", evicted=" << report.evicted_objects
               << ", released_bytes=" << report.released_bytes
-              << ", stopped=" << (report.stopped ? 1 : 0);
+              << ", stopped=" << (report.stopped ? 1 : 0)
+              << ", interrupted=" << (report.interrupted ? 1 : 0);
+    if (report.interrupted) {
+        LOG(INFO) << "[EVICT-INTERRUPT] round ended at a batch boundary, "
+                     "released_bytes="
+                  << report.released_bytes
+                  << ", evicted=" << report.evicted_objects;
+    }
     const bool made_progress = report.MadeProgress() || released_discarded > 0;
-    if (allocation_pressure && !report.stopped && !made_progress &&
-        report.filed > 0) {
+    if (allocation_pressure && !report.stopped &&
+        (report.interrupted || (!made_progress && report.filed > 0))) {
+        // A handoff to the work period must not lose the allocation failure:
+        // the period may start below its low watermark and would otherwise
+        // finish without trying to release anything.
         need_mem_eviction_.store(true, std::memory_order_relaxed);
     }
 
@@ -10444,7 +10471,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         const auto bytes = static_cast<int64_t>(report.released_bytes);
         metrics.inc_eviction_success(objects, bytes);
         metrics.inc_mem_eviction_success(objects, bytes);
-    } else if (report.filed > 0) {
+    } else if (!report.interrupted && report.filed > 0) {
+        // An interrupted round is neither a success nor a failure.
         metrics.inc_eviction_fail();
         metrics.inc_mem_eviction_fail();
     }
