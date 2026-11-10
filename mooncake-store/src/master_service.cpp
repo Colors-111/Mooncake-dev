@@ -366,6 +366,9 @@ struct MasterService::MemoryEviction {
         bool allow_evict_soft_pinned = false;
         bool offload_on_evict = false;
         eviction::OffloadingReclaimer::Options offload;
+        // Percent of judged objects whose acquisition, reclaim and release a
+        // run times; zero leaves the healthy path as it was.
+        uint32_t diag_sample_percent = 0;
     };
 
     MemoryEviction(MasterService& service, const Settings& settings)
@@ -382,8 +385,8 @@ struct MasterService::MemoryEviction {
                   : settings.offload_on_evict
                       ? static_cast<eviction::Reclaimer&>(offloading)
                       : static_cast<eviction::Reclaimer&>(immediate),
-                  Observers(settings)) {}
-
+                  Observers(settings),
+                  eviction::Diagnostics{settings.diag_sample_percent}) {}
     static bool InPlan(const eviction::Plan& plan, const Replica& replica) {
         return std::find(plan.release.begin(), plan.release.end(),
                          replica.id()) != plan.release.end();
@@ -658,6 +661,17 @@ MasterService::MasterService(const MasterServiceConfig& config)
     // With offload-on-evict and offload_force_evict, a round that has queued
     // offload_cap_ratio of the offloading queue limit lets the rest of the
     // memory it takes go without an offload.
+    uint32_t evict_diag_sample_percent = 0;
+    if (const char* raw = std::getenv("MOONCAKE_EVICT_DIAG_SAMPLE_PERCENT")) {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(raw, &end, 10);
+        if (end == raw || *end != '\0' || parsed > 100) {
+            LOG(ERROR) << "MOONCAKE_EVICT_DIAG_SAMPLE_PERCENT=" << raw
+                       << ", error=invalid_params, using 0";
+        } else {
+            evict_diag_sample_percent = static_cast<uint32_t>(parsed);
+        }
+    }
     memory_eviction_ = std::make_unique<MemoryEviction>(
         *this,
         MemoryEviction::Settings{
@@ -666,7 +680,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
             .offload_on_evict = offload_on_evict_,
             .offload = {.cap = static_cast<long>(offloading_queue_limit_ *
                                                  config.offload_cap_ratio),
-                        .force_evict = config.offload_force_evict}});
+                        .force_evict = config.offload_force_evict},
+            .diag_sample_percent = evict_diag_sample_percent});
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY. Only meaningful when offload is enabled
     // (otherwise no LOCAL_DISK replicas exist in the first place).
@@ -2588,101 +2603,284 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     return {};
 }
 
-bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
+namespace {
+
+bool IsOffboardingStaleReplica(const ClientOffboardingJob& job,
+                               const Replica& replica) {
+    if (!replica.is_completed()) {
+        return false;
+    }
+    if (replica.is_local_disk_replica()) {
+        return replica.get_local_disk_client_id() == job.client_id;
+    }
+    return replica.is_memory_replica() &&
+           replica.isAffiliatedWith(job.liveness);
+}
+
+uint64_t ElapsedMs(std::chrono::steady_clock::time_point started) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
+}
+
+const char* WaitReasonName(ClientOffboardingWaitReason reason) {
+    switch (reason) {
+        case ClientOffboardingWaitReason::kNone:
+            return "none";
+        case ClientOffboardingWaitReason::kPressure:
+            return "memory_eviction_priority";
+        case ClientOffboardingWaitReason::kNoProgressMaintenance:
+            return "eviction_no_progress";
+        case ClientOffboardingWaitReason::kLifecycle:
+            return "lifecycle_settling";
+    }
+    return "unknown";
+}
+
+}  // namespace
+
+uint64_t MasterService::GetLifecycleEpoch() const {
+    return lifecycle_epoch_.load(std::memory_order_acquire);
+}
+
+void MasterService::RestartOffboardingSweep(ClientOffboardingJob& job,
+                                            const char* reason) {
+    LOG(INFO) << "client_id=" << job.client_id
+              << ", action=client_offboarding_sweep_restart"
+              << ", attempt_id=" << job.attempt_id << ", reason=" << reason
+              << ", sweep_epoch=" << job.sweep_lifecycle_epoch
+              << ", current_epoch=" << GetLifecycleEpoch()
+              << ", tenant_index=" << job.cleanup_tenant_index
+              << ", stripe=" << job.cleanup_stripe_index
+              << ", candidates_pending="
+              << (job.cleanup_candidates.size() - job.cleanup_candidate_index);
+    job.cleanup_snapshot_taken = false;
+    job.cleanup_tenants.clear();
+    job.cleanup_tenant_index = 0;
+    job.cleanup_stripe_index = 0;
+    job.cleanup_candidates.clear();
+    job.cleanup_candidate_index = 0;
+    job.cleanup_candidate_tenant = TenantId{};
+    job.sweep_saw_processing = false;
+    job.metadata_cleanup_accepted = false;
+    // What the old lifecycle registered is no longer authoritative either.
+    job.local_ssd_unregistered = false;
+}
+
+ClientOffboardingDisposition MasterService::ProcessClientOffboardingJob(
+    ClientOffboardingJob& job) {
+    ++job.attempt_id;
     bool quota_recompute_needed = false;
+
+    // --- Prepare -----------------------------------------------------------
+    // A segment that is still UNMOUNTING is waited for; the offline effect
+    // (no new allocations, existing buffers unusable) was already taken before
+    // the job was scheduled, so this wait never delays it.
+    if (!job.pending_prepare_segments.empty()) {
+        PublishOffboardingStage(job, ClientOffboardingStage::kPrepare);
+        std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+        // Rechecked under the lock: a restore that was admitted after the
+        // worker's outer check may have completed, or still be running, since
+        // then. Prepare must not run against a failed or recovering service.
+        if (!AdmitsBusinessWorkers()) {
+            BeginOffboardingWait(job, ClientOffboardingWaitReason::kLifecycle);
+            return ClientOffboardingDisposition::kLifecycleWait;
+        }
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (auto it = job.pending_prepare_segments.begin();
+             it != job.pending_prepare_segments.end();) {
+            SegmentStatus status = SegmentStatus::UNDEFINED;
+            const auto status_err =
+                segment_access.GetSegmentStatusById(it->segment_id, status);
+            if (status_err == ErrorCode::SEGMENT_NOT_FOUND) {
+                it = job.pending_prepare_segments.erase(it);
+                continue;
+            }
+            if (status_err == ErrorCode::OK &&
+                status == SegmentStatus::UNMOUNTING) {
+                ++it;
+                continue;
+            }
+
+            size_t metrics_dec_capacity = 0;
+            const auto err = segment_access.PrepareUnmountSegment(
+                it->segment_id, metrics_dec_capacity);
+            if (err == ErrorCode::OK) {
+                job.prepared_segments.push_back(
+                    {.segment_id = it->segment_id,
+                     .segment_name = it->segment_name,
+                     .transport_endpoint = it->transport_endpoint,
+                     .metrics_dec_capacity = metrics_dec_capacity});
+                it = job.pending_prepare_segments.erase(it);
+                continue;
+            }
+            if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+                it = job.pending_prepare_segments.erase(it);
+                continue;
+            }
+            LOG(ERROR) << "client_id=" << job.client_id
+                       << ", segment_name=" << it->segment_name
+                       << ", action=prepare_client_offboarding"
+                       << ", error=" << toString(err);
+            ++it;
+        }
+        if (!job.pending_prepare_segments.empty()) {
+            BeginOffboardingWait(job, ClientOffboardingWaitReason::kLifecycle);
+            return ClientOffboardingDisposition::kLifecycleWait;
+        }
+        EndOffboardingWait(job);
+    }
+
+    // --- Metadata sweep ----------------------------------------------------
+    if (!job.metadata_cleanup_accepted) {
+        if (!job.cleanup_snapshot_taken) {
+            // Taken once, after prepare, under the shared master lock. The
+            // full table enumeration is deliberate: a namespace that is empty
+            // now may hold a write that already took its MetadataAccessor (and
+            // so its id) before the segment was prepared, and VisitNamespaces
+            // would filter it out.
+            std::shared_lock<std::shared_mutex> snapshot_lock(
+                master_state_mutex_);
+            // The snapshot must not come from under a restore window, and the
+            // sweep it starts is keyed to the lifecycle generation it saw here.
+            if (!AdmitsBusinessWorkers()) {
+                BeginOffboardingWait(job,
+                                     ClientOffboardingWaitReason::kLifecycle);
+                return ClientOffboardingDisposition::kLifecycleWait;
+            }
+            job.sweep_lifecycle_epoch = GetLifecycleEpoch();
+            job.cleanup_tenants.clear();
+            namespaces_.Visit(
+                [&](const TenantId& tenant_id, metadata::Namespace&) {
+                    job.cleanup_tenants.push_back(tenant_id);
+                });
+            job.cleanup_snapshot_taken = true;
+            job.cleanup_tenant_index = 0;
+            job.cleanup_stripe_index = 0;
+            job.cleanup_candidates.clear();
+            job.cleanup_candidate_index = 0;
+            job.cleanup_candidate_tenant = TenantId{};
+            job.sweep_saw_processing = false;
+            job.last_summary_at = std::chrono::steady_clock::now();
+            LOG(INFO) << "client_id=" << job.client_id
+                      << ", action=client_offboarding_metadata_snapshot"
+                      << ", attempt_id=" << job.attempt_id
+                      << ", tenants=" << job.cleanup_tenants.size()
+                      << ", stripes_per_tenant="
+                      << route::ObjectRoute::kStripeCount;
+        }
+
+        // Each unit is bounded: one stripe of candidates, or one cleanup
+        // batch. Between units the job rechecks memory eviction's priority and
+        // holds no key, stripe or master lock.
+        constexpr int kMaxUnitsPerAttempt = 8;
+        const auto candidates_pending = [&job] {
+            return job.cleanup_candidate_index < job.cleanup_candidates.size();
+        };
+        for (int unit = 0; unit < kMaxUnitsPerAttempt; ++unit) {
+            // Business admission is rechecked at every unit, not only when the
+            // job was scheduled: a restore window may open mid-job.
+            if (!AdmitsBusinessWorkers()) {
+                BeginOffboardingWait(job,
+                                     ClientOffboardingWaitReason::kLifecycle);
+                return ClientOffboardingDisposition::kLifecycleWait;
+            }
+            if (candidates_pending()) {
+                if (ShouldPauseOffboarding(job)) {
+                    BeginOffboardingWait(
+                        job, ClientOffboardingWaitReason::kPressure);
+                    return ClientOffboardingDisposition::kPressureWait;
+                }
+                EndOffboardingWait(job);
+                PublishOffboardingStage(job, ClientOffboardingStage::kClean);
+                const auto disposition = CleanOffboardingCandidateBatch(job);
+                if (disposition != ClientOffboardingDisposition::kContinue) {
+                    MaybeLogOffboardingSummary(job);
+                    return disposition;
+                }
+                MaybeLogOffboardingSummary(job);
+                if (candidates_pending()) {
+                    // The batch's time target was reached with candidates
+                    // left; come back after another priority check.
+                    return ClientOffboardingDisposition::kContinue;
+                }
+                // The stripe's candidates are done; the next unit collects
+                // the next stripe.
+                job.cleanup_candidates.clear();
+                job.cleanup_candidate_index = 0;
+                continue;
+            }
+            job.cleanup_candidates.clear();
+            job.cleanup_candidate_index = 0;
+
+            if (job.cleanup_tenant_index >= job.cleanup_tenants.size()) {
+                // A complete sweep that met an affiliated PROCESSING replica
+                // keeps the responsibility and opens a new one: the replica
+                // may finish and leave nothing stale behind it.
+                if (job.sweep_saw_processing) {
+                    LOG(INFO) << "client_id=" << job.client_id
+                              << ", action=client_offboarding_processing_check"
+                              << ", attempt_id=" << job.attempt_id
+                              << ", saw_processing=true"
+                              << ", action_reason=reopen_sweep";
+                    job.sweep_saw_processing = false;
+                    job.cleanup_tenant_index = 0;
+                    job.cleanup_stripe_index = 0;
+                    BeginOffboardingWait(
+                        job, ClientOffboardingWaitReason::kLifecycle);
+                    return ClientOffboardingDisposition::kLifecycleWait;
+                }
+                job.metadata_cleanup_accepted = true;
+                LOG(INFO) << "client_id=" << job.client_id
+                          << ", action=client_offboarding_metadata_cleanup"
+                          << ", accepted=true"
+                          << ", attempts=" << job.attempt_id
+                          << ", collect_units=" << job.collect_units
+                          << ", collect_visited=" << job.collect_visited
+                          << ", collect_candidates=" << job.collect_candidates
+                          << ", clean_attempted=" << job.clean_attempted
+                          << ", clean_requests=" << job.clean_requests
+                          << ", ha_enqueued=" << job.clean_ha_enqueued
+                          << ", ha_failed=" << job.clean_ha_failed;
+                break;
+            }
+
+            if (ShouldPauseOffboarding(job)) {
+                BeginOffboardingWait(job,
+                                     ClientOffboardingWaitReason::kPressure);
+                return ClientOffboardingDisposition::kPressureWait;
+            }
+            EndOffboardingWait(job);
+            PublishOffboardingStage(job, ClientOffboardingStage::kCollect);
+            const auto disposition = CollectOffboardingStripe(job);
+            if (disposition != ClientOffboardingDisposition::kContinue) {
+                return disposition;
+            }
+            MaybeLogOffboardingSummary(job);
+        }
+        if (!job.metadata_cleanup_accepted) {
+            return ClientOffboardingDisposition::kContinue;
+        }
+    }
+
+    // --- Unregister and commit --------------------------------------------
+    PublishOffboardingStage(job, ClientOffboardingStage::kCommit);
+    const auto commit_started = std::chrono::steady_clock::now();
     {
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
-
-        if (!job.pending_prepare_segments.empty()) {
-            ScopedSegmentAccess segment_access =
-                segment_manager_.getSegmentAccess();
-            for (auto it = job.pending_prepare_segments.begin();
-                 it != job.pending_prepare_segments.end();) {
-                SegmentStatus status = SegmentStatus::UNDEFINED;
-                const auto status_err =
-                    segment_access.GetSegmentStatusById(it->segment_id, status);
-                if (status_err == ErrorCode::SEGMENT_NOT_FOUND) {
-                    it = job.pending_prepare_segments.erase(it);
-                    continue;
-                }
-                if (status_err == ErrorCode::OK &&
-                    status == SegmentStatus::UNMOUNTING) {
-                    ++it;
-                    continue;
-                }
-
-                size_t metrics_dec_capacity = 0;
-                const auto err = segment_access.PrepareUnmountSegment(
-                    it->segment_id, metrics_dec_capacity);
-                if (err == ErrorCode::OK) {
-                    job.prepared_segments.push_back(
-                        {.segment_id = it->segment_id,
-                         .segment_name = it->segment_name,
-                         .transport_endpoint = it->transport_endpoint,
-                         .metrics_dec_capacity = metrics_dec_capacity});
-                    it = job.pending_prepare_segments.erase(it);
-                    continue;
-                }
-                if (err == ErrorCode::SEGMENT_NOT_FOUND) {
-                    it = job.pending_prepare_segments.erase(it);
-                    continue;
-                }
-                LOG(ERROR) << "client_id=" << job.client_id
-                           << ", segment_name=" << it->segment_name
-                           << ", action=prepare_client_offboarding"
-                           << ", error=" << toString(err);
-                ++it;
-            }
-            if (!job.pending_prepare_segments.empty()) {
-                return false;
-            }
+        // The commit mutates segment and local-SSD state, so it is admitted
+        // only under the lock. A restore that crossed the sweep also discards
+        // the acceptance: the restored metadata is swept again.
+        if (!AdmitsBusinessWorkers()) {
+            BeginOffboardingWait(job, ClientOffboardingWaitReason::kLifecycle);
+            return ClientOffboardingDisposition::kLifecycleWait;
         }
-
-        if (!job.metadata_cleanup_accepted) {
-            const auto cleanup_result =
-                ClearStaleHandles([&job](const Replica& replica) {
-                    if (!replica.is_completed()) {
-                        return false;
-                    }
-                    if (replica.is_local_disk_replica()) {
-                        return replica.get_local_disk_client_id() ==
-                               job.client_id;
-                    }
-                    return replica.is_memory_replica() &&
-                           replica.isAffiliatedWith(job.liveness);
-                });
-            if (!cleanup_result) {
-                LOG(ERROR) << "client_id=" << job.client_id
-                           << ", action=queue_client_offboarding_metadata"
-                           << ", error=" << toString(cleanup_result.error());
-                return false;
-            }
-            bool unfinished_affiliated_replica = false;
-            VisitNamespaces([&](const TenantId& /*tenant_id*/,
-                                metadata::Namespace& ns) {
-                if (unfinished_affiliated_replica) {
-                    return;
-                }
-                for (auto object : ns.objects.ReadCursor()) {
-                    if (object.metadata().HasReplica(
-                            [&job](const Replica& replica) {
-                                return replica.is_processing() &&
-                                       replica.isAffiliatedWith(job.liveness);
-                            })) {
-                        unfinished_affiliated_replica = true;
-                        break;
-                    }
-                }
-            });
-            if (unfinished_affiliated_replica) {
-                LOG(ERROR)
-                    << "client_id=" << job.client_id
-                    << ", action=wait_client_offboarding_processing_replica";
-                return false;
-            }
-            job.metadata_cleanup_accepted = true;
+        if (job.sweep_lifecycle_epoch != GetLifecycleEpoch()) {
+            RestartOffboardingSweep(job, "lifecycle_epoch_changed");
+            return ClientOffboardingDisposition::kContinue;
         }
-
         if (!job.local_ssd_unregistered) {
             auto capacity = local_ssd_manager_.UnregisterClient(job.client_id);
             if (capacity && *capacity > 0) {
@@ -2740,11 +2938,12 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         }
     }
 
+    job.commit_ms += ElapsedMs(commit_started);
     if (quota_recompute_needed) {
         NotifyPolicyCapacityChanged();
     }
     if (!job.prepared_segments.empty()) {
-        return false;
+        return ClientOffboardingDisposition::kError;
     }
 
     std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
@@ -2756,7 +2955,383 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         MasterMetricManager::instance().on_client_liveness_record_removed(
             state);
     }
+    PublishOffboardingStage(job, ClientOffboardingStage::kIdle);
+    return ClientOffboardingDisposition::kComplete;
+}
+
+ClientOffboardingDisposition MasterService::CollectOffboardingStripe(
+    ClientOffboardingJob& job) {
+    if (job.cleanup_tenant_index >= job.cleanup_tenants.size()) {
+        return ClientOffboardingDisposition::kContinue;
+    }
+    const TenantId tenant_id = job.cleanup_tenants[job.cleanup_tenant_index];
+    const size_t stripe_index = job.cleanup_stripe_index;
+    const size_t candidates_before = job.cleanup_candidates.size();
+    const auto started = std::chrono::steady_clock::now();
+    // The candidates this stripe yields belong to this tenant. The cursor
+    // advances as the stripe completes, so the cleaning batch must not derive
+    // the tenant from it again.
+    job.cleanup_candidate_tenant = tenant_id;
+
+    route::ObjectRoute::StripeVisitStats stats;
+    {
+        // Only one stripe is read, and only ObjectRefs leave the lock.
+        std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+        // Admission and the lifecycle generation are rechecked under the
+        // lock: the outer check ran before this unit, and a restore may have
+        // been admitted and finished since then.
+        if (!AdmitsBusinessWorkers()) {
+            BeginOffboardingWait(job, ClientOffboardingWaitReason::kLifecycle);
+            return ClientOffboardingDisposition::kLifecycleWait;
+        }
+        if (job.sweep_lifecycle_epoch != GetLifecycleEpoch()) {
+            RestartOffboardingSweep(job, "lifecycle_epoch_changed");
+            return ClientOffboardingDisposition::kContinue;
+        }
+        metadata::Namespace* ns = namespaces_.Lookup(tenant_id);
+        if (ns != nullptr) {
+            stats = ns->objects.VisitStripe(
+                stripe_index,
+                [&job](const std::string& key, route::Generation generation,
+                       const ObjectMetadata& metadata) {
+                    if (metadata.HasReplica([&job](const Replica& replica) {
+                            return replica.is_processing() &&
+                                   replica.isAffiliatedWith(job.liveness);
+                        })) {
+                        job.sweep_saw_processing = true;
+                    }
+                    if (metadata.IsValid() &&
+                        !metadata.HasReplica([&job](const Replica& replica) {
+                            return IsOffboardingStaleReplica(job, replica);
+                        })) {
+                        return;
+                    }
+                    job.cleanup_candidates.push_back(
+                        route::ObjectRef{key, generation});
+                });
+        }
+    }
+
+    const auto elapsed_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
+
+    ++job.collect_units;
+    job.collect_visited += stats.visited;
+    job.collect_candidates += job.cleanup_candidates.size() - candidates_before;
+    job.collect_deferred += stats.deferred;
+    job.collect_deferred_ns += stats.deferred_visit_ns;
+    if (elapsed_ns > job.collect_max_unit_ns) {
+        job.collect_max_unit_ns = elapsed_ns;
+    }
+    job.collect_ms += elapsed_ns / 1'000'000;
+
+    // A stripe that collected candidates or took measurable time is worth a
+    // line; an empty one is not, and the summary carries the totals.
+    if (job.cleanup_candidates.size() != candidates_before ||
+        elapsed_ns >= 100'000'000) {
+        VLOG(1) << "[OFFBOARD-COLLECT] client_id=" << job.client_id
+                << " attempt_id=" << job.attempt_id
+                << " tenant=" << tenant_id.value() << " stripe=" << stripe_index
+                << " visited=" << stats.visited << " candidates="
+                << job.cleanup_candidates.size() - candidates_before
+                << " busy_slots=" << stats.deferred
+                << " busy_visit_us=" << stats.deferred_visit_ns / 1000
+                << " stripe_us=" << elapsed_ns / 1000;
+    }
+
+    // The next unit is the next stripe, or the next tenant's first.
+    if (++job.cleanup_stripe_index >= route::ObjectRoute::kStripeCount) {
+        job.cleanup_stripe_index = 0;
+        ++job.cleanup_tenant_index;
+    }
+    return ClientOffboardingDisposition::kContinue;
+}
+
+ClientOffboardingDisposition MasterService::CleanOffboardingCandidateBatch(
+    ClientOffboardingJob& job) {
+    constexpr size_t kMaxCandidates = 512;
+    constexpr auto kTimeTarget = std::chrono::milliseconds(5);
+    if (job.cleanup_candidate_index >= job.cleanup_candidates.size()) {
+        job.cleanup_candidates.clear();
+        job.cleanup_candidate_index = 0;
+        return ClientOffboardingDisposition::kContinue;
+    }
+    // The tenant the candidates were collected from, not the cursor's current
+    // one: collecting the tenant's last stripe advances the cursor, possibly
+    // past the end of the snapshot.
+    const TenantId tenant_id = job.cleanup_candidate_tenant;
+    const size_t begin = job.cleanup_candidate_index;
+    const size_t end =
+        std::min(begin + kMaxCandidates, job.cleanup_candidates.size());
+    const auto started = std::chrono::steady_clock::now();
+    uint64_t removed_before = job.clean_removed_replicas;
+    uint64_t requests_before = job.clean_requests;
+
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    // Rechecked under the lock, for the same reason as collection: the outer
+    // check ran before this unit and a restore may have crossed it.
+    if (!AdmitsBusinessWorkers()) {
+        BeginOffboardingWait(job, ClientOffboardingWaitReason::kLifecycle);
+        return ClientOffboardingDisposition::kLifecycleWait;
+    }
+    if (job.sweep_lifecycle_epoch != GetLifecycleEpoch()) {
+        RestartOffboardingSweep(job, "lifecycle_epoch_changed");
+        return ClientOffboardingDisposition::kContinue;
+    }
+    while (job.cleanup_candidate_index < end) {
+        // The time target is soft: one key lock, one persistence call or a
+        // full stripe collection may overrun it. Check about every 16 keys
+        // rather than once per key.
+        if (((job.cleanup_candidate_index - begin) & 0xF) == 0xF &&
+            std::chrono::steady_clock::now() - started >= kTimeTarget) {
+            break;
+        }
+        const auto& object =
+            job.cleanup_candidates[job.cleanup_candidate_index];
+        const auto disposition =
+            CleanOffboardingCandidate(job, tenant_id, object);
+        if (disposition == ClientOffboardingDisposition::kError) {
+            // The failed candidate keeps its offset: this batch stops, and the
+            // error backoff retries from it.
+            ++job.clean_ha_failed;
+            LOG(ERROR) << "[OFFBOARD-CLEAN] client_id=" << job.client_id
+                       << " attempt_id=" << job.attempt_id
+                       << " tenant=" << tenant_id.value()
+                       << " key=" << object.key << " error=ha_persist_failed"
+                       << " candidate_offset=" << job.cleanup_candidate_index;
+            return disposition;
+        }
+        ++job.cleanup_candidate_index;
+    }
+
+    const auto elapsed_ms = ElapsedMs(started);
+    ++job.clean_units;
+    job.clean_ms += static_cast<uint64_t>(elapsed_ms);
+    VLOG(1) << "[OFFBOARD-CLEAN] client_id=" << job.client_id
+            << " attempt_id=" << job.attempt_id
+            << " tenant=" << tenant_id.value()
+            << " batch=" << (job.cleanup_candidate_index - begin)
+            << " offset=" << job.cleanup_candidate_index
+            << " of=" << job.cleanup_candidates.size()
+            << " requests=" << job.clean_requests - requests_before
+            << " removed_replicas="
+            << job.clean_removed_replicas - removed_before
+            << " elapsed_ms=" << elapsed_ms;
+    return ClientOffboardingDisposition::kContinue;
+}
+
+ClientOffboardingDisposition MasterService::CleanOffboardingCandidate(
+    ClientOffboardingJob& job, const TenantId& tenant_id,
+    const route::ObjectRef& object) {
+    ++job.clean_attempted;
+    // The by-reference accessor leaves the object as judged; success or a
+    // changed generation decides whether the offset advances.
+    MetadataAccessorRW accessor(this, tenant_id, object);
+    if (!accessor.IsPublished()) {
+        // Torn down or replaced since collection: nothing left to clean.
+        ++job.clean_skipped;
+        return ClientOffboardingDisposition::kContinue;
+    }
+    auto& metadata = accessor.Get();
+    const auto is_stale = [&job](const Replica& replica) {
+        return IsOffboardingStaleReplica(job, replica);
+    };
+    const auto cleanup_plan = BuildStaleHandleCleanupPlan(metadata, is_stale);
+    if (!cleanup_plan.removed_ids.empty()) {
+        if (enable_ha_ && enable_oplog_) {
+            const auto persist_result = PersistStaleHandleCleanupForHA(
+                "ClientOffboarding", tenant_id, object.key, metadata,
+                cleanup_plan);
+            if (!persist_result) {
+                return ClientOffboardingDisposition::kError;
+            }
+            ++job.clean_requests;
+            ++job.clean_ha_enqueued;
+            return ClientOffboardingDisposition::kContinue;
+        }
+        // Replicas were removed whether or not the object remains valid
+        // through another replica: count the removal and the request, and drop
+        // the object only when nothing valid is left.
+        const bool invalid_after_cleanup = CleanupStaleHandles(
+            object.key, tenant_id, metadata, accessor.GetState(), is_stale);
+        job.clean_removed_replicas += cleanup_plan.removed_ids.size();
+        ++job.clean_requests;
+        if (invalid_after_cleanup) {
+            accessor.Erase();
+        }
+        return ClientOffboardingDisposition::kContinue;
+    }
+    if (metadata.IsValid()) {
+        ++job.clean_skipped;
+        return ClientOffboardingDisposition::kContinue;
+    }
+    if (enable_ha_) {
+        if (enable_oplog_) {
+            const auto persist_result = AppendOpLogWithDurableFinalize(
+                OpType::REMOVE, tenant_id.value(), object.key, {},
+                [this, object](const OpLogEntry& durable_entry) {
+                    FinalizeMetadataEraseAfterDurable(
+                        object, TenantId(durable_entry.tenant_id));
+                });
+            if (!persist_result) {
+                LOG(WARNING)
+                    << "ClientOffboarding: REMOVE persist failed for "
+                       "key="
+                    << object.key
+                    << ", err=" << static_cast<int>(persist_result.error());
+                return ClientOffboardingDisposition::kError;
+            }
+            ++job.clean_requests;
+            ++job.clean_ha_enqueued;
+        }
+        return ClientOffboardingDisposition::kContinue;
+    }
+    accessor.Erase();
+    ++job.clean_requests;
+    return ClientOffboardingDisposition::kContinue;
+}
+
+bool MasterService::ShouldPauseOffboarding(ClientOffboardingJob& job) {
+    const auto pressure = SnapshotMemoryEvictionPressure();
+    if (pressure.active) {
+        // A DRAM round holds priority for its whole scope.
+        return true;
+    }
+    if (!pressure.enabled) {
+        // Eviction is configured off: a high watermark or an allocation
+        // failure can never be relieved by waiting for it.
+        return false;
+    }
+    if (!pressure.need && pressure.used_ratio <= pressure.high_watermark) {
+        return false;
+    }
+    // Memory is short but no round is running. Give eviction a chance to run.
+    // If its last completed rounds report no progress, it has nothing it can
+    // take (or the offboarding's own stale candidates are all it filed), so
+    // let one bounded maintenance unit through at a low rate: cleanup must
+    // still converge, and a persistent stall must not deadlock it.
+    constexpr auto kStalledMaintenanceInterval = std::chrono::milliseconds(200);
+    if (pressure.stalled) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= job.next_maintenance_at) {
+            job.next_maintenance_at = now + kStalledMaintenanceInterval;
+            if (pressure.stall_episode != job.consumed_eviction_stall_episode) {
+                job.consumed_eviction_stall_episode = pressure.stall_episode;
+            }
+            LOG(INFO) << "[OFFBOARD-WAIT] client_id=" << job.client_id
+                      << " attempt_id=" << job.attempt_id
+                      << " phase=maintenance"
+                      << " reason=eviction_no_progress"
+                      << " used_ratio=" << pressure.used_ratio
+                      << " high_watermark=" << pressure.high_watermark
+                      << " stall_episode=" << pressure.stall_episode;
+            return false;
+        }
+    }
     return true;
+}
+
+void MasterService::BeginOffboardingWait(ClientOffboardingJob& job,
+                                         ClientOffboardingWaitReason reason) {
+    if (job.waiting) {
+        return;
+    }
+    job.waiting = true;
+    job.wait_reason = reason;
+    job.wait_started = std::chrono::steady_clock::now();
+    ++job.wait_count;
+    const auto pressure = SnapshotMemoryEvictionPressure();
+    LOG(INFO) << "[OFFBOARD-WAIT] client_id=" << job.client_id
+              << " attempt_id=" << job.attempt_id << " phase=begin"
+              << " reason=" << WaitReasonName(reason)
+              << " used_ratio=" << pressure.used_ratio
+              << " high_watermark=" << pressure.high_watermark
+              << " eviction_active=" << pressure.active
+              << " need_mem_eviction=" << pressure.need;
+    PublishOffboardingStage(job,
+                            reason == ClientOffboardingWaitReason::kPressure
+                                ? ClientOffboardingStage::kEvictionWait
+                                : ClientOffboardingStage::kLifecycleWait);
+}
+
+void MasterService::EndOffboardingWait(ClientOffboardingJob& job) {
+    if (!job.waiting) {
+        return;
+    }
+    const auto waited_ms = ElapsedMs(job.wait_started);
+    job.wait_ms += waited_ms;
+    job.waiting = false;
+    LOG(INFO) << "[OFFBOARD-WAIT] client_id=" << job.client_id
+              << " attempt_id=" << job.attempt_id << " phase=end"
+              << " reason=" << WaitReasonName(job.wait_reason)
+              << " waited_ms=" << waited_ms << " total_wait_ms=" << job.wait_ms
+              << " wait_count=" << job.wait_count;
+    job.wait_reason = ClientOffboardingWaitReason::kNone;
+}
+
+void MasterService::MaybeLogOffboardingSummary(ClientOffboardingJob& job) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - job.last_summary_at < std::chrono::seconds(5)) {
+        return;
+    }
+    job.last_summary_at = now;
+    LOG(INFO) << "[OFFBOARD-SUMMARY] client_id=" << job.client_id
+              << " attempt_id=" << job.attempt_id
+              << " tenant_index=" << job.cleanup_tenant_index
+              << " of=" << job.cleanup_tenants.size()
+              << " stripe=" << job.cleanup_stripe_index
+              << " candidates_pending="
+              << (job.cleanup_candidates.size() - job.cleanup_candidate_index)
+              << " collect_units=" << job.collect_units
+              << " collect_visited=" << job.collect_visited
+              << " collect_candidates=" << job.collect_candidates
+              << " collect_busy_slots=" << job.collect_deferred
+              << " collect_ms=" << job.collect_ms
+              << " collect_max_us=" << job.collect_max_unit_ns / 1000
+              << " clean_units=" << job.clean_units
+              << " clean_attempted=" << job.clean_attempted
+              << " clean_skipped=" << job.clean_skipped
+              << " clean_requests=" << job.clean_requests
+              << " removed_replicas=" << job.clean_removed_replicas
+              << " ha_enqueued=" << job.clean_ha_enqueued
+              << " ha_failed=" << job.clean_ha_failed
+              << " clean_ms=" << job.clean_ms
+              << " wait_count=" << job.wait_count << " wait_ms=" << job.wait_ms
+              << " stage=" << static_cast<int>(job.stage);
+}
+
+void MasterService::PublishOffboardingStage(ClientOffboardingJob& job,
+                                            ClientOffboardingStage stage) {
+    job.stage = stage;
+    offboarding_stage_.store(static_cast<int>(stage),
+                             std::memory_order_release);
+    if (stage != ClientOffboardingStage::kIdle) {
+        const auto now_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        offboarding_stage_since_ms_.store(now_ms, std::memory_order_release);
+    } else {
+        offboarding_stage_since_ms_.store(0, std::memory_order_release);
+    }
+}
+
+void MasterService::RefreshOffboardingStageMetric() {
+    const int stage = offboarding_stage_.load(std::memory_order_acquire);
+    const int64_t since =
+        offboarding_stage_since_ms_.load(std::memory_order_acquire);
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    const int64_t stall_ms =
+        (stage == static_cast<int>(ClientOffboardingStage::kIdle) || since == 0)
+            ? 0
+            : std::max<int64_t>(0, now_ms - since);
+    auto& metrics = MasterMetricManager::instance();
+    metrics.set_client_offboarding_stage(stage);
+    metrics.set_client_offboarding_stage_stall_ms(stall_ms);
 }
 
 void MasterService::TaskCleanupThreadFunc() {
@@ -3754,6 +4329,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                    << RestoreLifecycleStateToString(expected) << ")";
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // A restore window opened: any offboarding sweep that spans it is stale.
+    lifecycle_epoch_.fetch_add(1, std::memory_order_acq_rel);
 
     auto result = RestoreFromStandbyStateCore(
         legacy_objects, metadata_store, initial_oplog_sequence_id, segments,
@@ -3762,6 +4339,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     lifecycle_state_.store(result.has_value() ? RestoreLifecycleState::kReady
                                               : RestoreLifecycleState::kFailed,
                            std::memory_order_release);
+    // And the window closed, whether the restore succeeded or failed.
+    lifecycle_epoch_.fetch_add(1, std::memory_order_acq_rel);
     LOG(INFO) << "Restore lifecycle -> "
               << RestoreLifecycleStateToString(lifecycle_state_.load());
     return result;
@@ -4921,6 +5500,36 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     return results;
 }
 
+void MasterService::MaybeLogMemoryAllocationFailure(uint64_t requested_bytes) {
+    constexpr int64_t kLogIntervalMs = 5000;
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    int64_t last = last_alloc_fail_log_ms_.load(std::memory_order_acquire);
+    if (last != 0 && now_ms - last < kLogIntervalMs) {
+        alloc_fail_suppressed_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!last_alloc_fail_log_ms_.compare_exchange_strong(
+            last, now_ms, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        alloc_fail_suppressed_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const auto usage = segment_manager_.GetMemoryUsage();
+    const uint64_t suppressed =
+        alloc_fail_suppressed_.exchange(0, std::memory_order_acq_rel);
+    // A global watermark below 100% does not prove an allocation should have
+    // succeeded: offsets, contiguous runs and metadata bound it too. The log
+    // names the bytes asked for and leaves the residual unexplained.
+    LOG(WARNING) << "[ALLOC-FAIL] requested_bytes=" << requested_bytes
+                 << " used_bytes=" << usage.used_bytes
+                 << " capacity_bytes=" << usage.capacity_bytes
+                 << " used_ratio=" << usage.used_ratio()
+                 << " high_watermark=" << eviction_high_watermark_ratio_
+                 << " suppressed_since_last=" << suppressed;
+}
+
 auto MasterService::AllocateReplicas(const std::string& key,
                                      uint64_t value_length,
                                      const ReplicateConfig& config,
@@ -4997,6 +5606,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 if (has_enough_memory_segments) {
                     need_mem_eviction_ = true;
                 }
+                MaybeLogMemoryAllocationFailure(value_length);
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
         } else {
@@ -5061,6 +5671,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 << ", allocated_memory_replicas=" << allocated_memory_replicas
                 << ", requested_nof_replicas=" << config.nof_replica_num
                 << ", allocated_nof_replicas=" << allocated_nof_replicas;
+        MaybeLogMemoryAllocationFailure(value_length);
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
@@ -7571,28 +8182,28 @@ long MasterService::RemoveAll(bool force) {
     std::unordered_set<std::string> tenants_with_remaining_objects;
 
     // Remove per object so managed weights and concurrent imports survive.
-    VisitNamespaces([&](const TenantId& tenant_id,
-                        metadata::Namespace& /*ns*/) {
-        const RemoveResult result =
-            RemoveTenantObjects(tenant_id, force, now, nullptr);
-        removed_count += result.removed_count;
-        total_freed_size += result.freed_bytes;
-        // Record the tenant only once the walk actually reached an object. A
-        // tenant row can outlive its objects, and recording it unconditionally
-        // made every empty-but-present tenant look like a fresh wipe and emit
-        // a spurious `cleared`. Under HA+oplog the erase is deferred to the
-        // durable callback, so only a skipped object means the tenant is not
-        // empty.
-        if (track_cleared_tenants && result.saw_object) {
-            tenants_seen.insert(tenant_id.value());
-            if (result.skipped_object) {
-                tenants_with_remaining_objects.insert(tenant_id.value());
+    VisitNamespaces(
+        [&](const TenantId& tenant_id, metadata::Namespace& /*ns*/) {
+            const RemoveResult result =
+                RemoveTenantObjects(tenant_id, force, now, nullptr);
+            removed_count += result.removed_count;
+            total_freed_size += result.freed_bytes;
+            // Record the tenant only once the walk actually reached an object.
+            // A tenant row can outlive its objects, and recording it
+            // unconditionally made every empty-but-present tenant look like a
+            // fresh wipe and emit a spurious `cleared`. Under HA+oplog the
+            // erase is deferred to the durable callback, so only a skipped
+            // object means the tenant is not empty.
+            if (track_cleared_tenants && result.saw_object) {
+                tenants_seen.insert(tenant_id.value());
+                if (result.skipped_object) {
+                    tenants_with_remaining_objects.insert(tenant_id.value());
+                }
             }
-        }
-        if (kv_remove_all_tenant_hook_) {
-            kv_remove_all_tenant_hook_(tenant_id);
-        }
-    });
+            if (kv_remove_all_tenant_hook_) {
+                kv_remove_all_tenant_hook_(tenant_id);
+            }
+        });
 
     // tenants_seen holds only tenants that actually held an object, so this
     // difference is "held objects and lost all of them" — a real wipe. Both
@@ -10009,6 +10620,10 @@ MasterService::NamespaceEvictionResult MasterService::EvictNamespaceMemory(
     if (target_bytes == 0) {
         return {};
     }
+    // A tenant's DRAM reclaim is a memory eviction too. It publishes pressure
+    // but not a pool-wide no-progress result: one tenant having nothing to
+    // give up says nothing about the whole pool.
+    MemoryEvictionScope eviction_scope(*this);
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const eviction::Report report = memory_eviction_->evictor.Run(
         tenant_id, eviction::ByteGoal{.target_bytes = target_bytes});
@@ -10018,10 +10633,25 @@ MasterService::NamespaceEvictionResult MasterService::EvictNamespaceMemory(
 
 void MasterService::BatchEvict(double evict_ratio_target,
                                double evict_ratio_lowerbound) {
+    // The whole round holds the priority state: offboarding waits from here
+    // until the destructor wakes it.
+    MemoryEvictionScope eviction_scope(*this);
+    const uint64_t round_id =
+        memory_eviction_round_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+
     // Consume the allocation-pressure signal before this round. A new failure
     // during the round remains visible to the next iteration.
     const bool allocation_pressure =
         need_mem_eviction_.exchange(false, std::memory_order_relaxed);
+
+    const auto round_started = std::chrono::steady_clock::now();
+    double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
+    VLOG(1) << "[EVICT-ROUND] round_id=" << round_id << " phase=begin"
+            << " used_ratio=" << used_ratio
+            << " high_watermark=" << eviction_high_watermark_ratio_
+            << " target=" << evict_ratio_target
+            << " lowerbound=" << evict_ratio_lowerbound
+            << " allocation_pressure=" << allocation_pressure;
 
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     // Writes that expired before they finished, and replicas whose release
@@ -10032,15 +10662,28 @@ void MasterService::BatchEvict(double evict_ratio_target,
             DiscardExpiredProcessingReplicas(ns, now);
         });
     const uint64_t released_discarded = ReleaseExpiredDiscardedReplicas(now);
+    auto progress = [this, round_id](const eviction::Report& report) {
+        const auto usage = segment_manager_.GetMemoryUsage();
+        LOG(INFO) << "[EVICT-PROGRESS] round_id=" << round_id << " phase=walk"
+                  << " attempted=" << report.attempted
+                  << " missing=" << report.missing
+                  << " visited=" << report.visited
+                  << " evicted=" << report.evicted_objects
+                  << " released_bytes=" << report.released_bytes
+                  << " used_ratio=" << usage.used_ratio()
+                  << " filed=" << report.filed;
+    };
     const eviction::Report report = memory_eviction_->evictor.Run(
         eviction::Scope::All(),
         eviction::ObjectGoal{.target_ratio = evict_ratio_target,
-                             .min_ratio = evict_ratio_lowerbound});
+                             .min_ratio = evict_ratio_lowerbound},
+        round_id, progress);
     const bool made_progress = report.MadeProgress() || released_discarded > 0;
     if (allocation_pressure && !report.stopped && !made_progress &&
         report.filed > 0) {
         need_mem_eviction_.store(true, std::memory_order_relaxed);
     }
+    PublishMemoryEvictionRound(made_progress, report.stopped);
 
     // Counted here, not by the evictor's observers: releasing discarded
     // replicas is progress too, and only the round sees it. A round with
@@ -10054,6 +10697,85 @@ void MasterService::BatchEvict(double evict_ratio_target,
     } else if (report.filed > 0) {
         metrics.inc_eviction_fail();
         metrics.inc_mem_eviction_fail();
+    }
+
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - round_started)
+            .count();
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    const int64_t last_log_ms =
+        last_evict_round_log_ms_.load(std::memory_order_relaxed);
+    // A long round, or the first one in a second, is worth a line; the rest
+    // are one VLOG each, so sustained pressure does not swamp the log.
+    const bool log_round = elapsed_ms >= 100 || now_ms - last_log_ms >= 1000;
+    if (log_round) {
+        last_evict_round_log_ms_.store(now_ms, std::memory_order_relaxed);
+    }
+    const auto write_round_line = [&](auto& stream) {
+        stream << "[EVICT-ROUND] round_id=" << round_id << " phase=end"
+               << " elapsed_ms=" << elapsed_ms << " trigger="
+               << (allocation_pressure ? "allocation" : "watermark")
+               << " used_ratio=" << used_ratio
+               << " high_watermark=" << eviction_high_watermark_ratio_
+               << " target=" << evict_ratio_target
+               << " lowerbound=" << evict_ratio_lowerbound
+               << " attempted=" << report.attempted
+               << " missing=" << report.missing << " visited=" << report.visited
+               << " evicted=" << report.evicted_objects
+               << " released_bytes=" << report.released_bytes
+               << " filed=" << report.filed
+               << " suppressed=" << report.suppressed_permanently_unavailable
+               << " made_progress=" << made_progress
+               << " stopped=" << report.stopped << " end_reason="
+               << (report.stopped      ? "oplog_error"
+                   : made_progress     ? "progress"
+                   : report.filed == 0 ? "no_candidates"
+                                       : "nothing_to_release");
+    };
+    if (log_round) {
+        std::ostringstream line;
+        write_round_line(line);
+        LOG(INFO) << line.str();
+    } else {
+        std::ostringstream line;
+        write_round_line(line);
+        VLOG(1) << line.str();
+    }
+}
+
+MasterService::MemoryEvictionPressure
+MasterService::SnapshotMemoryEvictionPressure() const {
+    MemoryEvictionPressure pressure;
+    pressure.enabled = eviction_ratio_ > 0.0;
+    pressure.active =
+        active_memory_evictions_.load(std::memory_order_acquire) > 0;
+    pressure.need = need_mem_eviction_.load(std::memory_order_acquire);
+    pressure.stalled = memory_eviction_stalled_.load(std::memory_order_acquire);
+    pressure.used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
+    pressure.high_watermark = eviction_high_watermark_ratio_;
+    pressure.stall_episode =
+        memory_eviction_stall_episode_.load(std::memory_order_acquire);
+    return pressure;
+}
+
+void MasterService::PublishMemoryEvictionRound(bool made_progress,
+                                               bool stopped) {
+    if (stopped) {
+        // An OpLog failure is not "nothing to do": it says nothing about
+        // whether the pool still has candidates.
+        return;
+    }
+    if (made_progress) {
+        memory_eviction_stalled_.store(false, std::memory_order_release);
+        return;
+    }
+    // One episode per run of consecutive no-progress rounds, so offboarding
+    // gets one maintenance unit per stall, not one per round.
+    if (!memory_eviction_stalled_.exchange(true, std::memory_order_acq_rel)) {
+        memory_eviction_stall_episode_.fetch_add(1, std::memory_order_acq_rel);
     }
 }
 
@@ -10216,6 +10938,10 @@ void MasterService::ClientMonitorFunc() {
                 std::chrono::milliseconds(kClientMonitorSleepMs));
             continue;
         }
+
+        // A management thread reports the offboarding stage and its stall, so a
+        // stage that cannot log its own progress is still observable.
+        RefreshOffboardingStageMetric();
 
         const auto now = ClientLivenessRecord::Clock::now();
         std::vector<std::pair<UUID, std::shared_ptr<ClientLivenessRecord>>>

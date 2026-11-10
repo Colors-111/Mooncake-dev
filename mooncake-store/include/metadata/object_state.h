@@ -18,6 +18,13 @@ namespace route {
 struct ObjectState {
     // A primary write or a background task is in flight for this key.
     bool is_processing{false};
+    // Eviction found nothing to release for this publication and every
+    // COMPLETE memory replica it holds lost its allocator or segment lifetime,
+    // so it may never release memory again. The eviction index keeps the key
+    // out of its candidates until a write finds a live COMPLETE memory replica
+    // again (see EvictionIndex::SuppressPermanentlyUnavailable). It lives and
+    // dies with the publication, so a new generation never inherits it.
+    bool eviction_suppressed{false};
     HeapOptional<ReplicationTask> replication_task;
     HeapOptional<OffloadingTask> offloading_task;
     HeapOptional<PromotionTask> promotion_task;

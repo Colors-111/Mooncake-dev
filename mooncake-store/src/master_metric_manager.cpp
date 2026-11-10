@@ -105,6 +105,13 @@ MasterMetricManager::MasterMetricManager()
       client_offboarding_alerts_(
           "master_client_offboarding_alerts_total",
           "Offboarding retries at or above the operator alert threshold"),
+      client_offboarding_stage_(
+          "master_client_offboarding_stage",
+          "Offboarding stage last published (0 idle, 1 prepare, 2 collect, "
+          "3 clean, 4 lifecycle wait, 5 eviction wait, 6 commit)"),
+      client_offboarding_stage_stall_ms_(
+          "master_client_offboarding_stage_stall_ms",
+          "Time the published offboarding stage has been running in ms"),
 
       // Initialize Request Counters
       put_start_requests_("master_put_start_requests_total",
@@ -1082,6 +1089,15 @@ void MasterMetricManager::inc_client_offboarding_alert() {
 void MasterMetricManager::observe_client_offboarding_duration_ms(
     int64_t duration_ms) {
     client_offboarding_duration_ms_.observe(duration_ms);
+}
+
+void MasterMetricManager::set_client_offboarding_stage(int64_t stage) {
+    client_offboarding_stage_.update(stage);
+}
+
+void MasterMetricManager::set_client_offboarding_stage_stall_ms(
+    int64_t stall_ms) {
+    client_offboarding_stage_stall_ms_.update(stall_ms);
 }
 
 // Store-observed cache reuse metrics

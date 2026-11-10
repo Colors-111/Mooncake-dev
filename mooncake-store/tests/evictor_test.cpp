@@ -24,6 +24,7 @@ namespace {
 
 using eviction::ByteGoal;
 using eviction::Clock;
+using eviction::NothingCause;
 using eviction::ObjectGoal;
 using eviction::Outcome;
 using eviction::Scope;
@@ -700,7 +701,46 @@ TEST_F(OffloadingReclaimerTest, PastTheCapAForcedRunDropsWithoutOffload) {
     EXPECT_TRUE(queue_.pushed.empty());
 }
 
+// A COMPLETE memory replica whose allocator is already gone.
+Replica DeadMemoryReplica() {
+    auto dying = std::make_shared<OffsetBufferAllocator>(
+        "dead_segment", 0x500000000ULL, 1 << 20, "dead_segment");
+    auto buffer = dying->allocate(128);
+    dying.reset();
+    return Replica(std::move(buffer), ReplicaStatus::COMPLETE);
+}
+
 // --- Report observers --------------------------------------------------------
+
+TEST_F(EvictorTest, NothingToReleaseSuppressesPermanentlyUnavailableCandidate) {
+    metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
+    {
+        auto guard = ns.objects.WriteKey("dead");
+        std::vector<Replica> replicas;
+        replicas.push_back(DeadMemoryReplica());
+        // The reference count is why the policy releases nothing, but the
+        // allocator lifetime is what makes the candidate permanently useless.
+        replicas.back().inc_refcnt();
+        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                            std::move(replicas), std::nullopt, false,
+                            ObjectDataType::UNKNOWN, std::string(),
+                            TenantId("a"), "dead");
+        SetDeadline(guard.metadata(), Clock::now() - seconds(10));
+    }
+
+    const auto first = Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+    EXPECT_EQ(first.filed, 1u);
+    EXPECT_EQ(first.visited, 1u);
+    EXPECT_EQ(first.NothingCount(NothingCause::kPermanentlyUnavailable), 1u);
+    EXPECT_EQ(first.suppressed_permanently_unavailable, 1u);
+    EXPECT_TRUE(observer_.applied.empty());
+
+    // The second run no longer has the candidate to visit.
+    const auto second = Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+    EXPECT_EQ(second.filed, 0u);
+    EXPECT_EQ(second.visited, 0u);
+    EXPECT_TRUE(observer_.applied.empty());
+}
 
 TEST_F(EvictorTest, MetricsLeaveAPoolRunToItsCaller) {
     Publish("a", "k1", seconds(10));

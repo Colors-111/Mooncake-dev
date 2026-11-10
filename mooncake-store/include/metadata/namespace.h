@@ -90,6 +90,9 @@ class Namespace final : private route::RouteObserver {
     [[nodiscard]] const EvictionIndex& eviction_index() const {
         return *eviction_index_;
     }
+    // The same index for a caller that acts on it under a key's write lock,
+    // such as suppressing a permanently unavailable candidate.
+    [[nodiscard]] EvictionIndex& eviction_index() { return *eviction_index_; }
 
     // --- Work in flight ------------------------------------------------------
     //

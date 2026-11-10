@@ -43,6 +43,7 @@
 #include "random.h"
 #include "types.h"
 #include "master_service_test_fixture.h"
+#include "common/transparent_string_hash.h"
 
 namespace mooncake::test {
 
@@ -4430,6 +4431,197 @@ TEST_F(MasterServiceTest,
     EXPECT_TRUE(job.prepared_segments.empty());
     EXPECT_TRUE(job.pending_prepare_segments.empty());
     EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
+}
+
+namespace {
+
+// A key the route files in `stripe`.
+std::string KeyInStripe(size_t stripe) {
+    for (int i = 0;; ++i) {
+        std::string key = "offboarding_stripe_key_" + std::to_string(i);
+        if (TransparentStringHash{}(key) % route::ObjectRoute::kStripeCount ==
+            stripe) {
+            return key;
+        }
+    }
+}
+
+}  // namespace
+
+// The sweep advances its tenant cursor as it collects a tenant's last stripe.
+// The candidates that stripe yielded must still be cleaned under the tenant
+// they came from; before that they were looked up under the next tenant, or
+// dropped when there was none.
+TEST_F(MasterServiceTest, ClientOffboardingCleansTheLastStripeOfATenant) {
+    MasterService service;
+    auto segment = MakeSegment("offboarding_last_stripe_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    const std::string key = KeyInStripe(route::ObjectRoute::kStripeCount - 1);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = segment.name;
+    ASSERT_TRUE(
+        service.PutStart(client_id, key, TenantId::Default(), 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service.PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
+
+    const MasterServiceTestPeer::ObjectIdentity identity{TenantId::Default(),
+                                                         key};
+    // The object is there and readable before the segment is prepared.
+    ASSERT_TRUE(
+        MasterServiceTestPeer::ReadObject(service, identity).has_value());
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.liveness);
+    job.pending_prepare_segments.push_back(
+        {.segment_id = segment.id,
+         .segment_name = segment.name,
+         .transport_endpoint = segment.te_endpoint});
+
+    ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
+    // The replica was really removed and the object torn down, not merely
+    // made unreadable by the prepare.
+    EXPECT_GE(job.clean_requests, 1u);
+    EXPECT_EQ(job.clean_removed_replicas, 1u);
+    EXPECT_FALSE(
+        MasterServiceTestPeer::ReadObject(service, identity).has_value());
+}
+
+// A restore crossing a sweep invalidates its tenant snapshot and cursors. The
+// job must notice the generation change and sweep again rather than continue
+// against rewritten metadata.
+TEST_F(MasterServiceTest, ClientOffboardingRestartsSweepWhenRestoreCrossesIt) {
+    MasterService service;
+    auto segment = MakeSegment("offboarding_epoch_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    const std::string key = KeyInStripe(route::ObjectRoute::kStripeCount - 1);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = segment.name;
+    ASSERT_TRUE(
+        service.PutStart(client_id, key, TenantId::Default(), 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service.PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
+    const MasterServiceTestPeer::ObjectIdentity identity{TenantId::Default(),
+                                                         key};
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.liveness);
+    job.pending_prepare_segments.push_back(
+        {.segment_id = segment.id,
+         .segment_name = segment.name,
+         .transport_endpoint = segment.te_endpoint});
+
+    MasterServiceTestPeer peer(service);
+    // Prepare, snapshot, and walk the first stripes; the key's stripe is the
+    // last one, so the sweep is still open.
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_EQ(peer.ProcessClientOffboardingStep(job),
+                  ClientOffboardingDisposition::kContinue);
+    }
+    ASSERT_TRUE(job.cleanup_snapshot_taken);
+    const uint64_t sweep_epoch = job.sweep_lifecycle_epoch;
+
+    MasterServiceTestPeer::LifecycleEpoch(service).fetch_add(1);
+    ASSERT_NE(sweep_epoch, MasterServiceTestPeer::LifecycleEpoch(service).load(
+                               std::memory_order_acquire));
+
+    bool completed = false;
+    for (int i = 0; i < 1'000'000 && !completed; ++i) {
+        const auto disposition = peer.ProcessClientOffboardingStep(job);
+        ASSERT_NE(disposition, ClientOffboardingDisposition::kError);
+        ASSERT_NE(disposition, ClientOffboardingDisposition::kLifecycleWait);
+        completed = disposition == ClientOffboardingDisposition::kComplete;
+    }
+    EXPECT_TRUE(completed);
+    EXPECT_GE(job.clean_requests, 1u);
+    EXPECT_FALSE(
+        MasterServiceTestPeer::ReadObject(service, identity).has_value());
+}
+
+// The same restart, driven by the real promotion restore path (its lifecycle
+// transition and exclusive lock) rather than a hand-advanced generation.
+TEST_F(MasterServiceTest, ClientOffboardingRestartsSweepAfterARealRestore) {
+    MasterService service;
+    auto segment = MakeSegment("offboarding_real_restore_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    const std::string key = KeyInStripe(route::ObjectRoute::kStripeCount - 1);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = segment.name;
+    ASSERT_TRUE(
+        service.PutStart(client_id, key, TenantId::Default(), 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service.PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
+    const MasterServiceTestPeer::ObjectIdentity identity{TenantId::Default(),
+                                                         key};
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.liveness);
+    job.pending_prepare_segments.push_back(
+        {.segment_id = segment.id,
+         .segment_name = segment.name,
+         .transport_endpoint = segment.te_endpoint});
+
+    MasterServiceTestPeer peer(service);
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_EQ(peer.ProcessClientOffboardingStep(job),
+                  ClientOffboardingDisposition::kContinue);
+    }
+    ASSERT_TRUE(job.cleanup_snapshot_taken);
+    const uint64_t sweep_epoch = job.sweep_lifecycle_epoch;
+
+    // A real restore opens and closes its lifecycle window under its own
+    // exclusive locks; the sweep's snapshot and cursors predate it.
+    const auto restored = service.RestoreFromStandbySnapshot(
+        {}, /*initial_oplog_sequence_id=*/0, {});
+    ASSERT_TRUE(restored.has_value()) << toString(restored.error());
+    EXPECT_EQ(MasterServiceTestPeer::GetRestoreLifecycleState(service),
+              MasterService::RestoreLifecycleState::kReady);
+    EXPECT_GT(MasterServiceTestPeer::LifecycleEpoch(service).load(
+                  std::memory_order_acquire),
+              sweep_epoch);
+    // An empty restore leaves the object in place: only a restarted sweep can
+    // be what removes it, so this assertion keeps the outcome below meaningful.
+    ASSERT_TRUE(
+        MasterServiceTestPeer::ReadObject(service, identity).has_value());
+
+    // The next unit notices the generation change and sweeps again.
+    bool completed = false;
+    for (int i = 0; i < 1'000'000 && !completed; ++i) {
+        const auto disposition = peer.ProcessClientOffboardingStep(job);
+        ASSERT_NE(disposition, ClientOffboardingDisposition::kError);
+        ASSERT_NE(disposition, ClientOffboardingDisposition::kLifecycleWait);
+        completed = disposition == ClientOffboardingDisposition::kComplete;
+    }
+    EXPECT_TRUE(completed);
+    // The re-sweep, not the pre-restore one, is what keys the job to the
+    // current generation.
+    EXPECT_EQ(job.sweep_lifecycle_epoch,
+              MasterServiceTestPeer::LifecycleEpoch(service).load(
+                  std::memory_order_acquire));
+    // The restarted sweep actually removed the residual metadata.
+    EXPECT_GE(job.clean_requests, 1u);
+    EXPECT_FALSE(
+        MasterServiceTestPeer::ReadObject(service, identity).has_value());
 }
 
 // Localhost-only HTTP server that records DELETE request lines. A test picks

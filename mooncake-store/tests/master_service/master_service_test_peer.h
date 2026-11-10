@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <utility>
 
 #include "master_service.h"
@@ -548,7 +549,31 @@ class MasterServiceTestPeer {
     }
 
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job) {
+        // The service advances a bounded unit per call. A test drives the
+        // units to completion, and still sees false for an error or a wait.
+        for (int i = 0; i < 1'000'000; ++i) {
+            const auto disposition = service_.ProcessClientOffboardingJob(job);
+            if (disposition == ClientOffboardingDisposition::kComplete) {
+                return true;
+            }
+            if (disposition != ClientOffboardingDisposition::kContinue) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // One bounded unit, for a test that interleaves another event with the
+    // sweep instead of driving it to completion.
+    ClientOffboardingDisposition ProcessClientOffboardingStep(
+        ClientOffboardingJob& job) {
         return service_.ProcessClientOffboardingJob(job);
+    }
+
+    // The restore lifecycle generation, which a test advances as a restore
+    // would to make a sweep spanning it stale.
+    static std::atomic<uint64_t>& LifecycleEpoch(MasterService& service) {
+        return service.lifecycle_epoch_;
     }
 
     tl::expected<void, ErrorCode> PushOffloadingQueue(

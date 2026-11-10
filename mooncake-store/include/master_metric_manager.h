@@ -160,6 +160,10 @@ class MasterMetricManager {
     void inc_client_offboarding_retry();
     void inc_client_offboarding_alert();
     void observe_client_offboarding_duration_ms(int64_t duration_ms);
+    // The offboarding stage last published (see ClientOffboardingStage) and how
+    // long it has been running, so a stuck stage is visible without a log.
+    void set_client_offboarding_stage(int64_t stage);
+    void set_client_offboarding_stage_stall_ms(int64_t stall_ms);
 
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
@@ -638,6 +642,8 @@ class MasterMetricManager {
     ylt::metric::histogram_t client_offboarding_duration_ms_;
     ylt::metric::counter_t client_offboarding_retries_;
     ylt::metric::counter_t client_offboarding_alerts_;
+    ylt::metric::gauge_t client_offboarding_stage_;
+    ylt::metric::gauge_t client_offboarding_stage_stall_ms_;
 
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;

@@ -356,6 +356,105 @@ TEST_F(LeaseEvictionIndexTest, AMemberReplacedInPlaceStaysInItsGroup) {
               (std::vector<std::set<std::string>>{{"g1", "g2"}}));
 }
 
+// A COMPLETE memory replica whose allocator is already gone: the allocator
+// lifetime is permanently invalid, so eviction can never release it.
+Replica DeadMemoryReplica() {
+    auto dying = std::make_shared<OffsetBufferAllocator>(
+        "dead_segment", 0x500000000ULL, 1 << 20, "dead_segment");
+    auto buffer = dying->allocate(128);
+    dying.reset();
+    return Replica(std::move(buffer), ReplicaStatus::COMPLETE);
+}
+
+// A publication eviction found nothing to release for, and that can never
+// release memory, leaves the candidates for good; a live COMPLETE memory
+// replica later lifts the suppression.
+TEST_F(LeaseEvictionIndexTest, SuppressesPermanentlyUnavailableCandidates) {
+    {
+        auto guard = ns_.objects.WriteKey("dead");
+        std::vector<Replica> replicas;
+        replicas.push_back(DeadMemoryReplica());
+        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                            std::move(replicas), std::nullopt, false,
+                            ObjectDataType::UNKNOWN, std::string(), TenantId(),
+                            "dead");
+        SetDeadline(guard.metadata(), t0_);
+    }
+    ASSERT_EQ(Filed(), 1u);
+
+    {
+        auto guard = ns_.objects.Write("dead");
+        ASSERT_TRUE(guard.has_value());
+        EXPECT_TRUE(
+            ns_.eviction_index().SuppressPermanentlyUnavailable(*guard));
+    }
+    EXPECT_EQ(Filed(), 0u);
+
+    // A write that still finds no live COMPLETE memory replica keeps it out.
+    {
+        auto guard = ns_.objects.Write("dead");
+        ASSERT_TRUE(guard.has_value());
+    }
+    EXPECT_EQ(Filed(), 0u);
+    EXPECT_TRUE(DueKeys(t0_ + seconds(1)).empty());
+
+    // A live COMPLETE memory replica makes it a candidate again.
+    {
+        auto guard = ns_.objects.Write("dead");
+        ASSERT_TRUE(guard.has_value());
+        std::vector<Replica> replicas;
+        replicas.emplace_back(allocator_->allocate(128),
+                              ReplicaStatus::COMPLETE);
+        guard->metadata().AddReplicas(std::move(replicas));
+    }
+    EXPECT_EQ(Filed(), 1u);
+    EXPECT_EQ(DueKeys(t0_ + seconds(1)), std::vector<std::string>{"dead"});
+}
+
+// Anything that may recover or release memory later never qualifies: a busy
+// reference count, a PROCESSING replica awaiting completion, and a live
+// COMPLETE memory replica beside a dead one.
+TEST_F(LeaseEvictionIndexTest, KeepsCandidatesThatMayStillReleaseMemory) {
+    Publish("live", t0_);
+    {
+        auto guard = ns_.objects.WriteKey("busy");
+        Replica replica(allocator_->allocate(128), ReplicaStatus::COMPLETE);
+        replica.inc_refcnt();
+        std::vector<Replica> replicas;
+        replicas.push_back(std::move(replica));
+        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                            std::move(replicas), std::nullopt, false,
+                            ObjectDataType::UNKNOWN, std::string(), TenantId(),
+                            "busy");
+        SetDeadline(guard.metadata(), t0_);
+    }
+    Publish("processing", t0_, ReplicaStatus::PROCESSING);
+    {
+        auto guard = ns_.objects.WriteKey("mixed");
+        std::vector<Replica> replicas;
+        replicas.push_back(DeadMemoryReplica());
+        replicas.emplace_back(allocator_->allocate(128),
+                              ReplicaStatus::COMPLETE);
+        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                            std::move(replicas), std::nullopt, false,
+                            ObjectDataType::UNKNOWN, std::string(), TenantId(),
+                            "mixed");
+        SetDeadline(guard.metadata(), t0_);
+    }
+    // The PROCESSING key has no COMPLETE memory replica, so it was never a
+    // candidate; the other three are.
+    ASSERT_EQ(Filed(), 3u);
+
+    for (const char* key : {"live", "busy", "processing", "mixed"}) {
+        auto guard = ns_.objects.Write(key);
+        ASSERT_TRUE(guard.has_value()) << key;
+        EXPECT_FALSE(
+            ns_.eviction_index().SuppressPermanentlyUnavailable(*guard))
+            << key;
+    }
+    EXPECT_EQ(Filed(), 3u);
+}
+
 // An index that counts what the namespace tells it.
 class CountingIndex final : public EvictionIndex {
    public:

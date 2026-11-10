@@ -55,6 +55,8 @@ enum class SkipReason : uint8_t {
     kExternalEvict,
     // No replica the policy would release.
     kNothingToRelease,
+    // Not a reason: how many reasons there are, for per-reason counters.
+    kCount,
 };
 
 class EvictionPolicy {
