@@ -4649,6 +4649,9 @@ TEST_F(MasterServiceTest, OffboardingCleanupWindowOpensOncePerSweep) {
     const UUID client_a = generate_uuid();
     const auto segment_a = MakeSegment("cleanup_window_a");
     ASSERT_TRUE(service.MountSegment(segment_a, client_a).has_value());
+    // Creates the tenant's namespace, so the sweep has work to do and does not
+    // converge in its first unit.
+    PutObjectOnSegment(service, client_a, segment_a.name);
     const UUID client_b = generate_uuid();
     const auto segment_b = MakeSegment("cleanup_window_b");
     ASSERT_TRUE(service.MountSegment(segment_b, client_b).has_value());
@@ -4701,6 +4704,8 @@ TEST_F(MasterServiceTest, OffboardingCleanupWindowReleaseIsIdempotent) {
     const UUID client_id = generate_uuid();
     const auto segment = MakeSegment("cleanup_window_release");
     ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    // Creates the tenant's namespace so the sweep stays open past one unit.
+    PutObjectOnSegment(service, client_id, segment.name);
 
     ClientOffboardingJob job;
     job.client_id = client_id;
