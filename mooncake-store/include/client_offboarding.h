@@ -118,6 +118,10 @@ struct ClientOffboardingJob {
     // complete sweep that saw one reopens instead of declaring the metadata
     // clean.
     bool sweep_saw_processing{false};
+    // Whether this job has the sweep registered with the service, so the
+    // eviction index gets the early permanent-unavailable path only while an
+    // offboarding sweep is in progress.
+    bool sweep_cleanup_registered{false};
     // The eviction stall episode whose one maintenance batch was already
     // spent, so a stalled eviction cannot be bypassed more than once per
     // episode.
@@ -184,7 +188,7 @@ class ClientOffboardingWorker {
     void ScheduleReserved(ClientOffboardingJob job);
     void ThreadFunc();
     void CompleteJob(const ClientOffboardingJob& job);
-    void DropJob(const ClientOffboardingJob& job, const char* reason);
+    void DropJob(ClientOffboardingJob& job, const char* reason);
     static std::chrono::seconds RetryDelay(uint64_t retry_count);
     static bool ShouldAlert(uint64_t retry_count) {
         return retry_count >= kAlertRetryThreshold;

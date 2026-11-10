@@ -4624,6 +4624,104 @@ TEST_F(MasterServiceTest, ClientOffboardingRestartsSweepAfterARealRestore) {
         MasterServiceTestPeer::ReadObject(service, identity).has_value());
 }
 
+// One registration per job, however many bounded units, waits or sweep
+// restarts it goes through; overlapping jobs stack, and the last one to
+// converge closes the window. A job that starts later opens it again, so an
+// eviction run already in progress sees it on its next candidate.
+TEST_F(MasterServiceTest, OffboardingCleanupWindowOpensOncePerSweep) {
+    MasterService service;
+    auto& sweeps = MasterServiceTestPeer::OffboardingCleanupSweeps(service);
+    MasterServiceTestPeer peer(service);
+
+    const auto make_job = [&](const UUID& client_id,
+                              const Segment& segment) {
+        ClientOffboardingJob job;
+        job.client_id = client_id;
+        job.liveness = FindClientLivenessForTest(service, client_id);
+        EXPECT_TRUE(job.liveness);
+        job.pending_prepare_segments.push_back(
+            {.segment_id = segment.id,
+             .segment_name = segment.name,
+             .transport_endpoint = segment.te_endpoint});
+        return job;
+    };
+
+    const UUID client_a = generate_uuid();
+    const auto segment_a = MakeSegment("cleanup_window_a");
+    ASSERT_TRUE(service.MountSegment(segment_a, client_a).has_value());
+    const UUID client_b = generate_uuid();
+    const auto segment_b = MakeSegment("cleanup_window_b");
+    ASSERT_TRUE(service.MountSegment(segment_b, client_b).has_value());
+
+    EXPECT_EQ(sweeps.load(), 0);
+    ClientOffboardingJob job_a = make_job(client_a, segment_a);
+    ASSERT_EQ(peer.ProcessClientOffboardingStep(job_a),
+              ClientOffboardingDisposition::kContinue);
+    EXPECT_TRUE(job_a.sweep_cleanup_registered);
+    EXPECT_EQ(sweeps.load(), 1);
+
+    // Further units and a restore-driven restart do not register again.
+    ASSERT_EQ(peer.ProcessClientOffboardingStep(job_a),
+              ClientOffboardingDisposition::kContinue);
+    EXPECT_EQ(sweeps.load(), 1);
+    MasterServiceTestPeer::LifecycleEpoch(service).fetch_add(1);
+    ASSERT_EQ(peer.ProcessClientOffboardingStep(job_a),
+              ClientOffboardingDisposition::kContinue);
+    EXPECT_EQ(sweeps.load(), 1);
+
+    // A second job overlaps: the window stays open while either sweeps.
+    ClientOffboardingJob job_b = make_job(client_b, segment_b);
+    ASSERT_EQ(peer.ProcessClientOffboardingStep(job_b),
+              ClientOffboardingDisposition::kContinue);
+    EXPECT_EQ(sweeps.load(), 2);
+    ASSERT_TRUE(peer.ProcessClientOffboardingJob(job_a));
+    EXPECT_EQ(sweeps.load(), 1);
+    ASSERT_TRUE(peer.ProcessClientOffboardingJob(job_b));
+    EXPECT_EQ(sweeps.load(), 0);
+
+    // A later job opens the window again.
+    const UUID client_c = generate_uuid();
+    const auto segment_c = MakeSegment("cleanup_window_c");
+    ASSERT_TRUE(service.MountSegment(segment_c, client_c).has_value());
+    ClientOffboardingJob job_c = make_job(client_c, segment_c);
+    ASSERT_EQ(peer.ProcessClientOffboardingStep(job_c),
+              ClientOffboardingDisposition::kContinue);
+    EXPECT_EQ(sweeps.load(), 1);
+    ASSERT_TRUE(peer.ProcessClientOffboardingJob(job_c));
+    EXPECT_EQ(sweeps.load(), 0);
+}
+
+// The release a dropped job runs must be idempotent: convergence and a
+// later drop can both reach it.
+TEST_F(MasterServiceTest, OffboardingCleanupWindowReleaseIsIdempotent) {
+    MasterService service;
+    auto& sweeps = MasterServiceTestPeer::OffboardingCleanupSweeps(service);
+    MasterServiceTestPeer peer(service);
+
+    const UUID client_id = generate_uuid();
+    const auto segment = MakeSegment("cleanup_window_release");
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.liveness);
+    job.pending_prepare_segments.push_back(
+        {.segment_id = segment.id,
+         .segment_name = segment.name,
+         .transport_endpoint = segment.te_endpoint});
+    ASSERT_EQ(peer.ProcessClientOffboardingStep(job),
+              ClientOffboardingDisposition::kContinue);
+    ASSERT_TRUE(job.sweep_cleanup_registered);
+    EXPECT_EQ(sweeps.load(), 1);
+
+    peer.ReleaseOffboardingCleanupForTesting(job);
+    EXPECT_FALSE(job.sweep_cleanup_registered);
+    EXPECT_EQ(sweeps.load(), 0);
+    peer.ReleaseOffboardingCleanupForTesting(job);
+    EXPECT_EQ(sweeps.load(), 0);
+}
+
 // Localhost-only HTTP server that records DELETE request lines. A test picks
 // which requests (by 1-based arrival number) the server holds before it
 // answers, and releases them one by one, so the cleanup worker can be stopped

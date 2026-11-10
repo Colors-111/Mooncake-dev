@@ -55,6 +55,10 @@ enum class SkipReason : uint8_t {
     kExternalEvict,
     // No replica the policy would release.
     kNothingToRelease,
+    // The offboarding window lifted this key out of the index before the
+    // normal path: every COMPLETE memory replica is permanently unavailable,
+    // so it could never release memory.
+    kPermanentlyUnavailable,
     // Not a reason: how many reasons there are, for per-reason counters.
     kCount,
 };

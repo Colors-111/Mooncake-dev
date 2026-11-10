@@ -90,8 +90,12 @@ void ClientOffboardingWorker::CompleteJob(const ClientOffboardingJob& job) {
               << ", duration_ms=" << duration_ms;
 }
 
-void ClientOffboardingWorker::DropJob(const ClientOffboardingJob& job,
+void ClientOffboardingWorker::DropJob(ClientOffboardingJob& job,
                                       const char* reason) {
+    // A dropped job keeps no window open: the sweep never converges, so the
+    // release must happen here too. It is idempotent with the one at
+    // convergence.
+    service_->ReleaseOffboardingCleanup(job);
     pending_jobs_.fetch_sub(1, std::memory_order_acq_rel);
     MasterMetricManager::instance().dec_client_offboarding_queue_depth();
     LOG(ERROR) << "client_id=" << job.client_id
@@ -112,7 +116,7 @@ void ClientOffboardingWorker::ThreadFunc() {
                 auto dropped = std::move(jobs_);
                 jobs_.clear();
                 lock.unlock();
-                for (const auto& queued : dropped) {
+                for (auto& queued : dropped) {
                     DropJob(queued, "master_stopping");
                 }
                 break;

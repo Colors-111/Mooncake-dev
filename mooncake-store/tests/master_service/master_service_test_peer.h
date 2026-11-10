@@ -576,6 +576,17 @@ class MasterServiceTestPeer {
         return service.lifecycle_epoch_;
     }
 
+    // How many offboarding jobs keep the early-suppression window open.
+    static std::atomic<int>& OffboardingCleanupSweeps(MasterService& service) {
+        return service.offboarding_cleanup_sweeps_;
+    }
+
+    // The same release a dropped job runs, so a test can check it is
+    // idempotent.
+    void ReleaseOffboardingCleanupForTesting(ClientOffboardingJob& job) {
+        service_.ReleaseOffboardingCleanup(job);
+    }
+
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr) {

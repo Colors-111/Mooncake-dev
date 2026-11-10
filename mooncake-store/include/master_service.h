@@ -1222,6 +1222,10 @@ class MasterService {
     // Drops the sweep's snapshot, cursor, candidates and acceptance, so the
     // next unit starts a fresh sweep after a restore.
     void RestartOffboardingSweep(ClientOffboardingJob& job, const char* reason);
+    // Idempotently releases the job's registration that keeps the early
+    // permanent-unavailable window open. Called when the sweep converges and
+    // when a job is dropped at shutdown.
+    void ReleaseOffboardingCleanup(ClientOffboardingJob& job);
     [[nodiscard]] uint64_t GetLifecycleEpoch() const;
     void PublishOffboardingStage(ClientOffboardingJob& job,
                                  ClientOffboardingStage stage);
@@ -1749,6 +1753,13 @@ class MasterService {
     std::atomic<int> offboarding_stage_{
         static_cast<int>(ClientOffboardingStage::kIdle)};
     std::atomic<int64_t> offboarding_stage_since_ms_{0};
+    // How many offboarding jobs are in a metadata sweep right now. While one
+    // is, the memory evictor opens its early permanent-unavailable path; an
+    // eviction run outside that window is unchanged.
+    std::atomic<int> offboarding_cleanup_sweeps_{0};
+    [[nodiscard]] bool OffboardingCleanupActive() const {
+        return offboarding_cleanup_sweeps_.load(std::memory_order_acquire) > 0;
+    }
 
     // Task cleanup thread related members
     std::thread task_cleanup_thread_;

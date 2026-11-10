@@ -37,6 +37,8 @@ const char* SkipName(SkipReason reason) {
             return "external_evict";
         case SkipReason::kNothingToRelease:
             return "nothing_to_release";
+        case SkipReason::kPermanentlyUnavailable:
+            return "permanently_unavailable";
         case SkipReason::kCount:
             break;
     }

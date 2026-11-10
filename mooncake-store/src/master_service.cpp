@@ -386,7 +386,8 @@ struct MasterService::MemoryEviction {
                       ? static_cast<eviction::Reclaimer&>(offloading)
                       : static_cast<eviction::Reclaimer&>(immediate),
                   Observers(settings),
-                  eviction::Diagnostics{settings.diag_sample_percent}) {}
+                  eviction::Diagnostics{settings.diag_sample_percent},
+                  [&service] { return service.OffboardingCleanupActive(); }) {}
     static bool InPlan(const eviction::Plan& plan, const Replica& replica) {
         return std::find(plan.release.begin(), plan.release.end(),
                          replica.id()) != plan.release.end();
@@ -2644,6 +2645,14 @@ uint64_t MasterService::GetLifecycleEpoch() const {
     return lifecycle_epoch_.load(std::memory_order_acquire);
 }
 
+void MasterService::ReleaseOffboardingCleanup(ClientOffboardingJob& job) {
+    if (!job.sweep_cleanup_registered) {
+        return;
+    }
+    offboarding_cleanup_sweeps_.fetch_sub(1, std::memory_order_acq_rel);
+    job.sweep_cleanup_registered = false;
+}
+
 void MasterService::RestartOffboardingSweep(ClientOffboardingJob& job,
                                             const char* reason) {
     LOG(INFO) << "client_id=" << job.client_id
@@ -2735,6 +2744,14 @@ ClientOffboardingDisposition MasterService::ProcessClientOffboardingJob(
 
     // --- Metadata sweep ----------------------------------------------------
     if (!job.metadata_cleanup_accepted) {
+        // While a sweep is in progress, memory eviction may take a permanently
+        // unavailable candidate out of the index on first contact. The window
+        // closes as soon as the sweep converges, so healthy eviction never
+        // pays the extra replica check.
+        if (!job.sweep_cleanup_registered) {
+            offboarding_cleanup_sweeps_.fetch_add(1, std::memory_order_acq_rel);
+            job.sweep_cleanup_registered = true;
+        }
         if (!job.cleanup_snapshot_taken) {
             // Taken once, after prepare, under the shared master lock. The
             // full table enumeration is deliberate: a namespace that is empty
@@ -2833,6 +2850,7 @@ ClientOffboardingDisposition MasterService::ProcessClientOffboardingJob(
                     return ClientOffboardingDisposition::kLifecycleWait;
                 }
                 job.metadata_cleanup_accepted = true;
+                ReleaseOffboardingCleanup(job);
                 LOG(INFO) << "client_id=" << job.client_id
                           << ", action=client_offboarding_metadata_cleanup"
                           << ", accepted=true"
@@ -10645,9 +10663,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
         need_mem_eviction_.exchange(false, std::memory_order_relaxed);
 
     const auto round_started = std::chrono::steady_clock::now();
-    double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
+    const double begin_used_ratio =
+        segment_manager_.GetMemoryUsage().used_ratio();
     VLOG(1) << "[EVICT-ROUND] round_id=" << round_id << " phase=begin"
-            << " used_ratio=" << used_ratio
+            << " used_ratio=" << begin_used_ratio
             << " high_watermark=" << eviction_high_watermark_ratio_
             << " target=" << evict_ratio_target
             << " lowerbound=" << evict_ratio_lowerbound
@@ -10715,10 +10734,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
         last_evict_round_log_ms_.store(now_ms, std::memory_order_relaxed);
     }
     const auto write_round_line = [&](auto& stream) {
+        // The begin and end watermarks are reported separately: a round that
+        // released memory may still end higher because concurrent writes
+        // refilled it, and printing only the entry watermark reads as "the
+        // round did not lower the level".
         stream << "[EVICT-ROUND] round_id=" << round_id << " phase=end"
                << " elapsed_ms=" << elapsed_ms << " trigger="
                << (allocation_pressure ? "allocation" : "watermark")
-               << " used_ratio=" << used_ratio
+               << " begin_used_ratio=" << begin_used_ratio << " end_used_ratio="
+               << segment_manager_.GetMemoryUsage().used_ratio()
                << " high_watermark=" << eviction_high_watermark_ratio_
                << " target=" << evict_ratio_target
                << " lowerbound=" << evict_ratio_lowerbound
