@@ -2832,6 +2832,14 @@ ClientOffboardingDisposition MasterService::ProcessClientOffboardingJob(
             job.cleanup_candidates.clear();
             job.cleanup_candidate_index = 0;
 
+            if (!job.cleanup_snapshot_taken) {
+                // A restore restarted the sweep from inside a unit, which
+                // dropped the snapshot and cursor. Stop this attempt here so
+                // the next one takes a fresh snapshot: the empty cursor must
+                // not be read as a completed sweep.
+                return ClientOffboardingDisposition::kContinue;
+            }
+
             if (job.cleanup_tenant_index >= job.cleanup_tenants.size()) {
                 // A complete sweep that met an affiliated PROCESSING replica
                 // keeps the responsibility and opens a new one: the replica
