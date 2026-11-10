@@ -283,6 +283,18 @@ class Evictor::Pass {
     std::vector<Replica> EvictLocked(const route::WriteGuard& hold,
                                      const Entry* entry, bool sampled) {
         ScopeTimer timer(sampled ? &report_.reclaim : nullptr);
+        // During an offboarding sweep, a key whose COMPLETE memory replicas are
+        // all permanently unavailable leaves the candidates on first contact:
+        // neither re-ranking it as "moved" nor running the policy can ever free
+        // memory from it. Only the derived index changes; its metadata stays
+        // with offboarding's own HA-cleared path. Outside a sweep the window is
+        // closed and this check does not run at all.
+        if (evictor_.suppression_window_ && evictor_.suppression_window_() &&
+            ns_.eviction_index().SuppressPermanentlyUnavailable(hold)) {
+            ++report_.suppressed_permanently_unavailable;
+            Skip(hold, SkipReason::kPermanentlyUnavailable);
+            return {};
+        }
         // Filed ahead of its real rank: letting the lock go files it there,
         // where the walk meets it in its turn.
         if (entry != nullptr && !cursor_->StillAt(hold, *entry)) {
@@ -374,12 +386,13 @@ class Evictor::Pass {
 Evictor::Evictor(metadata::NamespaceTable& namespaces,
                  const EvictionPolicy& policy, Reclaimer& reclaimer,
                  std::vector<EvictionObserver*> observers,
-                 Diagnostics diagnostics)
+                 Diagnostics diagnostics, SuppressionWindow suppression_window)
     : namespaces_(namespaces),
       policy_(policy),
       reclaimer_(reclaimer),
       observers_(std::move(observers)),
-      diagnostics_(diagnostics) {}
+      diagnostics_(diagnostics),
+      suppression_window_(std::move(suppression_window)) {}
 
 Report Evictor::Run(const Scope& scope, const ObjectGoal& goal,
                     uint64_t round_id, ProgressFn progress) {

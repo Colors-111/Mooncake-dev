@@ -1,6 +1,7 @@
 #include "eviction/evictor.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -710,6 +711,46 @@ Replica DeadMemoryReplica() {
     return Replica(std::move(buffer), ReplicaStatus::COMPLETE);
 }
 
+// Publishes `key` with a COMPLETE memory replica from `allocator`, filed at
+// `filed_deadline`, then extends its lease through the read path. The index
+// does not observe reads, so the key stays filed at the old rank while its
+// real deadline moved ahead: eviction sees a real "moved" condition unless it
+// removes the key first.
+void PublishStaleIndexKey(
+    metadata::Namespace& ns, const std::string& key,
+    const std::shared_ptr<OffsetBufferAllocator>& allocator,
+    Clock::time_point filed_deadline, Clock::time_point extended_deadline) {
+    auto buffer = allocator->allocate(128);
+    {
+        auto guard = ns.objects.WriteKey(key);
+        std::vector<Replica> replicas;
+        replicas.emplace_back(std::move(buffer), ReplicaStatus::COMPLETE);
+        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                            std::move(replicas), std::nullopt, false,
+                            ObjectDataType::UNKNOWN, std::string(), ns.id(),
+                            key);
+        SpinLocker locker(&guard.metadata().lock);
+        guard.metadata().lease_->SetDeadline(filed_deadline);
+    }
+    auto read = ns.objects.Read(key);
+    ASSERT_TRUE(read.has_value());
+    SpinLocker locker(&read->metadata().lock);
+    read->metadata().lease_->SetDeadline(extended_deadline);
+}
+
+// Flips the window on the first object the run skips, as an offboarding sweep
+// starting after the run did.
+class FlipWindowOnSkip final : public eviction::EvictionObserver {
+   public:
+    explicit FlipWindowOnSkip(std::atomic<bool>& window) : window_(window) {}
+    void OnSkipped(const eviction::ObjectView&, SkipReason) override {
+        window_.store(true, std::memory_order_release);
+    }
+
+   private:
+    std::atomic<bool>& window_;
+};
+
 // --- Report observers --------------------------------------------------------
 
 TEST_F(EvictorTest, NothingToReleaseSuppressesPermanentlyUnavailableCandidate) {
@@ -740,6 +781,174 @@ TEST_F(EvictorTest, NothingToReleaseSuppressesPermanentlyUnavailableCandidate) {
     EXPECT_EQ(second.filed, 0u);
     EXPECT_EQ(second.visited, 0u);
     EXPECT_TRUE(observer_.applied.empty());
+}
+
+// While an offboarding sweep is in progress, a permanently unavailable
+// candidate leaves the index on first contact: it is never re-ranked as moved
+// and the policy never runs for it.
+TEST_F(EvictorTest,
+       OffboardingWindowSuppressesPermanentlyUnavailableOnFirstContact) {
+    metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
+    {
+        auto guard = ns.objects.WriteKey("dead");
+        std::vector<Replica> replicas;
+        replicas.push_back(DeadMemoryReplica());
+        // Nobody holds it, so the policy would otherwise release it.
+        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                            std::move(replicas), std::nullopt, false,
+                            ObjectDataType::UNKNOWN, std::string(),
+                            TenantId("a"), "dead");
+        SetDeadline(guard.metadata(), Clock::now() - seconds(10));
+    }
+
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer_},
+                              eviction::Diagnostics{}, [] { return true; });
+    const auto first = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+    EXPECT_EQ(first.evicted_objects, 0u);
+    EXPECT_EQ(first.SkipCount(SkipReason::kPermanentlyUnavailable), 1u);
+    EXPECT_EQ(first.suppressed_permanently_unavailable, 1u);
+    EXPECT_TRUE(observer_.applied.empty());
+
+    const auto second = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+    EXPECT_EQ(second.filed, 0u);
+    EXPECT_EQ(second.visited, 0u);
+}
+
+// Without the window, a permanent candidate whose index rank lags its real
+// lease is only discovered as "moved": it costs a re-file and a later revisit.
+TEST_F(EvictorTest, StaleIndexPermanentCandidateIsMovedWithoutTheWindow) {
+    metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
+    const auto now = Clock::now();
+    auto dying = std::make_shared<OffsetBufferAllocator>(
+        "dead_segment", 0x500000000ULL, 1 << 20, "dead_segment");
+    PublishStaleIndexKey(ns, "dead", dying, now - seconds(10), now);
+    dying.reset();
+
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer_});
+    const auto report = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+
+    EXPECT_EQ(report.filed, 1u);
+    EXPECT_EQ(report.visited, 1u);
+    EXPECT_EQ(report.SkipCount(SkipReason::kMoved), 1u);
+    EXPECT_EQ(report.SkipCount(SkipReason::kPermanentlyUnavailable), 0u);
+    EXPECT_EQ(report.suppressed_permanently_unavailable, 0u);
+    EXPECT_EQ(report.evicted_objects, 0u);
+}
+
+// The window takes the same key out on first contact, before the moved check:
+// no re-file and no later revisit, and its metadata stays for offboarding.
+TEST_F(EvictorTest, StaleIndexPermanentCandidateIsSuppressedFirstWithTheWindow) {
+    metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
+    const auto now = Clock::now();
+    auto dying = std::make_shared<OffsetBufferAllocator>(
+        "dead_segment", 0x500000000ULL, 1 << 20, "dead_segment");
+    PublishStaleIndexKey(ns, "dead", dying, now - seconds(10), now);
+    dying.reset();
+
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer_},
+                              eviction::Diagnostics{},
+                              [] { return true; });
+    const auto first = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+    EXPECT_EQ(first.filed, 1u);
+    EXPECT_EQ(first.visited, 1u);
+    EXPECT_EQ(first.SkipCount(SkipReason::kMoved), 0u);
+    EXPECT_EQ(first.SkipCount(SkipReason::kPermanentlyUnavailable), 1u);
+    EXPECT_EQ(first.suppressed_permanently_unavailable, 1u);
+    EXPECT_EQ(first.evicted_objects, 0u);
+    // The suggestion changed only the derived index.
+    EXPECT_TRUE(ns.objects.Read("dead").has_value());
+
+    const auto second = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+    EXPECT_EQ(second.filed, 0u);
+    EXPECT_EQ(second.visited, 0u);
+}
+
+// A sweep that starts after the run did still applies to the candidates the
+// run has not reached yet: the window is asked per held key, not per run.
+TEST_F(EvictorTest, WindowOpeningDuringARunSuppressesLaterCandidates) {
+    metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
+    // Filed earlier than the stale key below, and skipped by the policy, which
+    // flips the window before the run reaches "dead".
+    Publish("a", "healthy", seconds(10));
+    policy_.soft_pinned.insert("healthy");
+
+    const auto now = Clock::now();
+    auto dying = std::make_shared<OffsetBufferAllocator>(
+        "dead_segment", 0x500000000ULL, 1 << 20, "dead_segment");
+    PublishStaleIndexKey(ns, "dead", dying, now - seconds(2), now);
+    dying.reset();
+
+    std::atomic<bool> window{false};
+    FlipWindowOnSkip observer(window);
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer},
+                              eviction::Diagnostics{}, [&window] {
+                                  return window.load(std::memory_order_acquire);
+                              });
+    const auto report = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+
+    EXPECT_EQ(report.SkipCount(SkipReason::kSoftPinned), 1u);
+    EXPECT_EQ(report.SkipCount(SkipReason::kPermanentlyUnavailable), 1u);
+    EXPECT_EQ(report.SkipCount(SkipReason::kMoved), 0u);
+    EXPECT_TRUE(ns.objects.Read("dead").has_value());
+}
+
+// The window only takes permanently unavailable memory sets. Live replicas,
+// mixed sets, recoverable states and live group members keep the normal lease
+// and group path.
+TEST_F(EvictorTest, WindowDoesNotSuppressRecoverableOrLiveCandidates) {
+    metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
+    const auto now = Clock::now();
+    Publish("a", "healthy", seconds(10));
+    Publish("a", "lease_live", -seconds(10));
+    Publish("a", "group_live", seconds(10), "g");
+
+    // One permanently unavailable replica beside a live one: still holds a
+    // live COMPLETE memory replica, so it is not suppressed.
+    {
+        auto guard = ns.objects.WriteKey("mixed");
+        std::vector<Replica> replicas;
+        replicas.push_back(DeadMemoryReplica());
+        replicas.emplace_back(allocator_->allocate(128),
+                              ReplicaStatus::COMPLETE);
+        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                            std::move(replicas), std::nullopt, false,
+                            ObjectDataType::UNKNOWN, std::string(),
+                            TenantId("a"), "mixed");
+        SetDeadline(guard.metadata(), now - seconds(10));
+    }
+    // A live replica held by a reference count: recoverable, never suppressed.
+    {
+        auto guard = ns.objects.WriteKey("busy");
+        Replica replica(allocator_->allocate(128), ReplicaStatus::COMPLETE);
+        replica.inc_refcnt();
+        std::vector<Replica> replicas;
+        replicas.push_back(std::move(replica));
+        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                            std::move(replicas), std::nullopt, false,
+                            ObjectDataType::UNKNOWN, std::string(),
+                            TenantId("a"), "busy");
+        SetDeadline(guard.metadata(), now - seconds(10));
+    }
+
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer_},
+                              eviction::Diagnostics{},
+                              [] { return true; });
+    const auto report = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+
+    EXPECT_EQ(report.SkipCount(SkipReason::kPermanentlyUnavailable), 0u);
+    EXPECT_EQ(report.suppressed_permanently_unavailable, 0u);
+    EXPECT_GE(report.SkipCount(SkipReason::kLeaseActive), 1u);
+    EXPECT_GE(report.SkipCount(SkipReason::kNothingToRelease), 1u);
+    EXPECT_GE(report.evicted_objects, 1u);
+    EXPECT_TRUE(ns.objects.Read("lease_live").has_value());
+    EXPECT_TRUE(ns.objects.Read("busy").has_value());
 }
 
 TEST_F(EvictorTest, MetricsLeaveAPoolRunToItsCaller) {

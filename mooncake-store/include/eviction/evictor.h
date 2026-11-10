@@ -81,12 +81,21 @@ struct Diagnostics {
 // key lock held, so the caller may sample capacity and log it.
 using ProgressFn = std::function<void(const Report&)>;
 
+// Asked before a held key goes through the normal path. When it returns true
+// the run first asks the index whether every COMPLETE memory replica is
+// permanently unavailable and, if so, takes the key out of the candidates at
+// once. A null window keeps the normal path unchanged, which is what an
+// eviction run outside an offboarding sweep gets: the extra replica check runs
+// only while such a sweep is in progress.
+using SuppressionWindow = std::function<bool()>;
+
 class Evictor {
    public:
     // Everything given outlives the evictor.
     Evictor(metadata::NamespaceTable& namespaces, const EvictionPolicy& policy,
             Reclaimer& reclaimer, std::vector<EvictionObserver*> observers,
-            Diagnostics diagnostics = {});
+            Diagnostics diagnostics = {},
+            SuppressionWindow suppression_window = {});
     Evictor(const Evictor&) = delete;
     Evictor& operator=(const Evictor&) = delete;
 
@@ -112,6 +121,7 @@ class Evictor {
     Reclaimer& reclaimer_;
     const std::vector<EvictionObserver*> observers_;
     const Diagnostics diagnostics_;
+    const SuppressionWindow suppression_window_;
     // Where the next run starts among the namespaces it visits.
     std::atomic<size_t> next_start_{0};
 };
