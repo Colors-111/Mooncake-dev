@@ -967,14 +967,16 @@ MasterService::~MasterService() {
               << " stage=destructor_body phase=begin";
     const auto trace_stop = [this](const char* stage, auto&& action) {
         const auto started = std::chrono::steady_clock::now();
-        LOG(INFO) << "[HA-TEARDOWN] component=master_service service=" << this
-                  << " stage=" << stage << " phase=begin";
+        VLOG(2) << "[HA-TEARDOWN] component=master_service service=" << this
+                << " stage=" << stage << " phase=begin";
         action();
-        LOG(INFO) << "[HA-TEARDOWN] component=master_service service=" << this
-                  << " stage=" << stage << " phase=end elapsed_ms="
-                  << std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now() - started)
-                         .count();
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started)
+                .count();
+        LOG_IF(INFO, elapsed_ms >= 100)
+            << "[HA-TEARDOWN] component=master_service service=" << this
+            << " stage=" << stage << " phase=end elapsed_ms=" << elapsed_ms;
     };
     const auto trace_join = [&](std::thread& worker, const char* stage) {
         if (worker.joinable()) {
@@ -3264,13 +3266,12 @@ bool MasterService::ShouldPauseOffboarding(ClientOffboardingJob& job) {
             if (pressure.stall_episode != job.consumed_eviction_stall_episode) {
                 job.consumed_eviction_stall_episode = pressure.stall_episode;
             }
-            LOG(INFO) << "[OFFBOARD-WAIT] client_id=" << job.client_id
-                      << " attempt_id=" << job.attempt_id
-                      << " phase=maintenance"
-                      << " reason=eviction_no_progress"
-                      << " used_ratio=" << pressure.used_ratio
-                      << " high_watermark=" << pressure.high_watermark
-                      << " stall_episode=" << pressure.stall_episode;
+            VLOG(2) << "[OFFBOARD-WAIT] client_id=" << job.client_id
+                    << " attempt_id=" << job.attempt_id << " phase=maintenance"
+                    << " reason=eviction_no_progress"
+                    << " used_ratio=" << pressure.used_ratio
+                    << " high_watermark=" << pressure.high_watermark
+                    << " stall_episode=" << pressure.stall_episode;
             return false;
         }
     }
@@ -3287,13 +3288,13 @@ void MasterService::BeginOffboardingWait(ClientOffboardingJob& job,
     job.wait_started = std::chrono::steady_clock::now();
     ++job.wait_count;
     const auto pressure = SnapshotMemoryEvictionPressure();
-    LOG(INFO) << "[OFFBOARD-WAIT] client_id=" << job.client_id
-              << " attempt_id=" << job.attempt_id << " phase=begin"
-              << " reason=" << WaitReasonName(reason)
-              << " used_ratio=" << pressure.used_ratio
-              << " high_watermark=" << pressure.high_watermark
-              << " eviction_active=" << pressure.active
-              << " need_mem_eviction=" << pressure.need;
+    VLOG(2) << "[OFFBOARD-WAIT] client_id=" << job.client_id
+            << " attempt_id=" << job.attempt_id << " phase=begin"
+            << " reason=" << WaitReasonName(reason)
+            << " used_ratio=" << pressure.used_ratio
+            << " high_watermark=" << pressure.high_watermark
+            << " eviction_active=" << pressure.active
+            << " need_mem_eviction=" << pressure.need;
     PublishOffboardingStage(job,
                             reason == ClientOffboardingWaitReason::kPressure
                                 ? ClientOffboardingStage::kEvictionWait
@@ -3307,17 +3308,17 @@ void MasterService::EndOffboardingWait(ClientOffboardingJob& job) {
     const auto waited_ms = ElapsedMs(job.wait_started);
     job.wait_ms += waited_ms;
     job.waiting = false;
-    LOG(INFO) << "[OFFBOARD-WAIT] client_id=" << job.client_id
-              << " attempt_id=" << job.attempt_id << " phase=end"
-              << " reason=" << WaitReasonName(job.wait_reason)
-              << " waited_ms=" << waited_ms << " total_wait_ms=" << job.wait_ms
-              << " wait_count=" << job.wait_count;
+    VLOG(2) << "[OFFBOARD-WAIT] client_id=" << job.client_id
+            << " attempt_id=" << job.attempt_id << " phase=end"
+            << " reason=" << WaitReasonName(job.wait_reason)
+            << " waited_ms=" << waited_ms << " total_wait_ms=" << job.wait_ms
+            << " wait_count=" << job.wait_count;
     job.wait_reason = ClientOffboardingWaitReason::kNone;
 }
 
 void MasterService::MaybeLogOffboardingSummary(ClientOffboardingJob& job) {
     const auto now = std::chrono::steady_clock::now();
-    if (now - job.last_summary_at < std::chrono::seconds(5)) {
+    if (now - job.last_summary_at < std::chrono::seconds(30)) {
         return;
     }
     job.last_summary_at = now;

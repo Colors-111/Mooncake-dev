@@ -38,12 +38,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -928,33 +928,73 @@ func hasKeepAliveContext(leaseId int64) bool {
 	return exists
 }
 
-// Attached only to the dedicated lease connection: no per-object RPC logging.
-// In particular, stream errors are otherwise hidden behind a closed ACK channel.
-type leaseTransportDiagnostics struct{ leaseID int64 }
+// Aggregate transport events without writing logs or waiting for a diagnostic
+// lock on the lease callbacks. The existing terminal error carries one summary.
+type leaseTransportDiagnostics struct {
+	rpcEnds, rpcFailures, connBegins, connEnds, dropped atomic.Uint64
+	stateMu                                             sync.Mutex
+	lastCode, lastError, lastConnection                 string
+	lastErrorAt                                         time.Time
+}
 
-func (d leaseTransportDiagnostics) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context {
+func (d *leaseTransportDiagnostics) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context {
 	return ctx
 }
 
-func (d leaseTransportDiagnostics) HandleRPC(_ context.Context, event stats.RPCStats) {
+func (d *leaseTransportDiagnostics) HandleRPC(_ context.Context, event stats.RPCStats) {
 	if end, ok := event.(*stats.End); ok {
-		log.Printf("[HA-LEASE-RPC] lease_id=%d phase=end code=%s error=%q elapsed_ms=%d",
-			d.leaseID, status.Code(end.Error), fmt.Sprint(end.Error), end.EndTime.Sub(end.BeginTime).Milliseconds())
+		d.rpcEnds.Add(1)
+		if end.Error == nil {
+			return
+		}
+		d.rpcFailures.Add(1)
+		if !d.stateMu.TryLock() {
+			d.dropped.Add(1)
+			return
+		}
+		d.lastCode, d.lastErrorAt = status.Code(end.Error).String(), time.Now()
+		d.lastError = fmt.Sprint(end.Error)
+		if len(d.lastError) > 256 {
+			d.lastError = d.lastError[:256]
+		}
+		d.stateMu.Unlock()
 	}
 }
 
 type leaseConnectionTag struct{}
 
-func (d leaseTransportDiagnostics) TagConn(ctx context.Context, info *stats.ConnTagInfo) context.Context {
+func (d *leaseTransportDiagnostics) TagConn(ctx context.Context, info *stats.ConnTagInfo) context.Context {
 	return context.WithValue(ctx, leaseConnectionTag{}, fmt.Sprintf("local=%s remote=%s", info.LocalAddr, info.RemoteAddr))
 }
 
-func (d leaseTransportDiagnostics) HandleConn(ctx context.Context, event stats.ConnStats) {
-	phase := "begin"
+func (d *leaseTransportDiagnostics) HandleConn(ctx context.Context, event stats.ConnStats) {
 	if _, ok := event.(*stats.ConnEnd); ok {
-		phase = "end"
+		d.connEnds.Add(1)
+	} else {
+		d.connBegins.Add(1)
 	}
-	log.Printf("[HA-LEASE-CONN] lease_id=%d phase=%s %v", d.leaseID, phase, ctx.Value(leaseConnectionTag{}))
+	if !d.stateMu.TryLock() {
+		d.dropped.Add(1)
+		return
+	}
+	d.lastConnection, _ = ctx.Value(leaseConnectionTag{}).(string)
+	d.stateMu.Unlock()
+}
+
+func (d *leaseTransportDiagnostics) summary() string {
+	counts := fmt.Sprintf("rpc_ends=%d rpc_failures=%d conn_begins=%d conn_ends=%d transport_detail_drops=%d",
+		d.rpcEnds.Load(), d.rpcFailures.Load(), d.connBegins.Load(), d.connEnds.Load(), d.dropped.Load())
+	if !d.stateMu.TryLock() {
+		return counts + " transport_detail_busy=1"
+	}
+	code, message, at, connection := d.lastCode, d.lastError, d.lastErrorAt, d.lastConnection
+	d.stateMu.Unlock()
+	age := int64(-1)
+	if !at.IsZero() {
+		age = time.Since(at).Milliseconds()
+	}
+	return fmt.Sprintf("%s last_rpc_code=%s last_rpc_error=%q last_rpc_age_ms=%d last_connection=%q",
+		counts, code, message, age, connection)
 }
 
 // Observe the existing stream without renewing, reconnecting or changing its
@@ -963,7 +1003,7 @@ func (d leaseTransportDiagnostics) HandleConn(ctx context.Context, event stats.C
 func observeKeepAlive(ctx, clientCtx context.Context, leaseID int64,
 	responses <-chan *clientv3.LeaseKeepAliveResponse, transportState func() string) (int, string) {
 	started := time.Now()
-	lastProbe, lastLog, lastWarning := started, started, started
+	lastProbe := started
 	var lastAck time.Time
 	var lastTTL int64
 	var ackCount uint64
@@ -981,11 +1021,9 @@ func observeKeepAlive(ctx, clientCtx context.Context, leaseID int64,
 			now.Sub(lastProbe).Milliseconds(), transportState(), ctx.Err(), clientCtx.Err(), runtime.NumGoroutine())
 	}
 	finish := func(code int, reason string) (int, string) {
-		detail := reason + "; " + fields(time.Now())
-		log.Printf("[HA-LEASE] phase=exit reason=%q %s", reason, detail)
+		detail := reason + "; [HA-LEASE] " + fields(time.Now())
 		return code, detail
 	}
-	log.Printf("[HA-LEASE] phase=observe gomaxprocs=%d %s", runtime.GOMAXPROCS(0), fields(started))
 	probe := time.NewTicker(time.Second)
 	defer probe.Stop()
 	for {
@@ -1006,25 +1044,12 @@ func observeKeepAlive(ctx, clientCtx context.Context, leaseID int64,
 			}
 			lastAck, lastTTL = now, resp.TTL
 			ackCount++
-			if ackCount == 1 || now.Sub(lastLog) >= 10*time.Second {
-				log.Printf("[HA-LEASE] phase=ack %s", fields(now))
-				lastLog = now
-			}
 		case <-probe.C:
 			now := time.Now()
 			gap := now.Sub(lastProbe)
 			lastProbe = now
 			if gap > maxProbeGap {
 				maxProbeGap = gap
-			}
-			// Probe delays describe this Go loop, not a proven process-wide
-			// pause. Never interpret them as a reason to retain leadership.
-			ackLate := !lastAck.IsZero() && lastTTL > 0 &&
-				now.Sub(lastAck) >= time.Duration(lastTTL)*time.Second*2/3
-			if (gap >= 2*time.Second || ackLate || lastAck.IsZero()) &&
-				now.Sub(lastWarning) >= 5*time.Second {
-				log.Printf("[HA-LEASE] phase=waiting probe_gap_ms=%d %s", gap.Milliseconds(), fields(now))
-				lastWarning = now
 			}
 		case <-ctx.Done():
 			return finish(-2, "keep alive context cancelled")
@@ -1046,8 +1071,9 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 		*errMsg = C.CString(err.Error())
 		return -1
 	}
+	diagnostics := &leaseTransportDiagnostics{}
 	clientConfig.DialOptions = append(clientConfig.DialOptions,
-		grpc.WithStatsHandler(leaseTransportDiagnostics{leaseID: leaseId}))
+		grpc.WithStatsHandler(diagnostics))
 	cli, err := clientv3.New(clientConfig)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
@@ -1078,10 +1104,11 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 	}
 
 	code, detail := observeKeepAlive(ctx, cli.Ctx(), leaseId, keepAliveChan, func() string {
+		state := "NO_CONNECTION"
 		if conn := cli.ActiveConnection(); conn != nil {
-			return conn.GetState().String()
+			state = conn.GetState().String()
 		}
-		return "NO_CONNECTION"
+		return state + " " + diagnostics.summary()
 	})
 	*errMsg = C.CString(detail)
 	return code

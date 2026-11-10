@@ -757,16 +757,21 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         std::unique_ptr<RpcWorkerPool> worker_pool;
         const auto trace_exit_step = [&](const char* stage, auto&& action) {
             const auto started = std::chrono::steady_clock::now();
-            LOG(INFO) << "[HA-TEARDOWN] component=supervisor view_version="
-                      << leadership_session->view.view_version
-                      << " stage=" << stage << " phase=begin";
+            const bool release_service =
+                std::string_view(stage) == "release_service";
+            LOG_IF(INFO, release_service)
+                << "[HA-TEARDOWN] component=supervisor view_version="
+                << leadership_session->view.view_version << " stage=" << stage
+                << " phase=begin";
             action();
-            LOG(INFO) << "[HA-TEARDOWN] component=supervisor view_version="
-                      << leadership_session->view.view_version
-                      << " stage=" << stage << " phase=end elapsed_ms="
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - started)
-                             .count();
+            const auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started)
+                    .count();
+            LOG_IF(INFO, release_service || elapsed_ms >= 100)
+                << "[HA-TEARDOWN] component=supervisor view_version="
+                << leadership_session->view.view_version << " stage=" << stage
+                << " phase=end elapsed_ms=" << elapsed_ms;
         };
         // Stops the term's resources that exist, in the serving-exit order,
         // and keeps the service, the index and the gate alive through the

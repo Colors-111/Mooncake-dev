@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"net"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,8 +14,66 @@ import (
 	"go.etcd.io/etcd/client/v3/concurrency"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 )
+
+type countingLogWriter struct{ writes atomic.Uint64 }
+
+func (w *countingLogWriter) Write(p []byte) (int, error) {
+	w.writes.Add(1)
+	return len(p), nil
+}
+
+func TestLeaseDiagnosticsNeverLogFromCallbacksOrAckLoop(t *testing.T) {
+	output := &countingLogWriter{}
+	original := log.Writer()
+	log.SetOutput(output)
+	defer log.SetOutput(original)
+	diagnostics := &leaseTransportDiagnostics{}
+	for i := 0; i < 1000; i++ {
+		diagnostics.HandleRPC(context.Background(), &stats.End{
+			Error: status.Error(codes.Unavailable, "repeated connection failure"),
+		})
+		diagnostics.HandleConn(context.Background(), &stats.ConnEnd{})
+	}
+	responses := make(chan *clientv3.LeaseKeepAliveResponse, 1000)
+	for i := 0; i < cap(responses); i++ {
+		responses <- &clientv3.LeaseKeepAliveResponse{ID: 42, TTL: 5}
+	}
+	close(responses)
+	_, detail := observeKeepAlive(context.Background(), context.Background(), 42, responses,
+		func() string { return "READY" })
+	if output.writes.Load() != 0 {
+		t.Fatalf("diagnostics performed %d synchronous writes during a retry/ACK storm", output.writes.Load())
+	}
+	if !strings.Contains(detail, "ack_count=1000") {
+		t.Fatalf("ACK summary was lost: %s", detail)
+	}
+	if !strings.Contains(diagnostics.summary(), "rpc_failures=1000") {
+		t.Fatalf("transport failure summary was lost: %s", diagnostics.summary())
+	}
+}
+
+func TestLeaseCallbacksDoNotWaitForDiagnosticSnapshot(t *testing.T) {
+	diagnostics := &leaseTransportDiagnostics{}
+	diagnostics.stateMu.Lock()
+	defer diagnostics.stateMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		diagnostics.HandleRPC(context.Background(), &stats.End{Error: status.Error(codes.Unavailable, "failure")})
+		diagnostics.HandleConn(context.Background(), &stats.ConnEnd{})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("transport callback blocked on diagnostic state")
+	}
+	if !strings.Contains(diagnostics.summary(), "transport_detail_busy=1") {
+		t.Fatal("summary waited for a busy diagnostic lock")
+	}
+}
 
 func TestObserveKeepAliveReportsLastAcknowledgementOnClose(t *testing.T) {
 	responses := make(chan *clientv3.LeaseKeepAliveResponse, 2)
@@ -79,13 +136,6 @@ func (s *brokenLeaseStream) LeaseKeepAlive(stream etcdpb.Lease_LeaseKeepAliveSer
 // diagnostics, even though the public KeepAlive API only returns a closed
 // channel after its ACK deadline. No external etcd process is needed.
 func TestLeaseTransportDiagnosticsReportsStreamFailure(t *testing.T) {
-	output, err := os.CreateTemp(t.TempDir(), "lease-log")
-	if err != nil {
-		t.Fatal(err)
-	}
-	original := log.Writer()
-	log.SetOutput(output)
-	defer func() { log.SetOutput(original); output.Close() }()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -94,9 +144,10 @@ func TestLeaseTransportDiagnosticsReportsStreamFailure(t *testing.T) {
 	etcdpb.RegisterLeaseServer(server, &brokenLeaseStream{})
 	go server.Serve(listener)
 	defer server.Stop()
+	diagnostics := &leaseTransportDiagnostics{}
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints: []string{listener.Addr().String()}, DialTimeout: time.Second,
-		DialOptions: []grpc.DialOption{grpc.WithStatsHandler(leaseTransportDiagnostics{leaseID: 42})},
+		DialOptions: []grpc.DialOption{grpc.WithStatsHandler(diagnostics)},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -108,17 +159,15 @@ func TestLeaseTransportDiagnosticsReportsStreamFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	code, detail := observeKeepAlive(ctx, cli.Ctx(), 42, responses, func() string { return cli.ActiveConnection().GetState().String() })
+	code, detail := observeKeepAlive(ctx, cli.Ctx(), 42, responses, func() string {
+		return cli.ActiveConnection().GetState().String() + " " + diagnostics.summary()
+	})
 	if code != -1 || !strings.Contains(detail, "ack_count=1") {
 		t.Fatalf("stream result = (%d, %q), want closed stream after one ACK", code, detail)
 	}
-	content, err := os.ReadFile(output.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, field := range []string{"[HA-LEASE-RPC]", "code=Unavailable", "injected lease stream failure", "[HA-LEASE-CONN]", "remote=127.0.0.1:"} {
-		if !strings.Contains(string(content), field) {
-			t.Errorf("missing transport diagnostic %q in %s", field, content)
+	for _, field := range []string{"last_rpc_code=Unavailable", "injected lease stream failure", "conn_begins=1", "remote=127.0.0.1:"} {
+		if !strings.Contains(detail, field) {
+			t.Errorf("missing transport diagnostic %q in %s", field, detail)
 		}
 	}
 }

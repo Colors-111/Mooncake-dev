@@ -362,9 +362,9 @@ tl::expected<bool, ErrorCode> EtcdLeaderCoordinator::RenewLeadership(
             started_keepalive = true;
             keepalive_thread_ = std::thread([this, lease = lease_id.value()]() {
                 const auto started = std::chrono::steady_clock::now();
-                LOG(INFO) << "[HA-LEASE] phase=call_begin lease_id=" << lease;
+                VLOG(2) << "[HA-LEASE] phase=call_begin lease_id=" << lease;
                 auto rc = EtcdHelper::KeepAlive(lease);
-                LOG(INFO)
+                VLOG(2)
                     << "[HA-LEASE] phase=call_end lease_id=" << lease
                     << " result=" << toString(rc) << " elapsed_ms="
                     << std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -372,11 +372,11 @@ tl::expected<bool, ErrorCode> EtcdLeaderCoordinator::RenewLeadership(
                            .count();
                 if (rc == ErrorCode::ETCD_OPERATION_ERROR) {
                     const auto reset_started = std::chrono::steady_clock::now();
-                    LOG(INFO)
+                    VLOG(2)
                         << "[HA-LEASE] phase=reset_begin lease_id=" << lease;
                     const auto reset_result =
                         EtcdHelper::ResetEtcdStoreClient(spec_.connstring);
-                    LOG(INFO)
+                    VLOG(2)
                         << "[HA-LEASE] phase=reset_end lease_id=" << lease
                         << " result=" << toString(reset_result)
                         << " elapsed_ms="
@@ -407,10 +407,9 @@ tl::expected<bool, ErrorCode> EtcdLeaderCoordinator::RenewLeadership(
                 if (monitor_armed != nullptr &&
                     monitor_armed->exchange(false) &&
                     on_leadership_lost != nullptr) {
-                    LOG(WARNING)
-                        << "[HA-LEASE] phase=notify_loss lease_id=" << lease
-                        << " reason="
-                        << LeadershipLossReasonToString(loss_reason);
+                    VLOG(2) << "[HA-LEASE] phase=notify_loss lease_id=" << lease
+                            << " reason="
+                            << LeadershipLossReasonToString(loss_reason);
                     on_leadership_lost(loss_reason);
                 }
             });
