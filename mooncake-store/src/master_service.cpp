@@ -961,12 +961,31 @@ void MasterService::InitDfsAllocatorFromEnvironment(
 }
 
 MasterService::~MasterService() {
+    const auto destructor_started = std::chrono::steady_clock::now();
+    LOG(INFO) << "[HA-TEARDOWN] component=master_service service=" << this
+              << " stage=destructor_body phase=begin";
+    const auto trace_stop = [this](const char* stage, auto&& action) {
+        const auto started = std::chrono::steady_clock::now();
+        LOG(INFO) << "[HA-TEARDOWN] component=master_service service=" << this
+                  << " stage=" << stage << " phase=begin";
+        action();
+        LOG(INFO) << "[HA-TEARDOWN] component=master_service service=" << this
+                  << " stage=" << stage << " phase=end elapsed_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - started)
+                         .count();
+    };
+    const auto trace_join = [&](std::thread& worker, const char* stage) {
+        if (worker.joinable()) {
+            trace_stop(stage, [&] { worker.join(); });
+        }
+    };
     // Stop and join the threads
     eviction_running_ = false;
     // Stop publishing transitions and deliver what is already queued, while
     // the offboarding worker can still accept the resulting jobs and the
     // members the listener touches are still alive.
-    client_sessions_.Stop();
+    trace_stop("stop_client_sessions", [&] { client_sessions_.Stop(); });
 
     task_cleanup_running_ = false;
     {
@@ -980,12 +999,14 @@ MasterService::~MasterService() {
     // This releases publication waiters; in-flight backend I/O still follows
     // the writer's shutdown contract and is not cancelled by the worker flag.
     if (ordered_oplog_writer_) {
-        ordered_oplog_writer_->Stop();
+        trace_stop("stop_oplog_writer", [&] { ordered_oplog_writer_->Stop(); });
     }
-    graceful_unmount_scheduler_.Stop();
+    trace_stop("stop_graceful_unmount",
+               [&] { graceful_unmount_scheduler_.Stop(); });
     StallCleanupWaiters();
-    replica_cleanup_worker_.Stop();
-    kvcs_capacity_refresh_worker_.Stop();
+    trace_stop("stop_replica_cleanup", [&] { replica_cleanup_worker_.Stop(); });
+    trace_stop("stop_capacity_refresh",
+               [&] { kvcs_capacity_refresh_worker_.Stop(); });
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
@@ -995,29 +1016,18 @@ MasterService::~MasterService() {
     weight_reconciliation_cv_.notify_all();
     http_metadata_cleanup_cv_.notify_all();
 
-    if (eviction_thread_.joinable()) {
-        eviction_thread_.join();
-    }
+    trace_join(eviction_thread_, "join_eviction");
 #ifdef USE_NOF
-    if (nof_heartbeat_thread_.joinable()) {
-        nof_heartbeat_thread_.join();
-    }
+    trace_join(nof_heartbeat_thread_, "join_nof_heartbeat");
 #endif
-    if (task_cleanup_thread_.joinable()) {
-        task_cleanup_thread_.join();
-    }
-    if (weight_reconciliation_thread_.joinable()) {
-        weight_reconciliation_thread_.join();
-    }
-    if (http_metadata_cleanup_thread_.joinable()) {
-        http_metadata_cleanup_thread_.join();
-    }
-    if (job_dispatch_thread_.joinable()) {
-        job_dispatch_thread_.join();
-    }
-    dynamic_replication_.Stop();
+    trace_join(task_cleanup_thread_, "join_task_cleanup");
+    trace_join(weight_reconciliation_thread_, "join_weight_reconciliation");
+    trace_join(http_metadata_cleanup_thread_, "join_http_metadata_cleanup");
+    trace_join(job_dispatch_thread_, "join_job_dispatch");
+    trace_stop("stop_dynamic_replication",
+               [&] { dynamic_replication_.Stop(); });
 
-    client_offboarding_worker_.Stop();
+    trace_stop("stop_offboarding", [&] { client_offboarding_worker_.Stop(); });
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
             segment, static_cast<int64_t>(bytes));
@@ -1028,9 +1038,19 @@ MasterService::~MasterService() {
     // release their capacity contribution so the process-lifetime
     // MasterMetricManager stays consistent when the next leadership term
     // constructs a fresh MasterService and the clients remount.
-    segment_manager_.releaseCapacityMetrics();
+    trace_stop("release_capacity_metrics",
+               [&] { segment_manager_.releaseCapacityMetrics(); });
 
-    client_sessions_.Reset();
+    trace_stop("reset_client_sessions", [&] { client_sessions_.Reset(); });
+    // The surrounding supervisor's release_service end is emitted only after
+    // member destruction too. Its remaining gap isolates namespace/allocator
+    // teardown from the explicit worker shutdown above.
+    LOG(INFO) << "[HA-TEARDOWN] component=master_service service=" << this
+              << " stage=destructor_body phase=end elapsed_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - destructor_started)
+                     .count()
+              << " member_destruction_follows=1";
 }
 
 OrderedOpLogWriter::TerminalCallback

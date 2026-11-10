@@ -121,8 +121,12 @@ class LeadershipRenewalGuard {
                 }
                 if (!logged_start) {
                     logged_start = true;
-                    LOG(INFO) << "Leadership keepalive covers oplog catch-up, "
-                              << "lease_ttl_sec=" << session.lease_ttl.count();
+                    LOG(INFO)
+                        << "Leadership keepalive covers oplog catch-up, "
+                        << "lease_ttl_sec="
+                        << std::chrono::duration_cast<std::chrono::seconds>(
+                               session.lease_ttl)
+                               .count();
                 }
                 std::unique_lock<std::mutex> lock(mutex_);
                 cv_.wait_for(lock, kRenewCheckInterval, [this] {
@@ -751,6 +755,19 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         // Runs the term's handlers once they are registered. It drains before
         // the service goes, so release the service through release_service.
         std::unique_ptr<RpcWorkerPool> worker_pool;
+        const auto trace_exit_step = [&](const char* stage, auto&& action) {
+            const auto started = std::chrono::steady_clock::now();
+            LOG(INFO) << "[HA-TEARDOWN] component=supervisor view_version="
+                      << leadership_session->view.view_version
+                      << " stage=" << stage << " phase=begin";
+            action();
+            LOG(INFO) << "[HA-TEARDOWN] component=supervisor view_version="
+                      << leadership_session->view.view_version
+                      << " stage=" << stage << " phase=end elapsed_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+        };
         // Stops the term's resources that exist, in the serving-exit order,
         // and keeps the service, the index and the gate alive through the
         // exit. Each step is a no-op on a resource not yet created or
@@ -775,8 +792,10 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 shutdown_exit("service_release",
                               term_lease);  // Does not return.
             }
-            worker_pool.reset();
-            wrapped_master_service.reset();
+            trace_exit_step("release_worker_pool",
+                            [&] { worker_pool.reset(); });
+            trace_exit_step("release_service",
+                            [&] { wrapped_master_service.reset(); });
         };
         wrapped_master_service->SetBatchOpLogTerminalCallback(
             [&](const OrderedOpLogWriterTerminalState& state) {
@@ -1021,16 +1040,40 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         shutdown_trigger.Stop();
         // Finish the calls the workers still hold before the term's OpLog
         // writer and leadership go, as inline handlers would have.
-        worker_pool.reset();
+        trace_exit_step("drain_rpc_workers", [&] { worker_pool.reset(); });
         LOG(ERROR) << "Master service stopped: " << server_err;
 
-        StopLeadershipMonitor(leadership_monitor_handle);
-        wrapped_master_service->StopBatchOpLogWriter();
-        DeactivateServingState(admin_server, label_reconciler);
-        wrapped_master_service->StopHttpMetadataCleanup();
-        auto err = release_term("serving");
+        trace_exit_step("stop_leadership_monitor", [&] {
+            StopLeadershipMonitor(leadership_monitor_handle);
+        });
+        trace_exit_step("stop_oplog_writer", [&] {
+            wrapped_master_service->StopBatchOpLogWriter();
+        });
+        trace_exit_step("deactivate_serving", [&] {
+            DeactivateServingState(admin_server, label_reconciler);
+        });
+        trace_exit_step("stop_http_cleanup", [&] {
+            wrapped_master_service->StopHttpMetadataCleanup();
+        });
+        ErrorCode err = ErrorCode::OK;
+        trace_exit_step("release_leadership",
+                        [&] { err = release_term("serving"); });
         LOG(INFO) << "Release leadership: " << toString(err);
-        auto current_view = leader_coordinator.ReadCurrentView();
+        auto current_view = [&] {
+            const auto started = std::chrono::steady_clock::now();
+            LOG(INFO) << "[HA-TEARDOWN] component=supervisor stage=read_view"
+                      << " phase=begin view_version="
+                      << leadership_session->view.view_version;
+            auto result = leader_coordinator.ReadCurrentView();
+            LOG(INFO) << "[HA-TEARDOWN] component=supervisor stage=read_view"
+                      << " phase=end elapsed_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count()
+                      << " result="
+                      << toString(result ? ErrorCode::OK : result.error());
+            return result;
+        }();
         release_service();
         if (ShutdownObserved(shutdown_requested)) {
             return shutdown_exit("standby_reentry", term_lease);

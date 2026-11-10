@@ -38,7 +38,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +51,8 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/stats"
+	"google.golang.org/grpc/status"
 )
 
 // prefixWatchInfo stores cancel function and callback context for a prefix watch
@@ -924,6 +928,110 @@ func hasKeepAliveContext(leaseId int64) bool {
 	return exists
 }
 
+// Attached only to the dedicated lease connection: no per-object RPC logging.
+// In particular, stream errors are otherwise hidden behind a closed ACK channel.
+type leaseTransportDiagnostics struct{ leaseID int64 }
+
+func (d leaseTransportDiagnostics) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context {
+	return ctx
+}
+
+func (d leaseTransportDiagnostics) HandleRPC(_ context.Context, event stats.RPCStats) {
+	if end, ok := event.(*stats.End); ok {
+		log.Printf("[HA-LEASE-RPC] lease_id=%d phase=end code=%s error=%q elapsed_ms=%d",
+			d.leaseID, status.Code(end.Error), fmt.Sprint(end.Error), end.EndTime.Sub(end.BeginTime).Milliseconds())
+	}
+}
+
+type leaseConnectionTag struct{}
+
+func (d leaseTransportDiagnostics) TagConn(ctx context.Context, info *stats.ConnTagInfo) context.Context {
+	return context.WithValue(ctx, leaseConnectionTag{}, fmt.Sprintf("local=%s remote=%s", info.LocalAddr, info.RemoteAddr))
+}
+
+func (d leaseTransportDiagnostics) HandleConn(ctx context.Context, event stats.ConnStats) {
+	phase := "begin"
+	if _, ok := event.(*stats.ConnEnd); ok {
+		phase = "end"
+	}
+	log.Printf("[HA-LEASE-CONN] lease_id=%d phase=%s %v", d.leaseID, phase, ctx.Value(leaseConnectionTag{}))
+}
+
+// Observe the existing stream without renewing, reconnecting or changing its
+// cancellation/error contract. A channel close alone does not tell us whether
+// etcd revoked the lease, the response deadline passed, or the stream ended.
+func observeKeepAlive(ctx, clientCtx context.Context, leaseID int64,
+	responses <-chan *clientv3.LeaseKeepAliveResponse, transportState func() string) (int, string) {
+	started := time.Now()
+	lastProbe, lastLog, lastWarning := started, started, started
+	var lastAck time.Time
+	var lastTTL int64
+	var ackCount uint64
+	var ackGap, maxAckGap, maxProbeGap time.Duration
+	fields := func(now time.Time) string {
+		ackAgeMS := int64(-1)
+		lastAckAt := "none"
+		if !lastAck.IsZero() {
+			ackAgeMS = now.Sub(lastAck).Milliseconds()
+			lastAckAt = lastAck.Format(time.RFC3339Nano)
+		}
+		return fmt.Sprintf("lease_id=%d elapsed_ms=%d ack_count=%d last_ack_at=%s last_ack_age_ms=%d last_ttl_sec=%d ack_gap_ms=%d max_ack_gap_ms=%d max_probe_gap_ms=%d probe_age_ms=%d transport_state=%s context_error=%v client_context_error=%v goroutines=%d",
+			leaseID, now.Sub(started).Milliseconds(), ackCount, lastAckAt, ackAgeMS,
+			lastTTL, ackGap.Milliseconds(), maxAckGap.Milliseconds(), maxProbeGap.Milliseconds(),
+			now.Sub(lastProbe).Milliseconds(), transportState(), ctx.Err(), clientCtx.Err(), runtime.NumGoroutine())
+	}
+	finish := func(code int, reason string) (int, string) {
+		detail := reason + "; " + fields(time.Now())
+		log.Printf("[HA-LEASE] phase=exit reason=%q %s", reason, detail)
+		return code, detail
+	}
+	log.Printf("[HA-LEASE] phase=observe gomaxprocs=%d %s", runtime.GOMAXPROCS(0), fields(started))
+	probe := time.NewTicker(time.Second)
+	defer probe.Stop()
+	for {
+		select {
+		case resp, ok := <-responses:
+			if !ok {
+				return finish(-1, "keep alive channel closed")
+			}
+			if resp == nil {
+				return finish(-1, "keep alive response is nil")
+			}
+			now := time.Now()
+			if !lastAck.IsZero() {
+				ackGap = now.Sub(lastAck)
+				if ackGap > maxAckGap {
+					maxAckGap = ackGap
+				}
+			}
+			lastAck, lastTTL = now, resp.TTL
+			ackCount++
+			if ackCount == 1 || now.Sub(lastLog) >= 10*time.Second {
+				log.Printf("[HA-LEASE] phase=ack %s", fields(now))
+				lastLog = now
+			}
+		case <-probe.C:
+			now := time.Now()
+			gap := now.Sub(lastProbe)
+			lastProbe = now
+			if gap > maxProbeGap {
+				maxProbeGap = gap
+			}
+			// Probe delays describe this Go loop, not a proven process-wide
+			// pause. Never interpret them as a reason to retain leadership.
+			ackLate := !lastAck.IsZero() && lastTTL > 0 &&
+				now.Sub(lastAck) >= time.Duration(lastTTL)*time.Second*2/3
+			if (gap >= 2*time.Second || ackLate || lastAck.IsZero()) &&
+				now.Sub(lastWarning) >= 5*time.Second {
+				log.Printf("[HA-LEASE] phase=waiting probe_gap_ms=%d %s", gap.Milliseconds(), fields(now))
+				lastWarning = now
+			}
+		case <-ctx.Done():
+			return finish(-2, "keep alive context cancelled")
+		}
+	}
+}
+
 //export EtcdStoreKeepAliveWrapper
 func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 	storeCli := getStoreClient()
@@ -938,6 +1046,8 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 		*errMsg = C.CString(err.Error())
 		return -1
 	}
+	clientConfig.DialOptions = append(clientConfig.DialOptions,
+		grpc.WithStatsHandler(leaseTransportDiagnostics{leaseID: leaseId}))
 	cli, err := clientv3.New(clientConfig)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
@@ -967,25 +1077,14 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 		return -1
 	}
 
-	// Wait for keep alive responses
-	for {
-		select {
-		case resp, ok := <-keepAliveChan:
-			if !ok {
-				*errMsg = C.CString("keep alive channel closed")
-				return -1
-			}
-			if resp == nil {
-				*errMsg = C.CString("keep alive response is nil")
-				return -1
-			}
-			// Keep alive successful, continue
-		case <-ctx.Done():
-			// Context cancelled
-			*errMsg = C.CString("keep alive context cancelled")
-			return -2
+	code, detail := observeKeepAlive(ctx, cli.Ctx(), leaseId, keepAliveChan, func() string {
+		if conn := cli.ActiveConnection(); conn != nil {
+			return conn.GetState().String()
 		}
-	}
+		return "NO_CONNECTION"
+	})
+	*errMsg = C.CString(detail)
+	return code
 }
 
 //export EtcdStoreCancelKeepAliveWrapper

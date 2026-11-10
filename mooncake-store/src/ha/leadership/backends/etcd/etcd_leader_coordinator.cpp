@@ -361,9 +361,29 @@ tl::expected<bool, ErrorCode> EtcdLeaderCoordinator::RenewLeadership(
             keepalive_result_ = ErrorCode::OK;
             started_keepalive = true;
             keepalive_thread_ = std::thread([this, lease = lease_id.value()]() {
+                const auto started = std::chrono::steady_clock::now();
+                LOG(INFO) << "[HA-LEASE] phase=call_begin lease_id=" << lease;
                 auto rc = EtcdHelper::KeepAlive(lease);
+                LOG(INFO)
+                    << "[HA-LEASE] phase=call_end lease_id=" << lease
+                    << " result=" << toString(rc) << " elapsed_ms="
+                    << std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
                 if (rc == ErrorCode::ETCD_OPERATION_ERROR) {
-                    (void)EtcdHelper::ResetEtcdStoreClient(spec_.connstring);
+                    const auto reset_started = std::chrono::steady_clock::now();
+                    LOG(INFO)
+                        << "[HA-LEASE] phase=reset_begin lease_id=" << lease;
+                    const auto reset_result =
+                        EtcdHelper::ResetEtcdStoreClient(spec_.connstring);
+                    LOG(INFO)
+                        << "[HA-LEASE] phase=reset_end lease_id=" << lease
+                        << " result=" << toString(reset_result)
+                        << " elapsed_ms="
+                        << std::chrono::duration_cast<
+                               std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - reset_started)
+                               .count();
                 }
                 std::shared_ptr<std::atomic<bool>> monitor_armed;
                 LeadershipLostCallback on_leadership_lost;
@@ -387,6 +407,10 @@ tl::expected<bool, ErrorCode> EtcdLeaderCoordinator::RenewLeadership(
                 if (monitor_armed != nullptr &&
                     monitor_armed->exchange(false) &&
                     on_leadership_lost != nullptr) {
+                    LOG(WARNING)
+                        << "[HA-LEASE] phase=notify_loss lease_id=" << lease
+                        << " reason="
+                        << LeadershipLossReasonToString(loss_reason);
                     on_leadership_lost(loss_reason);
                 }
             });
