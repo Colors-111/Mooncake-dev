@@ -823,7 +823,11 @@ TEST_F(EvictorTest, StaleIndexPermanentCandidateIsMovedWithoutTheWindow) {
     const auto now = Clock::now();
     auto dying = std::make_shared<OffsetBufferAllocator>(
         "dead_segment", 0x500000000ULL, 1 << 20, "dead_segment");
-    PublishStaleIndexKey(ns, "dead", dying, now - seconds(10), now);
+    // Filed ten seconds ago, then read-extended ten seconds ahead: the cursor
+    // reaches the old bucket, but the key's real lease is not due, so this run
+    // must leave it alone after re-filing it.
+    PublishStaleIndexKey(ns, "dead", dying, now - seconds(10),
+                         now + seconds(10));
     dying.reset();
 
     eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer_});
@@ -905,7 +909,10 @@ TEST_F(EvictorTest, WindowDoesNotSuppressRecoverableOrLiveCandidates) {
     metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
     const auto now = Clock::now();
     Publish("a", "healthy", seconds(10));
-    Publish("a", "lease_live", -seconds(10));
+    // A live replica whose real lease was extended past the bucket the cursor
+    // reaches: the normal path re-files it and leaves it.
+    PublishStaleIndexKey(ns, "lease_live", allocator_, now - seconds(10),
+                         now + seconds(10));
     Publish("a", "group_live", seconds(10), "g");
 
     // One permanently unavailable replica beside a live one: still holds a
@@ -944,11 +951,15 @@ TEST_F(EvictorTest, WindowDoesNotSuppressRecoverableOrLiveCandidates) {
 
     EXPECT_EQ(report.SkipCount(SkipReason::kPermanentlyUnavailable), 0u);
     EXPECT_EQ(report.suppressed_permanently_unavailable, 0u);
-    EXPECT_GE(report.SkipCount(SkipReason::kLeaseActive), 1u);
+    // The lease-extended key still follows the moved/lease path, not the
+    // suppression window.
+    EXPECT_GE(report.SkipCount(SkipReason::kMoved), 1u);
     EXPECT_GE(report.SkipCount(SkipReason::kNothingToRelease), 1u);
-    EXPECT_GE(report.evicted_objects, 1u);
+    EXPECT_GE(report.evicted_objects, 2u);
     EXPECT_TRUE(ns.objects.Read("lease_live").has_value());
     EXPECT_TRUE(ns.objects.Read("busy").has_value());
+    // The grouped live member went through the normal group path.
+    EXPECT_FALSE(ns.objects.Read("group_live").has_value());
 }
 
 TEST_F(EvictorTest, MetricsLeaveAPoolRunToItsCaller) {
