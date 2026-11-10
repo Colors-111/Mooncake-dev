@@ -15,6 +15,8 @@
 
 #include <gtest/gtest.h>
 
+#include "common/transparent_string_hash.h"
+
 namespace mooncake {
 namespace {
 
@@ -1122,6 +1124,74 @@ TEST(ObjectRouteTest, ChurnKeepsTheRouteAndTheGroupConsistent) {
     }
     EXPECT_TRUE(route.Empty());
     EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 0u);
+}
+
+// --- One stripe at a time ----------------------------------------------------
+
+size_t StripeOf(std::string_view key) {
+    return TransparentStringHash{}(key) % ObjectRoute::kStripeCount;
+}
+
+TEST(ObjectRouteTest, VisitStripeReadsOnlyItsOwnObjects) {
+    ObjectRoute route;
+    PublishObject(route, "k1");
+    PublishObject(route, "k2");
+    PublishObject(route, "k3");
+    const size_t stripe = StripeOf("k1");
+
+    std::vector<std::string> seen;
+    const auto stats = route.VisitStripe(
+        stripe, [&seen](const std::string& key, Generation,
+                        const ObjectMetadata&) { seen.push_back(key); });
+
+    EXPECT_EQ(stats.visited, seen.size());
+    EXPECT_EQ(stats.deferred, 0u);
+    EXPECT_NE(std::find(seen.begin(), seen.end(), "k1"), seen.end());
+    for (const auto& key : seen) {
+        EXPECT_EQ(StripeOf(key), stripe) << key;
+    }
+    // A stripe past the end visits nothing.
+    EXPECT_EQ(route
+                  .VisitStripe(ObjectRoute::kStripeCount,
+                               [](const auto&, Generation, const auto&) {})
+                  .visited,
+              0u);
+}
+
+TEST(ObjectRouteTest, VisitStripeRevisitsABusySlot) {
+    ObjectRoute route;
+    PublishObject(route, "busy");
+    const size_t stripe = StripeOf("busy");
+
+    std::atomic<bool> holding{false};
+    std::atomic<bool> release{false};
+    std::thread holder([&] {
+        auto guard = route.Write("busy");
+        holding.store(true);
+        while (!release.load()) {
+            std::this_thread::yield();
+        }
+    });
+    while (!holding.load()) {
+        std::this_thread::yield();
+    }
+    // The holder lets go while the visit waits for the deferred slot, so the
+    // slot is revisited rather than skipped.
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        release.store(true);
+    });
+
+    std::vector<std::string> seen;
+    const auto stats = route.VisitStripe(
+        stripe, [&seen](const std::string& key, Generation,
+                        const ObjectMetadata&) { seen.push_back(key); });
+
+    releaser.join();
+    holder.join();
+
+    EXPECT_EQ(stats.deferred, 1u);
+    EXPECT_EQ(std::count(seen.begin(), seen.end(), "busy"), 1);
 }
 
 }  // namespace

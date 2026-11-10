@@ -22,6 +22,7 @@
 // group's, and the group is filed at it. That lease is also how the index tells
 // groups apart: a group recreated under the same id has a new one.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -64,11 +65,41 @@ class LeaseEvictionIndex final : public EvictionIndex {
                });
     }
 
+    // Whether every COMPLETE memory replica of `metadata` has lost its
+    // allocator or segment lifetime, so none of them can ever release memory
+    // again. A replica that is still allocated but unreadable, awaiting
+    // remount or held by a reference count may recover and does not count.
+    [[nodiscard]] static bool PermanentlyUnavailable(
+        const ObjectMetadata& metadata) {
+        bool has_complete_memory = false;
+        for (const Replica& replica : metadata.GetAllReplicas()) {
+            if (!replica.is_memory_replica() || !replica.is_completed()) {
+                continue;
+            }
+            has_complete_memory = true;
+            if (!replica.has_invalid_mem_handle()) {
+                return false;
+            }
+        }
+        return has_complete_memory;
+    }
+
     void OnRead(const route::ReadGuard&) override {}
 
     void OnWrite(const route::WriteGuard& guard) override {
         route::SlotOwnerState& owner = guard.owner_state();
-        const bool file = guard.has_object() && Qualifies(guard.metadata());
+        // A suppressed publication stays out of the index while it still has
+        // nothing that could ever release memory. A write that finds a live
+        // COMPLETE memory replica lifts the suppression, so the key returns to
+        // the candidates it belongs in.
+        bool suppressed =
+            guard.has_object() && guard.state().eviction_suppressed;
+        if (suppressed && !PermanentlyUnavailable(guard.metadata())) {
+            guard.state().eviction_suppressed = false;
+            suppressed = false;
+        }
+        const bool file =
+            guard.has_object() && !suppressed && Qualifies(guard.metadata());
         const Rank rank = file ? RankOf(guard.metadata()) : 0;
         const Lease* const lease =
             file ? GroupLeaseOf(guard.metadata()) : nullptr;
@@ -99,6 +130,28 @@ class LeaseEvictionIndex final : public EvictionIndex {
     [[nodiscard]] std::unique_ptr<Cursor> Scan(
         Clock::time_point now) const override {
         return std::make_unique<LeaseCursor>(*this, BucketOf(now));
+    }
+
+    bool SuppressPermanentlyUnavailable(
+        const route::WriteGuard& guard) override {
+        if (!guard.has_object() || !PermanentlyUnavailable(guard.metadata())) {
+            return false;
+        }
+        // Already suppressed: the index has nothing left to take out.
+        if (!guard.state().eviction_suppressed) {
+            guard.state().eviction_suppressed = true;
+        }
+        route::SlotOwnerState& owner = guard.owner_state();
+        if (!owner.eviction_filed) {
+            return true;
+        }
+        // Under the index lock, as every other change to its buckets is. The
+        // held key lock keeps the slot and its group alive.
+        std::lock_guard<std::mutex> lock(mutex_);
+        Unfile(guard.slot(), owner);
+        owner.eviction_filed = false;
+        owner.eviction_rank = 0;
+        return true;
     }
 
    private:
@@ -294,7 +347,23 @@ class LeaseEvictionIndex final : public EvictionIndex {
         std::optional<Entry> Next() override {
             if (pos_ == copy_.size()) {
                 pos_ = 0;
+                const auto started = std::chrono::steady_clock::now();
                 next_ = index_.ReadBucket(next_, last_, copy_);
+                const auto elapsed =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - started)
+                        .count();
+                // A bucket was read when it handed out data. The next rank
+                // alone cannot tell: reading the last due bucket (rank
+                // last_) also reports last_ + 1 as done, and that bucket's
+                // cost must not be dropped from the diagnostics. No bucket is
+                // ever left empty, so any entry means one was read.
+                if (copy_.size() > 0) {
+                    ++timing_.bucket_reads;
+                    timing_.read_ns += static_cast<uint64_t>(elapsed);
+                    timing_.max_read_ns = std::max(
+                        timing_.max_read_ns, static_cast<uint64_t>(elapsed));
+                }
             }
             if (pos_ == copy_.size()) {
                 return std::nullopt;
@@ -317,6 +386,8 @@ class LeaseEvictionIndex final : public EvictionIndex {
 
         size_t Total() const override { return total_; }
 
+        ReadTiming Timing() const override { return timing_; }
+
        private:
         const LeaseEvictionIndex& index_;
         // The last bucket the walk reads.
@@ -327,6 +398,7 @@ class LeaseEvictionIndex final : public EvictionIndex {
         // The bucket being walked, and the next of its entries to hand out.
         Copy copy_;
         size_t pos_ = 0;
+        ReadTiming timing_;
     };
 
     static Rank RankOf(const ObjectMetadata& metadata) {

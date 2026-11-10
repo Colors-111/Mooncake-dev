@@ -35,6 +35,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include "eviction/observer.h"
@@ -67,30 +68,50 @@ struct ByteGoal {
     uint64_t target_bytes = 0;
 };
 
+// Extra bookkeeping a caller may ask a run for. It is off by default, so the
+// healthy path takes no clock reading it did not take before; when it is on a
+// fixed share of objects is timed, and the sample count bounds every figure.
+struct Diagnostics {
+    // Percent of judged objects whose acquisition, reclaim and release are
+    // timed, 0 to 100. Zero disables the per-object timing.
+    uint32_t sample_percent = 0;
+};
+
+// Told a long run's cumulative progress, at most every few seconds and with no
+// key lock held, so the caller may sample capacity and log it.
+using ProgressFn = std::function<void(const Report&)>;
+
 class Evictor {
    public:
     // Everything given outlives the evictor.
     Evictor(metadata::NamespaceTable& namespaces, const EvictionPolicy& policy,
-            Reclaimer& reclaimer, std::vector<EvictionObserver*> observers);
+            Reclaimer& reclaimer, std::vector<EvictionObserver*> observers,
+            Diagnostics diagnostics = {});
     Evictor(const Evictor&) = delete;
     Evictor& operator=(const Evictor&) = delete;
 
     // Evicts within `scope`, or in `tenant_id`'s namespace, until `goal` is
     // met, nothing more qualifies, or an OpLog write fails. Namespaces created
-    // during the run join the next one.
-    Report Run(const Scope& scope, const ObjectGoal& goal);
-    Report Run(const TenantId& tenant_id, const ByteGoal& goal);
+    // during the run join the next one. `round_id` tags the report and its
+    // logs; `progress`, when set, is told the cumulative report during a long
+    // run.
+    Report Run(const Scope& scope, const ObjectGoal& goal,
+               uint64_t round_id = 0, ProgressFn progress = {});
+    Report Run(const TenantId& tenant_id, const ByteGoal& goal,
+               uint64_t round_id = 0, ProgressFn progress = {});
 
    private:
     struct Aim;
     class Pass;
 
-    Report RunFor(const Scope& scope, const Aim& aim);
+    Report RunFor(const Scope& scope, const Aim& aim, uint64_t round_id,
+                  const ProgressFn& progress);
 
     metadata::NamespaceTable& namespaces_;
     const EvictionPolicy& policy_;
     Reclaimer& reclaimer_;
     const std::vector<EvictionObserver*> observers_;
+    const Diagnostics diagnostics_;
     // Where the next run starts among the namespaces it visits.
     std::atomic<size_t> next_start_{0};
 };

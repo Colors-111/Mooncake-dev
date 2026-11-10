@@ -67,6 +67,14 @@ class EvictionIndex {
                                            const Entry& entry) const = 0;
         // How many keys were filed when the walk began.
         [[nodiscard]] virtual size_t Total() const = 0;
+        // How reading this walk's buckets went, for diagnostics. A walk that
+        // does not read in buckets leaves it zero.
+        struct ReadTiming {
+            uint64_t bucket_reads = 0;
+            uint64_t read_ns = 0;
+            uint64_t max_read_ns = 0;
+        };
+        [[nodiscard]] virtual ReadTiming Timing() const { return {}; }
     };
 
     explicit EvictionIndex(bool observes_reads)
@@ -87,6 +95,22 @@ class EvictionIndex {
     // A walk over the keys that may be due by `now`.
     [[nodiscard]] virtual std::unique_ptr<Cursor> Scan(
         Clock::time_point now) const = 0;
+
+    // Told under a key's write lock that the policy found nothing to release
+    // for its object. The index may take the key out of its candidates for
+    // good, but only on a permanent condition: every COMPLETE memory replica
+    // of the object has lost its allocator or segment lifetime. A replica that
+    // is merely unreadable, awaiting remount or held by a reference count may
+    // recover, so it never qualifies. Returns whether the key was suppressed;
+    // an index that keeps no such state returns false and does nothing.
+    //
+    // The suppression is derived index state only: it touches no replica, no
+    // metadata and no eviction result. A later write that finds a live
+    // COMPLETE memory replica clears it (see OnWrite).
+    virtual bool SuppressPermanentlyUnavailable(
+        const route::WriteGuard& /*guard*/) {
+        return false;
+    }
 
     // Whether OnRead must be called.
     [[nodiscard]] bool observes_reads() const { return observes_reads_; }

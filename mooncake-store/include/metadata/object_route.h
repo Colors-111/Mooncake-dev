@@ -455,6 +455,24 @@ class ObjectRoute {
     [[nodiscard]] Cursor<LockMode::kRead> ReadCursor() const;
     [[nodiscard]] Cursor<LockMode::kWrite> WriteCursor();
 
+    // What one stripe visit did: the objects it reached, the slots that were
+    // busy when it passed and were therefore revisited, and how long those
+    // revisits took.
+    struct StripeVisitStats {
+        uint64_t visited = 0;
+        uint64_t deferred = 0;
+        uint64_t deferred_visit_ns = 0;
+    };
+
+    // Visits the objects currently in stripe `index`, each under its key's
+    // shared lock, and never touches another stripe. A slot busy elsewhere is
+    // kept alive by a handle and visited after the stripe lock is released, so
+    // it is never skipped. The visitor runs under a slot lock and must not
+    // reach the route; a caller that acts after it keeps the ObjectRef it
+    // needs and comes back through Write(ref).
+    template <typename Fn>
+    StripeVisitStats VisitStripe(size_t index, Fn&& fn) const;
+
     // The member keys of one group, as a snapshot to resolve again: a key in
     // it may hold a different object by the time the caller reads it, or none.
     [[nodiscard]] std::vector<std::string> GroupMembers(
@@ -839,6 +857,56 @@ inline ObjectRoute::Cursor<LockMode::kRead> ObjectRoute::ReadCursor() const {
 
 inline ObjectRoute::Cursor<LockMode::kWrite> ObjectRoute::WriteCursor() {
     return Cursor<LockMode::kWrite>(*this);
+}
+
+template <typename Fn>
+ObjectRoute::StripeVisitStats ObjectRoute::VisitStripe(size_t index,
+                                                       Fn&& fn) const {
+    StripeVisitStats stats;
+    if (index >= kStripeCount) {
+        return stats;
+    }
+    Stripe& stripe = stripes_[index];
+    // Slots busy when the stripe was passed, kept in the map until revisited.
+    std::vector<SlotHandle> deferred;
+    {
+        AssertNotInCursor();
+        std::shared_lock<std::shared_mutex> stripe_lock(stripe.lock);
+        ++cursor_stripes_;
+        for (auto it = stripe.slots.begin(); it != stripe.slots.end(); ++it) {
+            KeySlot& slot = it->second;
+            std::shared_lock<std::shared_mutex> slot_lock(slot.mutex_,
+                                                          std::try_to_lock);
+            if (!slot_lock.owns_lock()) {
+                deferred.emplace_back(stripe, slot);
+                continue;
+            }
+            if (!slot.record_.has_value()) {
+                continue;
+            }
+            ++stats.visited;
+            fn(slot.key(), slot.record_->generation, slot.record_->metadata);
+        }
+        --cursor_stripes_;
+    }
+    stats.deferred = deferred.size();
+    if (!deferred.empty()) {
+        const auto started = std::chrono::steady_clock::now();
+        for (SlotHandle& handle : deferred) {
+            KeySlot& slot = *handle;
+            std::shared_lock<std::shared_mutex> slot_lock(slot.mutex_);
+            if (!slot.record_.has_value()) {
+                continue;
+            }
+            ++stats.visited;
+            fn(slot.key(), slot.record_->generation, slot.record_->metadata);
+        }
+        stats.deferred_visit_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started)
+                .count());
+    }
+    return stats;
 }
 
 inline void ObjectRoute::RebuildGroupState() {

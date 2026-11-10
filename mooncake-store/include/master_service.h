@@ -1263,7 +1263,44 @@ class MasterService {
         const UUID& client_id, const ClientSessionSharedPtr& session);
 
     void OnClientSessionChanged(const ClientSessionEvent& event);
-    bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
+    // Advances one offboarding job by a bounded unit: segment prepare, a stripe
+    // of metadata candidates, or one cleanup batch. It gives memory eviction
+    // priority and says why it stopped, so the worker can wait without
+    // counting a wait as an error.
+    ClientOffboardingDisposition ProcessClientOffboardingJob(
+        ClientOffboardingJob& job);
+
+    // One unit of the metadata sweep. Both return kContinue when the unit
+    // finished and more remains.
+    ClientOffboardingDisposition CollectOffboardingStripe(
+        ClientOffboardingJob& job);
+    ClientOffboardingDisposition CleanOffboardingCandidateBatch(
+        ClientOffboardingJob& job);
+    // Cleans one candidate under the caller's shared master lock. Returns
+    // whether it may advance the candidate offset.
+    ClientOffboardingDisposition CleanOffboardingCandidate(
+        ClientOffboardingJob& job, const TenantId& tenant_id,
+        const route::ObjectRef& object);
+    // Whether offboarding must stand aside for memory eviction now. It may
+    // spend one maintenance unit after an eviction round reported no progress,
+    // so a stalled eviction cannot deadlock the sweep.
+    bool ShouldPauseOffboarding(ClientOffboardingJob& job);
+    // Keeps the wait accounting and logs one entry and exit per wait episode.
+    void BeginOffboardingWait(ClientOffboardingJob& job,
+                              ClientOffboardingWaitReason reason);
+    void EndOffboardingWait(ClientOffboardingJob& job);
+    // Logs the cumulative sweep accounting at most every few seconds.
+    void MaybeLogOffboardingSummary(ClientOffboardingJob& job);
+    // Drops the sweep's snapshot, cursor, candidates and acceptance, so the
+    // next unit starts a fresh sweep after a restore.
+    void RestartOffboardingSweep(ClientOffboardingJob& job, const char* reason);
+    [[nodiscard]] uint64_t GetLifecycleEpoch() const;
+    void PublishOffboardingStage(ClientOffboardingJob& job,
+                                 ClientOffboardingStage stage);
+    // Publishes the last stage and its stall to the metrics scrape from the
+    // client monitor thread, so a stuck stage is visible without a log line.
+    void RefreshOffboardingStageMetric();
+
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
@@ -1497,8 +1534,7 @@ class MasterService {
                              ObjectMetadata& metadata,
                              route::ObjectState& state);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
-    // accounting (promotion-task cancellation) instead of
-    // duplicating it.
+    // accounting (promotion-task cancellation) instead of duplicating it.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
         ObjectMetadata& metadata, route::ObjectState& state,
@@ -1521,6 +1557,9 @@ class MasterService {
                           const std::string& writer_host_id,
                           bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
+    // A rate-limited line per allocation failure burst: what was asked, what
+    // the pool reports, and how many failures were folded into it.
+    void MaybeLogMemoryAllocationFailure(uint64_t requested_bytes);
 
     class MetadataAccessorRW;
     // Publishes a new object under the key `accessor` holds, which must hold
@@ -1752,6 +1791,64 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+
+    // Whether DRAM eviction is active or waiting for memory, and how its last
+    // completed round went. Offboarding reads this at every safety point; it
+    // counts business reclaim runs, not the thread's lifetime.
+    struct MemoryEvictionPressure {
+        bool enabled{false};
+        bool active{false};
+        bool need{false};
+        // The last completed round made no progress and no later round has
+        // made any: eviction has nothing it can take right now.
+        bool stalled{false};
+        double used_ratio{0.0};
+        double high_watermark{0.0};
+        // Numbers the stall episodes, so offboarding may let a bounded
+        // maintenance unit through at a low rate while eviction has nothing.
+        uint64_t stall_episode{0};
+    };
+    [[nodiscard]] MemoryEvictionPressure SnapshotMemoryEvictionPressure() const;
+    // Publishes how a completed pool-wide DRAM round went.
+    void PublishMemoryEvictionRound(bool made_progress, bool stopped);
+    // Marks one DRAM eviction run active for its whole scope and wakes
+    // offboarding when it ends. NoF and DFS eviction do not use it.
+    class MemoryEvictionScope {
+       public:
+        explicit MemoryEvictionScope(MasterService& service)
+            : service_(service) {
+            service_.active_memory_evictions_.fetch_add(
+                1, std::memory_order_acq_rel);
+        }
+        ~MemoryEvictionScope() {
+            service_.active_memory_evictions_.fetch_sub(
+                1, std::memory_order_acq_rel);
+            service_.client_offboarding_worker_.NotifyPending();
+        }
+        MemoryEvictionScope(const MemoryEvictionScope&) = delete;
+        MemoryEvictionScope& operator=(const MemoryEvictionScope&) = delete;
+
+       private:
+        MasterService& service_;
+    };
+    std::atomic<int> active_memory_evictions_{0};
+    std::atomic<bool> memory_eviction_stalled_{false};
+    std::atomic<uint64_t> memory_eviction_stall_episode_{0};
+    // Numbers the pool-wide DRAM rounds, so a report and its progress lines
+    // can be told apart across rounds.
+    std::atomic<uint64_t> memory_eviction_round_seq_{0};
+    // Rate limits the per-round diagnostic lines: a round under sustained
+    // pressure can be a few milliseconds long, and a line per round would
+    // swamp the log. Long rounds and one round per second stay at INFO.
+    std::atomic<int64_t> last_evict_round_log_ms_{0};
+    // Rate limit for the allocation-failure diagnostic.
+    std::atomic<int64_t> last_alloc_fail_log_ms_{0};
+    std::atomic<uint64_t> alloc_fail_suppressed_{0};
+    // The offboarding stage last published, and when it began, in steady-clock
+    // milliseconds.
+    std::atomic<int> offboarding_stage_{
+        static_cast<int>(ClientOffboardingStage::kIdle)};
+    std::atomic<int64_t> offboarding_stage_since_ms_{0};
 
     // Task cleanup thread related members
     std::thread task_cleanup_thread_;
@@ -2197,6 +2294,10 @@ class MasterService {
     // Constructed -> Ready -> Serving before it serves RPCs.
     std::atomic<RestoreLifecycleState> lifecycle_state_{
         RestoreLifecycleState::kConstructed};
+    // Advanced as a restore enters and leaves its window. An offboarding sweep
+    // that spans a batch and sees a different value discards its snapshot and
+    // cursors instead of continuing against rewritten metadata.
+    std::atomic<uint64_t> lifecycle_epoch_{0};
 
     // True in every lifecycle state except the restore windows
     // (kRecovering / kFailed). Background workers that mutate business
