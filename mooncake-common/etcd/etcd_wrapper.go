@@ -4,6 +4,85 @@ package main
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+
+// Read-only socket observations. Never read SO_ERROR (which consumes a pending
+// error), duplicate an fd, or retain a socket reference beyond this call.
+#ifndef MOONCAKE_LEASE_TCP_DIAGNOSTICS
+#define MOONCAKE_LEASE_TCP_DIAGNOSTICS
+typedef struct {
+  uint64_t cookie;
+  uint32_t state, unacked, total_retrans, rtt_us, rto_us, user_timeout_ms;
+  char local[80], remote[80];
+} mooncake_lease_tcp_sample;
+
+#ifdef __linux__
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <stdio.h>
+
+static inline int mooncake_lease_tcp_supported(void) { return 1; }
+
+static inline int mooncake_lease_tcp_address(int fd, int peer, char* out,
+                                           size_t capacity) {
+  struct sockaddr_storage addr;
+  socklen_t len = sizeof(addr);
+  int rc = peer ? getpeername(fd, (struct sockaddr*)&addr, &len)
+                : getsockname(fd, (struct sockaddr*)&addr, &len);
+  if (rc != 0) return errno;
+  char ip[INET6_ADDRSTRLEN];
+  if (addr.ss_family == AF_INET) {
+    const struct sockaddr_in* a = (const struct sockaddr_in*)&addr;
+    if (!inet_ntop(AF_INET, &a->sin_addr, ip, sizeof(ip))) return errno;
+    snprintf(out, capacity, "%s:%u", ip, ntohs(a->sin_port));
+  } else if (addr.ss_family == AF_INET6) {
+    const struct sockaddr_in6* a = (const struct sockaddr_in6*)&addr;
+    if (!inet_ntop(AF_INET6, &a->sin6_addr, ip, sizeof(ip))) return errno;
+    snprintf(out, capacity, "[%s]:%u", ip, ntohs(a->sin6_port));
+  } else {
+    return EAFNOSUPPORT;
+  }
+  return 0;
+}
+
+static inline int mooncake_read_lease_tcp(int fd, uint64_t expected_cookie,
+                                        mooncake_lease_tcp_sample* out) {
+  uint64_t before = 0, after = 0;
+  socklen_t len = sizeof(before);
+  if (getsockopt(fd, SOL_SOCKET, SO_COOKIE, &before, &len) != 0) return errno;
+  if (expected_cookie != 0 && before != expected_cookie) return ESTALE;
+  struct tcp_info info;
+  memset(&info, 0, sizeof(info));
+  len = sizeof(info);
+  if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &len) != 0) return errno;
+  len = sizeof(out->user_timeout_ms);
+  if (getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                 &out->user_timeout_ms, &len) != 0) return errno;
+  int rc = mooncake_lease_tcp_address(fd, 0, out->local, sizeof(out->local));
+  if (rc != 0) return rc;
+  rc = mooncake_lease_tcp_address(fd, 1, out->remote, sizeof(out->remote));
+  if (rc != 0) return rc;
+  len = sizeof(after);
+  if (getsockopt(fd, SOL_SOCKET, SO_COOKIE, &after, &len) != 0) return errno;
+  if (before != after) return ESTALE;
+  out->cookie = before;
+  out->state = info.tcpi_state;
+  out->unacked = info.tcpi_unacked;
+  out->total_retrans = info.tcpi_total_retrans;
+  out->rtt_us = info.tcpi_rtt;
+  out->rto_us = info.tcpi_rto;
+  return 0;
+}
+#else
+static inline int mooncake_lease_tcp_supported(void) { return 0; }
+static inline int mooncake_read_lease_tcp(int fd, uint64_t expected_cookie,
+                                        mooncake_lease_tcp_sample* out) {
+  return ENOTSUP;
+}
+#endif
+#endif  // MOONCAKE_LEASE_TCP_DIAGNOSTICS
 
 // Trampolines to invoke C/C++ function pointers safely from Go via cgo.
 // NOTE: Calling a C function pointer by converting it to a Go func is undefined
@@ -38,12 +117,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -928,13 +1011,362 @@ func hasKeepAliveContext(leaseId int64) bool {
 	return exists
 }
 
+// leaseTCPSample is evidence about one socket, not a diagnosis of which host
+// dropped packets. Cookie identifies the socket across samples and fd reuse.
+type leaseTCPSample struct {
+	Available     bool   `json:"available"`
+	Cookie        uint64 `json:"cookie,omitempty"`
+	State         uint32 `json:"state,omitempty"`
+	Unacked       uint32 `json:"unacked"`
+	TotalRetrans  uint32 `json:"total_retrans"`
+	RTTUS         uint32 `json:"rtt_us,omitempty"`
+	RTOUS         uint32 `json:"rto_us,omitempty"`
+	UserTimeoutMS uint32 `json:"user_timeout_ms,omitempty"`
+	Local         string `json:"local,omitempty"`
+	Remote        string `json:"remote,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
+func leaseTCPDiagnosticsSupported() bool { return C.mooncake_lease_tcp_supported() != 0 }
+
+func readLeaseTCP(fd int, expectedCookie uint64) leaseTCPSample {
+	var s C.mooncake_lease_tcp_sample
+	if rc := C.mooncake_read_lease_tcp(C.int(fd), C.uint64_t(expectedCookie), &s); rc != 0 {
+		return leaseTCPSample{Error: syscall.Errno(rc).Error()}
+	}
+	return leaseTCPSample{Available: true, Cookie: uint64(s.cookie), State: uint32(s.state),
+		Unacked: uint32(s.unacked), TotalRetrans: uint32(s.total_retrans),
+		RTTUS: uint32(s.rtt_us), RTOUS: uint32(s.rto_us), UserTimeoutMS: uint32(s.user_timeout_ms),
+		Local: canonicalLeaseAddress(C.GoString(&s.local[0])), Remote: canonicalLeaseAddress(C.GoString(&s.remote[0]))}
+}
+
+func canonicalLeaseAddress(address string) string {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return address
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+	return net.JoinHostPort(host, port)
+}
+
+type leaseTCPProbe struct {
+	fd     int
+	cookie uint64
+}
+
+func (p *leaseTCPProbe) sample(local, remote string) leaseTCPSample {
+	if local == "" || remote == "" {
+		return leaseTCPSample{Error: "connection_address_unavailable"}
+	}
+	local, remote = canonicalLeaseAddress(local), canonicalLeaseAddress(remote)
+	matches := func(s leaseTCPSample) bool { return s.Error == "" && s.Local == local && s.Remote == remote }
+	if p.cookie != 0 {
+		s := readLeaseTCP(p.fd, p.cookie)
+		if matches(s) {
+			return s
+		}
+		p.fd, p.cookie = -1, 0
+	}
+	if !leaseTCPDiagnosticsSupported() {
+		return leaseTCPSample{Error: "unsupported_platform"}
+	}
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return leaseTCPSample{Error: "fd_directory_unavailable"}
+	}
+	for _, entry := range entries {
+		// No open/dup: retaining an fd would change connection teardown.
+		link, err := os.Readlink("/proc/self/fd/" + entry.Name())
+		if err != nil || !strings.HasPrefix(link, "socket:[") {
+			continue
+		}
+		fd, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		s := readLeaseTCP(fd, 0)
+		if matches(s) {
+			p.fd, p.cookie = fd, s.Cookie
+			return s
+		}
+	}
+	return leaseTCPSample{Error: "socket_not_found_or_already_closed"}
+}
+
+type leaseFlightSample struct {
+	At         time.Time         `json:"at"`
+	State      string            `json:"state,omitempty"`
+	Requests   uint64            `json:"requests"`
+	Responses  uint64            `json:"responses"`
+	TCP        leaseTCPSample    `json:"tcp"`
+	Resources  map[string]string `json:"resources,omitempty"`
+	DurationMS int64             `json:"sample_ms"`
+}
+
+type leaseFlightRecorder struct {
+	mu                    sync.Mutex
+	samples               [8]leaseFlightSample
+	next, count           int
+	recoveries, coalesced atomic.Uint64
+}
+
+func (r *leaseFlightRecorder) record(s leaseFlightSample) {
+	r.mu.Lock()
+	r.samples[r.next] = s
+	r.next = (r.next + 1) % len(r.samples)
+	if r.count < len(r.samples) {
+		r.count++
+	}
+	r.mu.Unlock()
+}
+
+func (r *leaseFlightRecorder) history() string {
+	if !r.mu.TryLock() {
+		return `{"unavailable":"sampler_busy"}`
+	}
+	samples := make([]leaseFlightSample, 0, r.count)
+	for i := 0; i < r.count; i++ {
+		samples = append(samples, r.samples[(r.next-r.count+i+len(r.samples))%len(r.samples)])
+	}
+	r.mu.Unlock()
+	// One failure must not produce an arbitrarily long log line, even when a
+	// container has unusually long cgroup paths. Keep the newest complete JSON
+	// samples within a 6 KB budget instead of truncating JSON mid-field.
+	for len(samples) > 0 {
+		data, _ := json.Marshal(samples)
+		if len(data) <= 6000 {
+			return string(data)
+		}
+		samples = samples[1:]
+	}
+	return "[]"
+}
+
+// Read only a few named counters; do not dump process environments or cgroup
+// contents. Source paths are explicit because host PSI is not per-process PSI.
+func leaseResourceSample() map[string]string {
+	out := map[string]string{}
+	if ns, err := os.Readlink("/proc/self/ns/net"); err == nil {
+		out["network_namespace"] = ns
+	}
+	for _, kind := range []string{"cpu", "memory"} {
+		path := "/proc/pressure/" + kind
+		data, err := os.ReadFile(path)
+		if err != nil {
+			out["host_"+kind+"_psi"] = "unavailable"
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) == 0 {
+				continue
+			}
+			for _, field := range fields[1:] {
+				if strings.HasPrefix(field, "total=") {
+					out["host_"+kind+"_"+fields[0]+"_us"] = strings.TrimPrefix(field, "total=")
+				}
+			}
+		}
+	}
+	// Mount roots may differ between container and host cgroup namespaces.
+	// Resolve membership against mountinfo instead of assuming the mount root
+	// is this process's cgroup (which could silently report an ancestor).
+	membership, err := os.ReadFile("/proc/self/cgroup")
+	mounts, mountErr := os.ReadFile("/proc/self/mountinfo")
+	if err != nil || mountErr != nil {
+		out["cgroup_cpu"] = "unavailable"
+		return out
+	}
+	path := leaseCPUStatPath(string(membership), string(mounts))
+	if path == "" {
+		out["cgroup_cpu"] = "unresolved"
+		return out
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		out["cgroup_cpu"] = "unavailable"
+		return out
+	}
+	out["cgroup_cpu_source"] = path
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		switch f[0] {
+		case "nr_periods", "nr_throttled", "throttled_usec", "throttled_time":
+			out[f[0]] = f[1]
+		}
+	}
+	return out
+}
+
+func leaseCPUStatPath(membership, mounts string) string {
+	unescape := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\134`, `\`)
+	for _, member := range strings.Split(membership, "\n") {
+		parts := strings.SplitN(member, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		v2 := parts[0] == "0" && parts[1] == ""
+		if !v2 && !strings.Contains(","+parts[1]+",", ",cpu,") {
+			continue
+		}
+		for _, mount := range strings.Split(mounts, "\n") {
+			pair := strings.SplitN(mount, " - ", 2)
+			if len(pair) != 2 {
+				continue
+			}
+			left, right := strings.Fields(pair[0]), strings.Fields(pair[1])
+			if len(left) < 5 || len(right) < 3 {
+				continue
+			}
+			if v2 && right[0] != "cgroup2" || !v2 && (right[0] != "cgroup" || !strings.Contains(","+right[2]+",", ",cpu,")) {
+				continue
+			}
+			root, point := unescape.Replace(left[3]), unescape.Replace(left[4])
+			group := parts[2]
+			if group != root && !strings.HasPrefix(group, strings.TrimSuffix(root, "/")+"/") {
+				continue
+			}
+			rel := strings.TrimPrefix(strings.TrimPrefix(group, root), "/")
+			// Namespace-relative membership can contain ../ outside the mounted
+			// subtree. Treat this as unknown, never escape the cgroup mount.
+			if rel == ".." || strings.HasPrefix(rel, "../") || strings.Contains(rel, "/../") {
+				continue
+			}
+			return filepath.Join(point, rel, "cpu.stat")
+		}
+	}
+	return ""
+}
+
+// Recovery means a new lease response was observed, not that a previously
+// relinquished leadership term can be reused. The supervisor remains in charge.
+type leaseRecoveryTracker struct {
+	since, lastResponse time.Time
+	failures, ends      uint64
+	disruption          time.Time
+	lastGapMS           int64
+}
+
+func (r *leaseRecoveryTracker) update(now time.Time, failures, ends uint64, response time.Time, ttl int64, state string) bool {
+	changed := failures > r.failures || ends > r.ends
+	r.failures, r.ends = failures, ends
+	if changed && r.since.IsZero() {
+		r.since = now
+	}
+	if response.IsZero() || ttl <= 0 {
+		return false
+	}
+	threshold := time.Duration(ttl)*time.Second/3 + 2*time.Second
+	if threshold < 3*time.Second {
+		threshold = 3 * time.Second
+	}
+	if r.since.IsZero() && (changed || now.Sub(response) > threshold || state != "READY") {
+		r.since = now
+	}
+	if response.After(r.lastResponse) && !r.lastResponse.IsZero() {
+		r.lastGapMS = response.Sub(r.lastResponse).Milliseconds()
+	}
+	recovered := !r.since.IsZero() && response.After(r.lastResponse) && response.After(r.disruption) && state == "READY" && now.Sub(response) <= threshold
+	if recovered {
+		r.since = time.Time{}
+	}
+	r.lastResponse = response
+	return recovered
+}
+
+func startLeaseFlightRecorder(ctx context.Context, id int64, d *leaseTransportDiagnostics, state func() string) *leaseFlightRecorder {
+	probe := &leaseTCPProbe{fd: -1}
+	return startLeaseFlightRecorderWithSampler(ctx, id, d, state, func() leaseFlightSample {
+		local, remote := "", ""
+		if addresses := d.addresses.Load(); addresses != nil {
+			local, remote = addresses.local, addresses.remote
+		}
+		started := time.Now()
+		return leaseFlightSample{At: started, State: state(), Requests: d.requests.Load(), Responses: d.responses.Load(), TCP: probe.sample(local, remote), Resources: leaseResourceSample(), DurationMS: time.Since(started).Milliseconds()}
+	})
+}
+
+func startLeaseFlightRecorderWithSampler(ctx context.Context, id int64, d *leaseTransportDiagnostics, state func() string, sample func() leaseFlightSample) *leaseFlightRecorder {
+	r := &leaseFlightRecorder{}
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		tracker := leaseRecoveryTracker{}
+		var lastReport time.Time
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			r.record(sample()) // File/socket observations never run on the ACK path.
+			if ctx.Err() != nil {
+				return
+			}
+			now := time.Now()
+			disruptionNS := d.lastDisruptionNS.Load()
+			failures, ends := d.rpcFailures.Load(), d.connEnds.Load()
+			response := time.Time{}
+			if ns := d.lastInNS.Load(); ns != 0 {
+				response = time.Unix(0, ns)
+			}
+			if disruptionNS != 0 {
+				tracker.disruption = time.Unix(0, disruptionNS)
+			}
+			// Do not combine a new failure counter with an older failure time.
+			stable := disruptionNS == d.lastDisruptionNS.Load()
+			if stable && tracker.update(now, failures, ends, response, d.lastTTL.Load(), state()) {
+				r.recoveries.Add(1)
+				if lastReport.IsZero() || now.Sub(lastReport) >= 30*time.Second {
+					lastReport = now
+					log.Printf("[HA-LEASE-RECOVERED] lease_id=%d response_gap_ms=%d recovery_count=%d coalesced=%d %s flight_history=%s", id, tracker.lastGapMS, r.recoveries.Load(), r.coalesced.Load(), d.summary(), r.history())
+				} else {
+					r.coalesced.Add(1)
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return r
+}
+
 // Aggregate transport events without writing logs or waiting for a diagnostic
 // lock on the lease callbacks. The existing terminal error carries one summary.
 type leaseTransportDiagnostics struct {
 	rpcEnds, rpcFailures, connBegins, connEnds, dropped atomic.Uint64
+	rpcBegins, requests, responses                      atomic.Uint64
+	lastOutNS, lastInNS, lastTTL, lastDisruptionNS      atomic.Int64
+	addresses                                           atomic.Pointer[leaseConnectionAddresses]
 	stateMu                                             sync.Mutex
 	lastCode, lastError, lastConnection                 string
 	lastErrorAt                                         time.Time
+	events                                              [12]leaseTransportEvent
+	eventNext, eventCount                               int
+}
+
+type leaseTransportEvent struct {
+	At     time.Time `json:"at"`
+	Event  string    `json:"event"`
+	Detail string    `json:"detail,omitempty"`
+}
+
+// Caller owns stateMu. The event array cannot grow during a retry storm.
+func (d *leaseTransportDiagnostics) event(event, detail string) {
+	if len(detail) > 160 {
+		detail = detail[:160]
+	}
+	d.events[d.eventNext] = leaseTransportEvent{time.Now(), event, detail}
+	d.eventNext = (d.eventNext + 1) % len(d.events)
+	if d.eventCount < len(d.events) {
+		d.eventCount++
+	}
 }
 
 func (d *leaseTransportDiagnostics) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context {
@@ -942,11 +1374,34 @@ func (d *leaseTransportDiagnostics) TagRPC(ctx context.Context, _ *stats.RPCTagI
 }
 
 func (d *leaseTransportDiagnostics) HandleRPC(_ context.Context, event stats.RPCStats) {
+	switch e := event.(type) {
+	case *stats.OutPayload:
+		d.requests.Add(1)
+		d.lastOutNS.Store(time.Now().UnixNano())
+		return
+	case *stats.InPayload:
+		d.responses.Add(1)
+		if resp, ok := e.Payload.(interface{ GetTTL() int64 }); ok {
+			d.lastTTL.Store(resp.GetTTL())
+		}
+		d.lastInNS.Store(time.Now().UnixNano())
+		return
+	case *stats.Begin:
+		d.rpcBegins.Add(1)
+		if d.stateMu.TryLock() {
+			d.event("rpc_begin", "")
+			d.stateMu.Unlock()
+		} else {
+			d.dropped.Add(1)
+		}
+		return
+	}
 	if end, ok := event.(*stats.End); ok {
 		d.rpcEnds.Add(1)
 		if end.Error == nil {
 			return
 		}
+		d.lastDisruptionNS.Store(time.Now().UnixNano())
 		d.rpcFailures.Add(1)
 		if !d.stateMu.TryLock() {
 			d.dropped.Add(1)
@@ -957,18 +1412,23 @@ func (d *leaseTransportDiagnostics) HandleRPC(_ context.Context, event stats.RPC
 		if len(d.lastError) > 256 {
 			d.lastError = d.lastError[:256]
 		}
+		d.event("rpc_error", d.lastError)
 		d.stateMu.Unlock()
 	}
 }
 
 type leaseConnectionTag struct{}
+type leaseConnectionAddresses struct{ local, remote string }
 
 func (d *leaseTransportDiagnostics) TagConn(ctx context.Context, info *stats.ConnTagInfo) context.Context {
-	return context.WithValue(ctx, leaseConnectionTag{}, fmt.Sprintf("local=%s remote=%s", info.LocalAddr, info.RemoteAddr))
+	addresses := &leaseConnectionAddresses{fmt.Sprint(info.LocalAddr), fmt.Sprint(info.RemoteAddr)}
+	d.addresses.Store(addresses)
+	return context.WithValue(ctx, leaseConnectionTag{}, addresses)
 }
 
 func (d *leaseTransportDiagnostics) HandleConn(ctx context.Context, event stats.ConnStats) {
 	if _, ok := event.(*stats.ConnEnd); ok {
+		d.lastDisruptionNS.Store(time.Now().UnixNano())
 		d.connEnds.Add(1)
 	} else {
 		d.connBegins.Add(1)
@@ -977,24 +1437,47 @@ func (d *leaseTransportDiagnostics) HandleConn(ctx context.Context, event stats.
 		d.dropped.Add(1)
 		return
 	}
-	d.lastConnection, _ = ctx.Value(leaseConnectionTag{}).(string)
+	if addresses, _ := ctx.Value(leaseConnectionTag{}).(*leaseConnectionAddresses); addresses != nil {
+		d.lastConnection = fmt.Sprintf("local=%s remote=%s", addresses.local, addresses.remote)
+	}
+	if _, ok := event.(*stats.ConnEnd); ok {
+		d.event("conn_end", d.lastConnection)
+	} else {
+		d.event("conn_begin", d.lastConnection)
+	}
 	d.stateMu.Unlock()
 }
 
 func (d *leaseTransportDiagnostics) summary() string {
 	counts := fmt.Sprintf("rpc_ends=%d rpc_failures=%d conn_begins=%d conn_ends=%d transport_detail_drops=%d",
 		d.rpcEnds.Load(), d.rpcFailures.Load(), d.connBegins.Load(), d.connEnds.Load(), d.dropped.Load())
+	ageMS := func(ns int64) int64 {
+		if ns == 0 {
+			return -1
+		}
+		return time.Since(time.Unix(0, ns)).Milliseconds()
+	}
+	counts += fmt.Sprintf(" rpc_begins=%d requests_sent=%d responses_received=%d last_request_age_ms=%d last_response_age_ms=%d last_response_ttl_sec=%d",
+		d.rpcBegins.Load(), d.requests.Load(), d.responses.Load(), ageMS(d.lastOutNS.Load()), ageMS(d.lastInNS.Load()), d.lastTTL.Load())
 	if !d.stateMu.TryLock() {
 		return counts + " transport_detail_busy=1"
 	}
 	code, message, at, connection := d.lastCode, d.lastError, d.lastErrorAt, d.lastConnection
+	if addresses := d.addresses.Load(); addresses != nil {
+		connection = fmt.Sprintf("local=%s remote=%s", addresses.local, addresses.remote)
+	}
+	events := make([]leaseTransportEvent, 0, d.eventCount)
+	for i := 0; i < d.eventCount; i++ {
+		events = append(events, d.events[(d.eventNext-d.eventCount+i+len(d.events))%len(d.events)])
+	}
 	d.stateMu.Unlock()
+	history, _ := json.Marshal(events)
 	age := int64(-1)
 	if !at.IsZero() {
 		age = time.Since(at).Milliseconds()
 	}
-	return fmt.Sprintf("%s last_rpc_code=%s last_rpc_error=%q last_rpc_age_ms=%d last_connection=%q",
-		counts, code, message, age, connection)
+	return fmt.Sprintf("%s last_rpc_code=%s last_rpc_error=%q last_rpc_age_ms=%d last_connection=%q transport_events=%s",
+		counts, code, message, age, connection, history)
 }
 
 // Observe the existing stream without renewing, reconnecting or changing its
@@ -1095,6 +1578,13 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 	storeKeepAliveMutex.Unlock()
 	// Make sure to delete from the map before returning
 	defer cancelAndDeleteKeepAlive(leaseId)
+	connectionState := func() string {
+		if conn := cli.ActiveConnection(); conn != nil {
+			return conn.GetState().String()
+		}
+		return "NO_CONNECTION"
+	}
+	recorder := startLeaseFlightRecorder(ctx, leaseId, diagnostics, connectionState)
 
 	// Start keep alive
 	keepAliveChan, err := cli.KeepAlive(ctx, clientv3.LeaseID(leaseId))
@@ -1104,11 +1594,7 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 	}
 
 	code, detail := observeKeepAlive(ctx, cli.Ctx(), leaseId, keepAliveChan, func() string {
-		state := "NO_CONNECTION"
-		if conn := cli.ActiveConnection(); conn != nil {
-			state = conn.GetState().String()
-		}
-		return state + " " + diagnostics.summary()
+		return fmt.Sprintf("%s %s recovery_count=%d recovery_logs_coalesced=%d flight_history=%s", connectionState(), diagnostics.summary(), recorder.recoveries.Load(), recorder.coalesced.Load(), recorder.history())
 	})
 	*errMsg = C.CString(detail)
 	return code
