@@ -1133,7 +1133,8 @@ class MasterService {
     auto EvictDiskReplicaImpl(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
                               ReplicaType replica_type,
-                              const ReplicaID* expected_replica_id)
+                              const ReplicaID* expected_replica_id,
+                              bool log_not_found = true)
         -> tl::expected<bool, ErrorCode>;
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyImpl(
         const std::vector<std::string>& keys, const TenantId& tenant_id,

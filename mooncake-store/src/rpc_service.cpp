@@ -1483,13 +1483,16 @@ WrappedMasterService::BatchEvictDiskReplica(
                 client_id, keys, resolved_tenant_id, replica_type);
         });
 
+    const size_t log_interval = results.size() < 1000 ? 1000 : 100;
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
-            LOG(WARNING) << "BatchEvictDiskReplica failed for key[" << i
-                         << "] '" << keys[i]
-                         << "': " << toString(results[i].error());
+            if ((failure_count - 1) % log_interval == 0) {
+                LOG(WARNING)
+                    << "BatchEvictDiskReplica failed for key[" << i << "] '"
+                    << keys[i] << "': " << toString(results[i].error());
+            }
         }
     }
     if (failure_count > 0) {

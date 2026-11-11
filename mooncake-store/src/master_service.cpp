@@ -7628,18 +7628,18 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
     return BatchPutRevoke(client_id, keys, tenant_id);
 }
 
-auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
-                                         const std::string& key,
-                                         const TenantId& tenant_id,
-                                         ReplicaType replica_type,
-                                         const ReplicaID* expected_replica_id)
-    -> tl::expected<bool, ErrorCode> {
+auto MasterService::EvictDiskReplicaImpl(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    ReplicaType replica_type, const ReplicaID* expected_replica_id,
+    bool log_not_found) -> tl::expected<bool, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
-        LOG(INFO) << "key=" << key
-                  << ", tenant_id=" << object_id.tenant_id.value()
-                  << ", info=object_not_found_for_eviction";
+        if (log_not_found) {
+            LOG(INFO) << "key=" << key
+                      << ", tenant_id=" << object_id.tenant_id.value()
+                      << ", info=object_not_found_for_eviction";
+        }
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
@@ -7787,9 +7787,20 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
     assert(tenant_id.IsValid());
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
+    const size_t log_interval = keys.size() < 1000 ? 1000 : 100;
+    size_t not_found_count = 0;
     for (const auto& key : keys) {
-        results.push_back(
-            EvictDiskReplica(client_id, key, tenant_id, replica_type));
+        auto result =
+            EvictDiskReplicaImpl(client_id, key, tenant_id, replica_type,
+                                 nullptr, not_found_count % log_interval == 0);
+        if (!result) {
+            if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                ++not_found_count;
+            }
+            results.emplace_back(tl::make_unexpected(result.error()));
+        } else {
+            results.emplace_back();
+        }
     }
     return results;
 }
