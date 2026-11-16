@@ -25,6 +25,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -4505,6 +4506,62 @@ TEST_F(MasterServiceTest,
         &service, MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
                       key, TenantId::Default()));
     EXPECT_FALSE(accessor.IsPublished());
+}
+
+TEST_F(MasterServiceTest,
+       OffboardingDoesNotSerializeOtherRetiredClientsWithoutOpLog) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(false)
+                              .set_eviction_ratio(0.0)
+                              .build());
+    const auto segment_a = MakeSegment("retired_descriptor_a");
+    const auto segment_b = MakeSegment(
+        "retired_descriptor_b", kDefaultSegmentBase + kDefaultSegmentSize);
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment_a, client_a).has_value());
+    ASSERT_TRUE(service.MountSegment(segment_b, client_b).has_value());
+    const auto key_a = PutObjectOnSegment(service, client_a, segment_a.name);
+    const auto key_b = PutObjectOnSegment(service, client_b, segment_b.name);
+
+    auto job_a = MasterServiceTestPeer(service).BuildClientOffboardingJob(
+        client_a, FindClientLivenessForTest(service, client_a));
+    auto job_b = MasterServiceTestPeer(service).BuildClientOffboardingJob(
+        client_b, FindClientLivenessForTest(service, client_b));
+    ASSERT_EQ(1u, job_a.prepared_segments.size());
+    ASSERT_EQ(1u, job_b.prepared_segments.size());
+
+    class ExpiredEndpointLogCounter final : public google::LogSink {
+       public:
+        ExpiredEndpointLogCounter() { google::AddLogSink(this); }
+        ~ExpiredEndpointLogCounter() override { google::RemoveLogSink(this); }
+        void send(google::LogSeverity, const char*, const char*, int,
+                  const google::LogMessageTime&, const char* message,
+                  size_t length) override {
+            if (std::string_view(message, length)
+                    .find(
+                        "allocator=expired_or_null in getTransportEndpoint") !=
+                std::string_view::npos) {
+                count.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        std::atomic<size_t> count{0};
+    } logs;
+
+    // Both allocators have expired. A's sweep must not serialize B's old
+    // replica, and each job must still remove its own replica and converge.
+    ASSERT_TRUE(ProcessClientOffboardingForTest(service, job_a));
+    ASSERT_TRUE(ProcessClientOffboardingForTest(service, job_b));
+    EXPECT_EQ(0u, logs.count.load(std::memory_order_relaxed));
+    EXPECT_EQ(1u, job_a.clean_removed_replicas);
+    EXPECT_EQ(1u, job_b.clean_removed_replicas);
+    EXPECT_FALSE(
+        MasterServiceTestPeer::ReadObject(service, {TenantId::Default(), key_a})
+            .has_value());
+    EXPECT_FALSE(
+        MasterServiceTestPeer::ReadObject(service, {TenantId::Default(), key_b})
+            .has_value());
 }
 
 TEST_F(MasterServiceTest,
