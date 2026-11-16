@@ -270,8 +270,9 @@ class ClientSessionRegistry::Registration {
     // Whether this incarnation still owes a successful remount handshake.
     // Independent of ACTIVE/SUSPECTED: a suspected session may need no remount.
     bool NeedsRemount() const;
-    // Updates immediately; empty hints preserve the previous value. The hint
-    // goes with the session, so rolling back a provisional one drops it.
+    // Stages a hint until Commit; an abandoned scope preserves existing state.
+    // Empty hints preserve the previous value. After Commit, updates apply
+    // immediately while the scope still owns per-incarnation serialization.
     void UpdateHostId(const std::string& host_id);
     // Exactly one commit, with semantics fixed by the Begin* call.
     // Destruction without Commit removes only a provisional session, not
@@ -289,7 +290,10 @@ class ClientSessionRegistry::Registration {
     std::shared_lock<std::shared_mutex> lifecycle_lock_;
     UUID client_id_;
     const RegistrationKind kind_;
-    Clock::time_point observed_at_;
+    // Keep the default unresolved until publication/commit, after lock waits
+    // and resource installation. Explicit times remain deterministic overrides.
+    std::optional<Clock::time_point> observed_at_;
+    std::optional<std::string> pending_host_id_;
     Slot slot_;
     ExclusiveOperation operation_;
     bool admitted_{false};

@@ -62,6 +62,13 @@ class ClientSessionRegistryTestPeer {
         registry.events_.Drain();
     }
 
+    // Model contention on membership publication without blocking the separate
+    // lifecycle lock before registration reaches the registry.
+    static std::unique_lock<std::shared_mutex> LockRegistry(
+        ClientSessionRegistry& registry) {
+        return std::unique_lock<std::shared_mutex>(registry.mutex_);
+    }
+
     static Slot FindSlot(const ClientSessionRegistry& registry,
                          const UUID& client_id) {
         return registry.FindSlot(client_id);

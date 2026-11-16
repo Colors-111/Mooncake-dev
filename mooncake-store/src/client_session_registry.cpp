@@ -213,13 +213,14 @@ ClientSessionRegistry::Registration::Registration(
       lifecycle_lock_(registry.lifecycle_mutex_),
       client_id_(client_id),
       kind_(kind),
-      observed_at_(observed_at.value_or(Clock::now())) {
+      observed_at_(observed_at) {
     for (;;) {
         slot_ = registry.FindSlot(client_id);
         provisional_ = !slot_;
         if (provisional_) {
             slot_ = std::make_shared<ClientSlot>(
-                std::make_shared<ClientLivenessRecord>(observed_at_));
+                std::make_shared<ClientLivenessRecord>(
+                    observed_at_.value_or(Clock::now())));
             // Claim the private slot before publication; never acquire a
             // published slot's operation lock under the registry lock.
             operation_ = ExclusiveOperation(slot_->operation_mutex);
@@ -228,6 +229,12 @@ ClientSessionRegistry::Registration::Registration(
                 // Lost the publication race; retry against the winner.
                 operation_ = {};
                 continue;
+            }
+            // Publication may have waited for registry membership changes.
+            // A new remount gets a fresh initial deadline here; existing
+            // sessions retain their heartbeat deadline across remounts.
+            if (!observed_at_) {
+                (void)slot_->liveness->Observe(Clock::now());
             }
             registry.AdoptSlot(client_id, slot_);
         } else {
@@ -261,6 +268,10 @@ void ClientSessionRegistry::Registration::UpdateHostId(
     if (host_id.empty()) {
         return;
     }
+    if (!committed_) {
+        pending_host_id_ = host_id;
+        return;
+    }
     std::unique_lock lock(registry_.mutex_);
     slot_->host_id = host_id;
 }
@@ -268,8 +279,13 @@ void ClientSessionRegistry::Registration::UpdateHostId(
 void ClientSessionRegistry::Registration::Commit() {
     CHECK(operation_.owns_lock() && admitted_);
     CHECK(!committed_);
+    if (pending_host_id_) {
+        std::unique_lock lock(registry_.mutex_);
+        slot_->host_id = std::move(*pending_host_id_);
+        pending_host_id_.reset();
+    }
     if (kind_ == RegistrationKind::Register) {
-        if (slot_->liveness->Observe(observed_at_) ==
+        if (slot_->liveness->Observe(observed_at_.value_or(Clock::now())) ==
             ClientLivenessObservation::RECOVERED_ACTIVE) {
             registry_.PublishTransition(client_id_, slot_,
                                         ClientLivenessState::SUSPECTED,

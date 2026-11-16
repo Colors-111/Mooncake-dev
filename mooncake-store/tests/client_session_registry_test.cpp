@@ -7,6 +7,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -72,8 +73,12 @@ TEST_F(ClientSessionRegistryTest, HostHintsBelongToTheSession) {
         ASSERT_TRUE(registration);
         registration->UpdateHostId("host-b");
         registration->UpdateHostId("");
-        EXPECT_EQ(registry.GetHostId(kClient), "host-b");
+        EXPECT_EQ(registry.GetHostId(kClient), "host-a");
         registration->Commit();
+        EXPECT_EQ(registry.GetHostId(kClient), "host-b");
+        // A caller retaining a committed scope may still update its hint.
+        registration->UpdateHostId("host-c");
+        EXPECT_EQ(registry.GetHostId(kClient), "host-c");
     }
     EXPECT_TRUE(registry.GetHostId(UUID{3, 4}).empty());
     registry.Reset();
@@ -92,11 +97,85 @@ TEST_F(ClientSessionRegistryTest,
         ASSERT_TRUE(remount);
         EXPECT_FALSE(original->Session());
         remount->UpdateHostId("host-a");
-        EXPECT_EQ(registry.GetHostId(kClient), "host-a");
+        EXPECT_TRUE(registry.GetHostId(kClient).empty());
         EXPECT_EQ(registry.GetHostId(other), "other-host");
         remount->Commit();
     }
     EXPECT_EQ(registry.GetHostId(kClient), "host-a");
+}
+
+TEST_F(ClientSessionRegistryTest, FailedScopesPreserveAnExistingHostHint) {
+    ClientSessionRegistry registry;
+    Register(registry);
+    registry.UpdateHostId(kClient, "original-host");
+    for (const bool remount : {false, true}) {
+        auto registration = remount ? registry.BeginRemount(kClient)
+                                    : registry.BeginRegistration(kClient);
+        ASSERT_TRUE(registration);
+        registration->UpdateHostId("failed-host");
+        registration->UpdateHostId("");
+        EXPECT_EQ(registry.GetHostId(kClient), "original-host");
+        registration.reset();
+        EXPECT_EQ(registry.GetHostId(kClient), "original-host");
+    }
+}
+
+TEST_F(ClientSessionRegistryTest, RegistrationSamplesLivenessAtCommit) {
+    constexpr auto ttl = 10ms;
+    for (const bool existing : {false, true}) {
+        SCOPED_TRACE(existing);
+        ClientSessionRegistry registry;
+        if (existing) {
+            Suspect(Register(registry));
+        }
+        auto registration = registry.BeginRegistration(kClient);
+        ASSERT_TRUE(registration);
+        // Resource installation may take longer than the active TTL.
+        std::this_thread::sleep_for(20ms);
+        const auto before_commit = Clock::now();
+        registration->Commit();
+        const auto after_commit = Clock::now();
+        registration.reset();
+        auto record = Find(registry, kClient);
+        ASSERT_TRUE(record);
+        EXPECT_EQ(record->Evaluate(before_commit + ttl - Clock::duration(1),
+                                   ttl, 20s),
+                  Transition::NONE);
+        EXPECT_TRUE(registry.TryAcquireServingSession(kClient));
+        EXPECT_EQ(record->Evaluate(after_commit + ttl, ttl, 20s),
+                  Transition::BECAME_SUSPECTED);
+    }
+}
+
+TEST_F(ClientSessionRegistryTest,
+       NewRemountSamplesLivenessAfterRegistryLockWait) {
+    constexpr auto ttl = 10ms;
+    ClientSessionRegistry registry;
+    auto lock = LockRegistry(registry);
+    std::promise<void> started;
+    auto entered = started.get_future();
+    auto remount = std::async(std::launch::async, [&] {
+        started.set_value();
+        auto registration = registry.BeginRemount(kClient);
+        if (!registration) return false;
+        registration->Commit();
+        return true;
+    });
+    entered.wait();
+    const auto blocked = remount.wait_for(20ms);
+    const auto before_unlock = Clock::now();
+    // Release before any assertion or future destruction can join the worker.
+    lock.unlock();
+    EXPECT_EQ(blocked, std::future_status::timeout);
+    ASSERT_TRUE(remount.get());
+    const auto after_remount = Clock::now();
+    auto record = Find(registry, kClient);
+    ASSERT_TRUE(record);
+    EXPECT_EQ(
+        record->Evaluate(before_unlock + ttl - Clock::duration(1), ttl, 20s),
+        Transition::NONE);
+    EXPECT_EQ(record->Evaluate(after_remount + ttl, ttl, 20s),
+              Transition::BECAME_SUSPECTED);
 }
 
 TEST_F(ClientSessionRegistryTest, RemovingOldIncarnationPreservesNewHostHint) {
@@ -302,7 +381,7 @@ TEST_F(ClientSessionRegistryTest,
     EXPECT_EQ(fail(), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(Find(registry, kClient), record);
     EXPECT_EQ(record->state(), State::SUSPECTED);
-    EXPECT_EQ(registry.GetHostId(kClient), "failed-host");
+    EXPECT_TRUE(registry.GetHostId(kClient).empty());
     {
         auto registration = registry.BeginRegistration(kClient, kInitial + 12s);
         ASSERT_TRUE(registration);
